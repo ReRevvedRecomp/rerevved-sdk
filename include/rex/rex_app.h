@@ -17,11 +17,14 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <rex/image_info.h>
 #include <rex/runtime.h>
+#include <rex/system/mod_plugin.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
@@ -263,6 +266,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
  private:
   std::function<void(PathConfig)> MakeResumeCallback();
+  void ShutdownModPlugins();
 
   // Stand up the ImGui overlay stack (drawer, F3/Backtick/F4 binds, dialogs)
   // independently of how the presenter/drawer were obtained. `presenter` may be
@@ -307,10 +311,16 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> mod_manager_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
+
+  // These values back the borrowed strings passed through ModHostContext.
+  std::vector<system::ModInfo> mod_infos_;
+  std::vector<std::string> mod_root_strings_;
+  std::vector<std::unique_ptr<system::IModPlugin>> mod_plugins_;
 };
 
 }  // namespace rex

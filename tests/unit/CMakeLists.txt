@@ -16,6 +16,8 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    system/mod_dependency_test.cpp
+    system/mod_plugin_test.cpp
     graphics/diagnostic_util_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
@@ -40,6 +42,37 @@ target_link_libraries(unit_tests PRIVATE
     rexruntime
     Catch2::Catch2WithMain
 )
+
+set(REX_TEST_MODS_ROOT "${CMAKE_CURRENT_BINARY_DIR}/mods")
+if(REX_PLATFORM STREQUAL "win-amd64")
+    set(REX_TEST_MOD_PLATFORM "windows-x64")
+elseif(REX_PLATFORM STREQUAL "win-arm64")
+    set(REX_TEST_MOD_PLATFORM "windows-arm64")
+elseif(REX_PLATFORM STREQUAL "linux-amd64")
+    set(REX_TEST_MOD_PLATFORM "linux-x64")
+elseif(REX_PLATFORM STREQUAL "linux-arm64")
+    set(REX_TEST_MOD_PLATFORM "linux-arm64")
+else()
+    message(FATAL_ERROR "No mod package platform mapping for ${REX_PLATFORM}")
+endif()
+add_library(test_mod_plugin SHARED system/test_mod_plugin.cpp)
+add_library(test_mod_bad_abi SHARED system/test_mod_bad_abi.cpp)
+foreach(target test_mod_plugin test_mod_bad_abi)
+    target_link_libraries(${target} PRIVATE rexruntime)
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${REX_TEST_MODS_ROOT}/$<TARGET_PROPERTY:${target},OUTPUT_NAME>/code/${REX_TEST_MOD_PLATFORM}"
+        DEBUG_POSTFIX "d"
+        RELWITHDEBINFO_POSTFIX "rd"
+        RELEASE_POSTFIX ""
+    )
+endforeach()
+set_target_properties(test_mod_plugin PROPERTIES OUTPUT_NAME lifecycle)
+set_target_properties(test_mod_bad_abi PROPERTIES OUTPUT_NAME bad_abi)
+target_compile_definitions(unit_tests PRIVATE
+    REX_TEST_MOD_PLUGIN_PATH="$<TARGET_FILE:test_mod_plugin>"
+    REX_TEST_BAD_MOD_PLUGIN_PATH="$<TARGET_FILE:test_mod_bad_abi>"
+)
+add_dependencies(unit_tests test_mod_plugin test_mod_bad_abi)
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into
 # rexui. Keep its SDK-consumer compilation path covered by the test build.

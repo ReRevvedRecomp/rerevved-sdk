@@ -24,6 +24,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/mod_manager_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -34,6 +35,7 @@
 #include <rex/system/achievement_manager.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/mod_plugin.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
@@ -253,7 +255,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_ &&
+            !mod_manager_overlay_)
           return true;
         return !imgui_drawer_->GetIO().WantCaptureMouse;
       });
@@ -298,6 +301,36 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     if (!rex::kernel::crt::InitHeap(REXCVAR_GET(rexcrt_heap_size_mb), runtime_->memory())) {
       REXLOG_ERROR("Failed to initialize rexcrt heap");
       return false;
+    }
+  }
+
+  mod_infos_ = runtime_->enabled_mods_info();
+  mod_root_strings_.clear();
+  mod_root_strings_.reserve(mod_infos_.size());
+  for (const auto& mod : mod_infos_) {
+    mod_root_strings_.push_back(mod.mod_root.string());
+  }
+
+  rex::system::ModHostContext context{};
+  context.runtime = runtime_.get();
+  context.app_context = &app_context();
+  context.window = window_.get();
+  context.input_system = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+  for (size_t i = 0; i < mod_infos_.size(); ++i) {
+    const auto& mod = mod_infos_[i];
+    if (mod.code.empty()) {
+      continue;
+    }
+    context.mod_root = mod_root_strings_[i].c_str();
+    context.mod_name = mod.folder_name.c_str();
+    if (auto plugin =
+            rex::system::LoadModPlugin(mod.mod_root, mod.folder_name, mod.code, context)) {
+      mod_plugins_.push_back(std::move(plugin));
+    }
+  }
+  if (imgui_drawer_) {
+    for (auto& plugin : mod_plugins_) {
+      plugin->OnCreateDialogs(imgui_drawer_.get());
     }
   }
 
@@ -417,6 +450,14 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
+  rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this, drawer] {
+    if (mod_manager_overlay_) {
+      mod_manager_overlay_.reset();
+    } else {
+      mod_manager_overlay_ =
+          std::make_unique<ui::ModManagerDialog>(imgui_drawer_.get(), drawer, runtime_.get());
+    }
+  });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
@@ -466,6 +507,10 @@ void ReXApp::LaunchModule() {
       }
     }
 
+    for (auto& plugin : mod_plugins_) {
+      plugin->OnModuleLaunched();
+    }
+
     OnPostLaunchModule(main_thread.get());
     main_thread->Resume();
 
@@ -496,10 +541,18 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
   rex::ui::ProcessKeyEvent(e);
 }
 
+void ReXApp::ShutdownModPlugins() {
+  for (auto& plugin : mod_plugins_) {
+    plugin->OnShutdown();
+  }
+  mod_plugins_.clear();
+}
+
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  ShutdownModPlugins();
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
@@ -558,10 +611,13 @@ void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
 
+  ShutdownModPlugins();
+
   // Unregister overlay keybinds before destroying dialogs
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  rex::ui::UnregisterBind("bind_mod_manager");
   rex::ui::UnregisterBind("bind_achievements");
 
   // ImGui cleanup (reverse of setup)
@@ -573,6 +629,7 @@ void ReXApp::OnDestroy() {
   }
   achievement_notification_.reset();
   achievements_overlay_.reset();
+  mod_manager_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

@@ -11,6 +11,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -22,6 +23,7 @@
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/mod_config.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
@@ -33,6 +35,8 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_STRING(mods_data_root, "", "Mods", "Mod folder; defaults to <executable>/mods");
+REXCVAR_DEFINE_STRING(enabled_mods, "", "Mods", "Enabled mod folder names in priority order");
 
 namespace rex {
 
@@ -113,6 +117,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   thread::EnableAffinityConfiguration();
 
   tool_mode_ = config.tool_mode;
+  game_version_ = std::move(config.game_version);
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -163,6 +168,14 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
       } else {
         REXSYS_DEBUG("Audio system initialized");
       }
+    }
+  }
+
+  // Tool mode analyzes title binaries without starting the host mod lifecycle.
+  if (!tool_mode_) {
+    ResolveEnabledMods();
+    if (!ValidateModDependencies()) {
+      return fail(X_STATUS_UNSUCCESSFUL, "mod version validation failed");
     }
   }
 
@@ -282,6 +295,8 @@ void Runtime::Shutdown() {
   export_resolver_.reset();
   file_system_.reset();
   memory_.reset();
+  enabled_mods_info_.clear();
+  game_version_.clear();
 
   rex::perf::Profiler::Shutdown();
   setup_complete_ = false;
@@ -289,6 +304,19 @@ void Runtime::Shutdown() {
 
 uint8_t* Runtime::virtual_membase() const {
   return memory_ ? memory_->virtual_membase() : nullptr;
+}
+
+void Runtime::ResolveEnabledMods() {
+  std::string enabled = REXCVAR_GET(enabled_mods);
+  std::string configured_root = REXCVAR_GET(mods_data_root);
+  auto mods_root = configured_root.empty()
+                       ? rex::filesystem::GetExecutableFolder() / "mods"
+                       : std::filesystem::absolute(std::filesystem::path(configured_root));
+  enabled_mods_info_ = system::ResolveModConfiguration(mods_root, enabled);
+}
+
+bool Runtime::ValidateModDependencies() const {
+  return system::ValidateModConfiguration(enabled_mods_info_, game_version_);
 }
 
 bool Runtime::SetupVfs() {

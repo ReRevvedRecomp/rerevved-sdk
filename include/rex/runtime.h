@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/embedded_metadata.h>
@@ -28,6 +29,7 @@
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/interfaces/input.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/mod_plugin.h>
 #include <rex/system/xobject.h>  // object_ref
 
 // Forward declaration for function mapping (defined in rex/ppc/context.h)
@@ -40,6 +42,8 @@ REXCVAR_DECLARE(std::string, user_data_root);
 REXCVAR_DECLARE(std::string, update_data_root);
 REXCVAR_DECLARE(std::string, cache_root);
 REXCVAR_DECLARE(std::string, metadata_root);
+REXCVAR_DECLARE(std::string, mods_data_root);
+REXCVAR_DECLARE(std::string, enabled_mods);
 
 namespace rex {
 
@@ -72,6 +76,7 @@ struct RuntimeConfig {
   std::function<std::unique_ptr<system::IInputSystem>(bool tool_mode)> input_factory;
   std::function<void(Runtime*, system::KernelState*)> kernel_init;
   bool tool_mode = false;
+  std::string game_version;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.
@@ -132,6 +137,10 @@ class Runtime {
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
   const std::filesystem::path& metadata_root() const { return metadata_root_; }
+  const std::string& game_version() const { return game_version_; }
+
+  // Enabled mods in priority order. The metadata is parsed once during Setup.
+  const std::vector<system::ModInfo>& enabled_mods_info() const { return enabled_mods_info_; }
 
   // Finds a metadata file or directory. An explicit metadata_root disables
   // legacy discovery; otherwise existing project layouts remain supported.
@@ -181,12 +190,16 @@ class Runtime {
  private:
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
+  void ResolveEnabledMods();
+  bool ValidateModDependencies() const;
 
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;
   std::filesystem::path metadata_root_;
+  std::string game_version_;
+  std::vector<system::ModInfo> enabled_mods_info_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;
