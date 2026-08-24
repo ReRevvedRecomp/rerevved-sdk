@@ -1,5 +1,10 @@
 # Releasing ReXGlue SDK
 
+> [!NOTE]
+> This page documents the upstream ReXGlue release process. The maintained fork
+> does not publish from upstream `v*` tags. See [Maintaining the ReRevved
+> fork](MAINTAINING.md) for its branch and artifact policy.
+
 ## Branches
 
 `main` always sits at the most recent stable tag. `development` is the working canary; all feature work merges here first. `release/X.Y.Z` is short-lived: branched from dev tip when a release is cut, merged into both dev and main when the release is published, then deleted.

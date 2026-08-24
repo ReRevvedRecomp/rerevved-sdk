@@ -1,0 +1,19 @@
+name: Maintained branch checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - rerevved-sdk
+
+permissions:
+  contents: read
+
+jobs:
+  build-win-amd64:
+    name: Build and test win-amd64
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: win-amd64
+      ref: ${{ github.sha }}
+      publish_mode: none

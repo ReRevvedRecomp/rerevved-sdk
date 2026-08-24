@@ -1,0 +1,83 @@
+name: SDK artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Full 40-character commit SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve exact commit
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit
+        id: resolve
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          if [[ ! "${REQUESTED_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "commit must be a full 40-character SHA" >&2
+            exit 1
+          fi
+          commit=$(printf '%s' "${REQUESTED_COMMIT}" | tr 'A-F' 'a-f')
+          git cat-file -e "${commit}^{commit}"
+          git branch --remotes --contains "${commit}" | grep -q .
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+  build-win-amd64:
+    needs: resolve
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: win-amd64
+      ref: ${{ needs.resolve.outputs.commit }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-win-amd64
+
+  build-mac-amd64:
+    needs: resolve
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: mac-amd64
+      ref: ${{ needs.resolve.outputs.commit }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-mac-amd64
+
+  build-mac-arm64:
+    needs: resolve
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: mac-arm64
+      ref: ${{ needs.resolve.outputs.commit }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-mac-arm64
+
+  build-linux-amd64:
+    needs: resolve
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: linux-amd64
+      ref: ${{ needs.resolve.outputs.commit }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-linux-amd64
+
+  build-linux-arm64:
+    needs: resolve
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: linux-arm64
+      ref: ${{ needs.resolve.outputs.commit }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-linux-arm64

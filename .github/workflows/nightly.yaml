@@ -1,8 +1,6 @@
 name: Nightly rexglue-sdk
 
 on:
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -141,6 +139,8 @@ jobs:
           PREV_SHA: ${{ needs.check.outputs.prev_nightly_sha }}
           TAG_NAME: ${{ needs.check.outputs.tag_name }}
         run: |
+          # DEV_SHA is supplied by the step environment.
+          # shellcheck disable=SC2153
           if [ -n "${PREV_SHA}" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
             commits=$(git log --no-merges --pretty='format:- %s (%h)' "${PREV_SHA}..${DEV_SHA}")
             range_header="Changes since previous nightly (\`${PREV_SHA:0:8}\`):"

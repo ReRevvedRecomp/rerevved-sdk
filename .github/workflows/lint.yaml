@@ -9,6 +9,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -22,14 +24,27 @@ jobs:
           clang-format --version
 
       - name: Check C/C++ formatting
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          find include src tests \
-            -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.c' \) \
-            | xargs clang-format --dry-run --Werror
+          if [[ "${BASE_SHA}" =~ ^0+$ ]]; then
+            BASE_SHA=$(git merge-base "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}")
+          fi
+          mapfile -d '' files < <(
+            git diff --name-only -z --diff-filter=ACMR \
+              "${BASE_SHA}" "${GITHUB_SHA}" -- include src tests |
+              grep -zE '\.(c|cpp|h|hpp)$' || true
+          )
+          if ((${#files[@]})); then
+            printf 'Checking %s\n' "${files[@]}"
+            clang-format --dry-run --Werror "${files[@]}"
+          else
+            echo "No changed C/C++ files"
+          fi
 
       - name: Check Vulkan dependency pins
         run: python scripts/check_vulkan_stack.py
 
       - name: Run script tests
         run: python -m pytest scripts/tests -v
-
