@@ -126,6 +126,10 @@ void FinalizeInit();
 bool IsFinalized();
 void SaveConfig(const std::filesystem::path& config_path);
 
+// Patch named flags while preserving every other config line verbatim.
+void SaveConfigSubset(const std::filesystem::path& config_path,
+                      const std::vector<std::string>& names);
+
 //=============================================================================
 // Flag Registry
 //=============================================================================

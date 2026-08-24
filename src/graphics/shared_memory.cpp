@@ -389,6 +389,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
+  // Validity is changed under the global lock, so every decision based on it
+  // must hold that lock: https://github.com/birabittoh/rexglue-sdk/commit/f8bb00010bd3ec08b0be5b3c8342ef967984d73a
   upload_ranges_.clear();
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {

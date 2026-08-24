@@ -74,7 +74,7 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
     .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+REXCVAR_DEFINE_BOOL(async_shader_compilation, false, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
                     "pipelines are being prepared.")

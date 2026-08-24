@@ -1888,6 +1888,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
   copy_buffer_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
   command_processor_.SubmitBarriers();
+  command_processor_.CaptureTextureLoadScratch(copy_buffer, uint32_t(copy_buffer_size));
   uint32_t texture_level_count = texture_key.mip_max_level + 1;
   D3D12_TEXTURE_COPY_LOCATION location_source, location_dest;
   location_source.pResource = copy_buffer;

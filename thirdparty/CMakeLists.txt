@@ -125,8 +125,10 @@ target_include_directories(aes128 PUBLIC
 target_compile_options(aes128 PRIVATE -w)
 
 # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
-# Uses cabextract version which has all needed headers in one place
-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
+# Use the real source and header paths because the cabextract copies are
+# relative symlinks, which Git materializes as text files on Windows when
+# symlinks are disabled.
+set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
 add_library(mspack STATIC
     ${MSPACK_DIR}/lzxd.c
 )
@@ -275,6 +277,8 @@ set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
 set(SDL_LOCALE ON CACHE BOOL "" FORCE)
 set(SDL_FILE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
+# File dialogs: the game data selector drives SDL's native file dialogs on
+# every platform (IFileOpenDialog-backed on Windows).
 set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)

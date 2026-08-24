@@ -12,6 +12,14 @@ project(ReXGlue
     LANGUAGES ${REXGLUE_LANGUAGES}
     DESCRIPTION "Xbox 360 Recompilation SDK"
 )
+if(WIN32)
+    add_compile_definitions(
+        _CRT_DECLARE_NONSTDC_NAMES=1
+        fileno=_fileno
+        isatty=_isatty
+        itoa=_itoa
+    )
+endif()
 # Floor only: bump MAJOR.MINOR for API changes. Patch is derived from git tags
 # in cmake/rex_version.cmake. See docs/RELEASING.md.
 

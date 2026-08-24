@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -177,6 +178,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // by its user.
   void ReleaseScratchGPUBuffer(ID3D12Resource* buffer, D3D12_RESOURCE_STATES new_state);
 
+  // Diagnostic-only one-shot capture of the texture-load scratch buffer.
+  void ArmTextureLoadScratchCapture(const std::filesystem::path& path);
+  void CaptureTextureLoadScratch(ID3D12Resource* buffer, uint32_t size);
+  std::filesystem::path GetSwapTextureCapturePath() const;
+  ID3D12Resource* RequestDiagnosticBufferCapture(const std::filesystem::path& path, uint32_t size);
+
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
@@ -310,7 +317,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass submission_current_
   // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  bool CheckSubmissionFence(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -318,17 +325,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool BeginSubmission(bool is_guest_command);
   // If is_swap is true, a full frame is closed - with, if needed, cache
   // clearing and stopping capturing. Returns whether the submission was done
-  // successfully, if it has failed, leaves it open.
+  // successfully. A failure before execution leaves it open. A Signal failure
+  // after execution closes it permanently.
   bool EndSubmission(bool is_swap);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
-  }
+  bool AwaitAllQueueOperationsCompletion() { return CheckSubmissionFence(submission_current_); }
+  void HandleFenceFailure(const char* operation, HRESULT operation_result,
+                          bool tracking_is_unrecoverable);
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 
   void UpdateDebugMarkersEnabled();
@@ -425,8 +432,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   HANDLE fence_completion_event_ = nullptr;
 
   bool submission_open_ = false;
+  bool submission_fence_failed_ = false;
   // Values of submission_fence_.
   uint64_t submission_current_ = 1;
+  uint64_t submission_last_signaled_ = 0;
   uint64_t submission_completed_ = 0;
   ID3D12Fence* submission_fence_ = nullptr;
 
@@ -552,6 +561,19 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 
+  bool texture_load_scratch_capture_armed_ = false;
+  std::filesystem::path texture_load_scratch_capture_path_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> texture_load_scratch_capture_buffer_;
+  uint32_t texture_load_scratch_capture_size_ = 0;
+  uint64_t texture_load_scratch_capture_submission_ = 0;
+  struct DiagnosticBufferCapture {
+    std::filesystem::path path;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint32_t size;
+    uint64_t submission;
+  };
+  std::vector<DiagnosticBufferCapture> diagnostic_buffer_captures_;
+
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
   // Bytes 0x400...0x9FF - 128-entry PWL R16G16 gamma ramp (R - base, G - delta,
@@ -636,6 +658,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> submission_retry_resources_;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

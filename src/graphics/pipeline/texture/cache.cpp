@@ -10,15 +10,23 @@
  */
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
+#include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -80,6 +88,15 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
+REXCVAR_DEFINE_STRING(texture_load_dump, "", "GPU",
+                      "One-shot directory for a filtered texture-load DDS and metadata")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(texture_load_dump_filter, "", "GPU",
+                      "Texture-load filter: hex_address, or "
+                      "hex_address|*:width:height:pitch:tiled:format:endian")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
 //     "Integer pixel width scale used for scaling the rendering resolution "
@@ -126,6 +143,219 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+namespace {
+
+struct TextureLoadDumpFilter {
+  uint32_t address;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pitch;
+  uint32_t tiled;
+  uint32_t format;
+  uint32_t endian;
+};
+
+bool ParseTextureLoadDumpFilter(const std::string& value, TextureLoadDumpFilter& filter_out,
+                                bool& exact_out, bool& any_address_out) {
+  if (value.find(':') == std::string::npos) {
+    auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), filter_out.address, 16);
+    exact_out = false;
+    any_address_out = false;
+    return !value.empty() && error == std::errc() && end == value.data() + value.size();
+  }
+
+  uint32_t* fields[] = {&filter_out.address, &filter_out.width, &filter_out.height,
+                        &filter_out.pitch,   &filter_out.tiled, &filter_out.format,
+                        &filter_out.endian};
+  std::string_view remaining = value;
+  for (size_t i = 0; i < std::size(fields); ++i) {
+    size_t separator = remaining.find(':');
+    std::string_view field = remaining.substr(0, separator);
+    if (field.empty() || (i + 1 != std::size(fields)) != (separator != std::string_view::npos)) {
+      return false;
+    }
+    if (i == 0 && field == "*") {
+      any_address_out = true;
+      if (separator != std::string_view::npos) {
+        remaining.remove_prefix(separator + 1);
+      }
+      continue;
+    }
+    auto [end, error] =
+        std::from_chars(field.data(), field.data() + field.size(), *fields[i], i == 0 ? 16 : 10);
+    if (error != std::errc() || end != field.data() + field.size()) {
+      return false;
+    }
+    if (separator != std::string_view::npos) {
+      remaining.remove_prefix(separator + 1);
+    }
+  }
+  exact_out = true;
+  return true;
+}
+
+#pragma pack(push, 1)
+// Narrow DDS output adapted from:
+// https://github.com/birabittoh/rexglue-sdk/commit/164b2229eaae9e4d38d3c7dc9a74c38498d3b6b9
+struct DdsPixelFormat {
+  uint32_t size = 32;
+  uint32_t flags = 0x41;
+  uint32_t four_cc = 0;
+  uint32_t rgb_bit_count = 32;
+  uint32_t r_bit_mask = 0x000000FF;
+  uint32_t g_bit_mask = 0x0000FF00;
+  uint32_t b_bit_mask = 0x00FF0000;
+  uint32_t a_bit_mask = 0xFF000000;
+};
+
+struct DdsHeader {
+  uint32_t magic = 0x20534444;
+  uint32_t size = 124;
+  uint32_t flags = 0x100F;
+  uint32_t height = 0;
+  uint32_t width = 0;
+  uint32_t pitch = 0;
+  uint32_t depth = 0;
+  uint32_t mip_map_count = 1;
+  uint32_t reserved[11] = {};
+  DdsPixelFormat pixel_format;
+  uint32_t caps = 0x1000;
+  uint32_t caps2 = 0;
+  uint32_t caps3 = 0;
+  uint32_t caps4 = 0;
+  uint32_t reserved2 = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(DdsHeader) == 128);
+
+bool DumpTextureLoad(const TextureLoadDumpFilter& filter, const std::filesystem::path& directory,
+                     const uint8_t* source, uint32_t source_size) {
+  if (!source || !source_size || filter.format != uint32_t(xenos::TextureFormat::k_8_8_8_8)) {
+    return false;
+  }
+
+  const FormatInfo* format_info = FormatInfo::Get(xenos::TextureFormat::k_8_8_8_8);
+  uint32_t pitch_blocks = filter.pitch / format_info->block_width;
+  uint32_t width_blocks = filter.width / format_info->block_width;
+  uint32_t height_blocks = filter.height / format_info->block_height;
+  uint32_t output_pitch = width_blocks * format_info->bytes_per_block();
+  std::vector<uint8_t> output(size_t(output_pitch) * height_blocks);
+  xenos::Endian endian = xenos::Endian(filter.endian);
+  if (filter.tiled) {
+    texture_conversion::UntileInfo untile_info{};
+    untile_info.width = width_blocks;
+    untile_info.height = height_blocks;
+    untile_info.input_pitch = pitch_blocks;
+    untile_info.output_pitch = width_blocks;
+    untile_info.input_format_info = format_info;
+    untile_info.output_format_info = format_info;
+    untile_info.copy_callback = [endian](void* output_block, const void* input_block,
+                                         size_t length) {
+      texture_conversion::CopySwapBlock(endian, output_block, input_block, length);
+    };
+    texture_conversion::Untile(output.data(), source, &untile_info);
+  } else {
+    uint32_t input_pitch = pitch_blocks * format_info->bytes_per_block();
+    for (uint32_t y = 0; y < height_blocks; ++y) {
+      texture_conversion::CopySwapBlock(endian, output.data() + size_t(y) * output_pitch,
+                                        source + size_t(y) * input_pitch, output_pitch);
+    }
+  }
+
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    return false;
+  }
+  std::string stem =
+      fmt::format("texture_{:08x}_{}x{}_p{}_t{}_f{}_e{}", filter.address, filter.width,
+                  filter.height, filter.pitch, filter.tiled, filter.format, filter.endian);
+  std::filesystem::path dds_path = directory / stem;
+  dds_path.replace_extension(".dds");
+  std::filesystem::path metadata_path = directory / stem;
+  metadata_path.replace_extension(".txt");
+  std::filesystem::path dds_temporary_path = dds_path;
+  dds_temporary_path += ".tmp";
+  std::filesystem::path metadata_temporary_path = metadata_path;
+  metadata_temporary_path += ".tmp";
+  auto remove_temporary_file = [](const std::filesystem::path& path) {
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+    if (remove_error) {
+      REXGPU_ERROR("Failed to clean up diagnostic temporary file {}: {}", rex::path_to_utf8(path),
+                   remove_error.message());
+      return false;
+    }
+    return true;
+  };
+  auto remove_temporary_pair = [&]() {
+    bool dds_removed = remove_temporary_file(dds_temporary_path);
+    bool metadata_removed = remove_temporary_file(metadata_temporary_path);
+    return dds_removed && metadata_removed;
+  };
+  if (!remove_temporary_pair()) {
+    return false;
+  }
+
+  DdsHeader dds_header;
+  dds_header.width = filter.width;
+  dds_header.height = filter.height;
+  dds_header.pitch = output_pitch;
+  std::ofstream dds(dds_temporary_path, std::ios::binary | std::ios::trunc);
+  dds.write(reinterpret_cast<const char*>(&dds_header), sizeof(dds_header));
+  dds.write(reinterpret_cast<const char*>(output.data()), output.size());
+  dds.close();
+  if (!dds) {
+    remove_temporary_pair();
+    return false;
+  }
+
+  size_t source_nonzero = 0;
+  for (uint32_t i = 0; i < source_size; ++i) {
+    source_nonzero += source[i] != 0;
+  }
+  size_t output_nonzero = 0;
+  for (uint8_t byte : output) {
+    output_nonzero += byte != 0;
+  }
+  std::ofstream metadata(metadata_temporary_path, std::ios::trunc);
+  metadata << "address=0x" << std::hex << filter.address << std::dec << '\n'
+           << "width=" << filter.width << '\n'
+           << "height=" << filter.height << '\n'
+           << "pitch=" << filter.pitch << '\n'
+           << "tiled=" << filter.tiled << '\n'
+           << "format=" << filter.format << '\n'
+           << "endian=" << filter.endian << '\n'
+           << "source_bytes=" << source_size << '\n'
+           << "source_nonzero_bytes=" << source_nonzero << '\n'
+           << "decoded_bytes=" << output.size() << '\n'
+           << "decoded_nonzero_bytes=" << output_nonzero << '\n';
+  metadata.close();
+  if (!metadata) {
+    remove_temporary_pair();
+    return false;
+  }
+
+  const diagnostic::ArtifactPairPublicationResult publication = diagnostic::PublishArtifactPair(
+      dds_temporary_path, metadata_temporary_path, dds_path, metadata_path);
+  if (publication.cleanup_error) {
+    REXGPU_ERROR("Failed to clean up diagnostic artifact temporary files: {}",
+                 publication.cleanup_error.message());
+  }
+  if (!publication.succeeded()) {
+    REXGPU_ERROR("Failed to publish diagnostic artifact pair: {}",
+                 publication.publication_error.message());
+    return false;
+  }
+
+  REXGPU_INFO("Dumped first matching texture load to {} ({} of {} source bytes nonzero)",
+              rex::path_to_utf8(dds_path), source_nonzero, source_size);
+  return true;
+}
+
+}  // namespace
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -214,6 +444,37 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
   assert_true(draw_resolution_scale_y >= 1);
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
+
+  texture_load_dump_config_.directory = REXCVAR_GET(texture_load_dump);
+  std::string texture_load_dump_filter = REXCVAR_GET(texture_load_dump_filter);
+  if (!texture_load_dump_config_.directory.empty() || !texture_load_dump_filter.empty()) {
+    TextureLoadDumpFilter parsed_filter{};
+    bool exact_filter = true;
+    bool any_address = false;
+    if (texture_load_dump_config_.directory.empty() ||
+        !ParseTextureLoadDumpFilter(texture_load_dump_filter, parsed_filter, exact_filter,
+                                    any_address)) {
+      texture_load_dump_attempted_ = true;
+      REXGPU_ERROR("Invalid texture load dump configuration");
+    } else {
+      texture_load_dump_config_.address = parsed_filter.address;
+      texture_load_dump_config_.width = parsed_filter.width;
+      texture_load_dump_config_.height = parsed_filter.height;
+      texture_load_dump_config_.pitch = parsed_filter.pitch;
+      texture_load_dump_config_.tiled = parsed_filter.tiled;
+      texture_load_dump_config_.format = parsed_filter.format;
+      texture_load_dump_config_.endian = parsed_filter.endian;
+      texture_load_dump_config_.any_address = any_address;
+      texture_load_dump_config_.exact = exact_filter;
+      texture_load_dump_config_.enabled = true;
+      if (any_address) {
+        REXGPU_INFO("Armed one-shot shape-only texture load dump");
+      } else {
+        REXGPU_INFO("Armed one-shot {} texture load dump for 0x{:08X}",
+                    exact_filter ? "exact" : "address-only", parsed_filter.address);
+      }
+    }
+  }
 
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
@@ -438,6 +699,34 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
     return false;
+  }
+
+  if (texture_load_dump_config_.enabled && !texture_load_dump_attempted_ &&
+      pending_load.load_base && !texture_key.scaled_resolve &&
+      (texture_load_dump_config_.any_address ||
+       (uint32_t(texture_key.base_page) << 12) == texture_load_dump_config_.address) &&
+      (!texture_load_dump_config_.exact ||
+       (texture_key.GetWidth() == texture_load_dump_config_.width &&
+        texture_key.GetHeight() == texture_load_dump_config_.height &&
+        (uint32_t(texture_key.pitch) << 5) == texture_load_dump_config_.pitch &&
+        texture_key.tiled == texture_load_dump_config_.tiled &&
+        uint32_t(texture_key.format) == texture_load_dump_config_.format &&
+        uint32_t(texture_key.endianness) == texture_load_dump_config_.endian))) {
+    TextureLoadDumpFilter dump_filter{
+        uint32_t(texture_key.base_page) << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+        uint32_t(texture_key.pitch) << 5,      texture_key.tiled,      uint32_t(texture_key.format),
+        uint32_t(texture_key.endianness),
+    };
+    REXGPU_INFO("Matched one-shot texture load dump: 0x{:08X}:{}:{}:{}:{}:{}:{}",
+                dump_filter.address, dump_filter.width, dump_filter.height, dump_filter.pitch,
+                dump_filter.tiled, dump_filter.format, dump_filter.endian);
+    const uint8_t* source = shared_memory().TranslatePhysical(texture_key.base_page << 12);
+    if (DumpTextureLoad(dump_filter, rex::to_path(texture_load_dump_config_.directory), source,
+                        texture.GetGuestBaseSize())) {
+      texture_load_dump_attempted_ = true;
+    } else {
+      REXGPU_ERROR("Failed to dump the first matching texture load");
+    }
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled

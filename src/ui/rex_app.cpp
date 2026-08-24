@@ -168,7 +168,8 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    // Keep logs in user data so read-only installs can start.
+    log_config.log_dir = (user_data_root_ / "logs").string();
   }
 
   rex::InitLogging(log_config);

@@ -374,6 +374,9 @@ void BuilderContext::emit_mid_asm_hook() {
       case 'x':
         out += xer();
         break;
+      case 'l':
+        out += "ctx.lr";
+        break;
       case 'r':
         if (reg == "reserved")
           out += reserved();

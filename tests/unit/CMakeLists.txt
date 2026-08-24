@@ -8,6 +8,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/hash_test.cpp
+    core/sha256_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
     ppc/import_function_test.cpp
@@ -15,6 +16,7 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    graphics/diagnostic_util_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
@@ -22,6 +24,7 @@ add_executable(unit_tests
 )
 
 target_sources(unit_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
 )

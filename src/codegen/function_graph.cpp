@@ -434,6 +434,12 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
             case 'x':
               emit_print(out, "PPCXERRegister& xer");
               break;
+            // lr is a bare uint64_t in the context, not a PPCRegister. At a
+            // function-entry hook it still holds the caller's return address,
+            // which is the only way a hook can identify its caller.
+            case 'l':
+              emit_print(out, "uint64_t lr");
+              break;
             case 'r':
               emit_print(out, "PPCRegister& {}", reg);
               break;

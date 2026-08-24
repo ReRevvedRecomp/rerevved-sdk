@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -606,6 +607,21 @@ class TextureCache {
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
+
+  struct TextureLoadDumpConfig {
+    std::string directory;
+    uint32_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pitch = 0;
+    uint32_t tiled = 0;
+    uint32_t format = 0;
+    uint32_t endian = 0;
+    bool any_address = false;
+    bool exact = true;
+    bool enabled = false;
+  } texture_load_dump_config_;
+  bool texture_load_dump_attempted_ = false;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

@@ -364,6 +364,23 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   }
 }
 
+bool GraphicsSystem::PauseAndResetGpuWritePointer() {
+  if (!command_processor_) {
+    return false;
+  }
+  const bool resume = !command_processor_->is_paused();
+  if (resume) {
+    command_processor_->Pause();
+  }
+  command_processor_->UpdateWritePointer(0);
+  return resume;
+}
+
+void GraphicsSystem::ResumeGpu() {
+  if (command_processor_) {
+    command_processor_->Resume();
+  }
+}
 void GraphicsSystem::Pause() {
   paused_ = true;
   command_processor_->Pause();

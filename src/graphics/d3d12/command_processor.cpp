@@ -12,23 +12,27 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
-#include <rex/perf/counter.h>
+#include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/perf/counter.h>
+#include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -47,7 +51,30 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(d3d12_capture_swap_texture, "", "GPU/D3D12",
+                      "One-shot path for a raw pre-gamma swap texture capture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+
+bool CreateDiagnosticCaptureParent(const std::filesystem::path& path, const char* name) {
+  const std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) {
+    return true;
+  }
+  std::error_code error;
+  std::filesystem::create_directories(parent, error);
+  if (error) {
+    REXGPU_ERROR("Skipping the {} capture because its parent directory could not be created: {}",
+                 name, error.message());
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -66,6 +93,59 @@ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_syste
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
 D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+
+void D3D12CommandProcessor::ArmTextureLoadScratchCapture(const std::filesystem::path& path) {
+  texture_load_scratch_capture_armed_ = true;
+  texture_load_scratch_capture_path_ = path;
+  texture_load_scratch_capture_buffer_.Reset();
+  texture_load_scratch_capture_size_ = 0;
+  texture_load_scratch_capture_submission_ = 0;
+}
+
+void D3D12CommandProcessor::CaptureTextureLoadScratch(ID3D12Resource* buffer, uint32_t size) {
+  if (!texture_load_scratch_capture_armed_) {
+    return;
+  }
+  texture_load_scratch_capture_armed_ = false;
+  D3D12_RESOURCE_DESC capture_buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&texture_load_scratch_capture_buffer_)))) {
+    REXGPU_ERROR("Failed to create the texture-load scratch capture buffer");
+    return;
+  }
+  texture_load_scratch_capture_size_ = size;
+  deferred_command_list_.D3DCopyBufferRegion(texture_load_scratch_capture_buffer_.Get(), 0, buffer,
+                                             0, size);
+  texture_load_scratch_capture_submission_ = submission_current_;
+}
+
+std::filesystem::path D3D12CommandProcessor::GetSwapTextureCapturePath() const {
+  std::string path = REXCVAR_GET(d3d12_capture_swap_texture);
+  return path.empty() ? std::filesystem::path() : rex::to_path(path);
+}
+
+ID3D12Resource* D3D12CommandProcessor::RequestDiagnosticBufferCapture(
+    const std::filesystem::path& path, uint32_t size) {
+  if (path.empty() || !size) {
+    return nullptr;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+  DiagnosticBufferCapture capture{path, nullptr, size, submission_current_};
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture.buffer)))) {
+    REXGPU_ERROR("Failed to create a diagnostic readback buffer");
+    return nullptr;
+  }
+  diagnostic_buffer_captures_.push_back(std::move(capture));
+  return diagnostic_buffer_captures_.back().buffer.Get();
+}
 
 void D3D12CommandProcessor::UpdateDebugMarkersEnabled() {
   debug_markers_enabled_ = IsGpuDebugMarkersEnabled();
@@ -1627,7 +1707,14 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
-  AwaitAllQueueOperationsCompletion();
+  const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
+  if (!diagnostic::CanReleaseSubmittedGpuResources(queue_is_idle, device_is_removed)) {
+    REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
+    CommandProcessor::ShutdownContext();
+    return;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1755,7 +1842,9 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ui::d3d12::util::ReleaseAndNull(submission_fence_);
   submission_open_ = false;
+  submission_fence_failed_ = false;
   submission_current_ = 1;
+  submission_last_signaled_ = 0;
   submission_completed_ = 0;
 
   if (fence_completion_event_) {
@@ -1911,24 +2000,110 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  static bool swap_texture_capture_attempted = false;
+  std::string swap_texture_capture_path_utf8 = REXCVAR_GET(d3d12_capture_swap_texture);
+  std::filesystem::path swap_texture_capture_path;
+  if (!swap_texture_capture_attempted && !swap_texture_capture_path_utf8.empty()) {
+    swap_texture_capture_path = rex::to_path(swap_texture_capture_path_utf8);
+    std::filesystem::path scratch_path = swap_texture_capture_path;
+    scratch_path.replace_extension(".scratch.bin");
+    ArmTextureLoadScratchCapture(scratch_path);
+  }
+
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
   xenos::TextureFormat frontbuffer_format;
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+  const auto& regs = *register_file_;
+  auto fetch = regs.GetTextureFetch(0);
   ID3D12Resource* swap_texture_resource =
       texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
                                          &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
-    const auto& regs = *register_file_;
-    auto fetch = regs.GetTextureFetch(0);
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> swap_texture_capture_buffer;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT swap_texture_capture_footprint = {};
+  UINT swap_texture_capture_row_count = 0;
+  UINT64 swap_texture_capture_row_size = 0;
+  UINT64 swap_texture_capture_buffer_size = 0;
+  uint64_t swap_texture_capture_submission = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource> swap_source_capture_buffer;
+  uint32_t swap_source_capture_size = 0;
+  uint64_t swap_source_capture_submission = 0;
+  std::filesystem::path swap_source_capture_path;
+  if (!swap_texture_capture_attempted && !swap_texture_capture_path_utf8.empty()) {
+    swap_texture_capture_attempted = true;
+
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+
+    const FormatInfo* format_info = FormatInfo::Get(fetch.format);
+    uint32_t pitch_blocks =
+        ((fetch.pitch << 5) + format_info->block_width - 1) / format_info->block_width;
+    uint32_t height_blocks =
+        (frontbuffer_height_unscaled + format_info->block_height - 1) / format_info->block_height;
+    if (fetch.tiled) {
+      height_blocks = rex::align(height_blocks, xenos::kTextureTileWidthHeight);
+    }
+    swap_source_capture_size = pitch_blocks * height_blocks * format_info->bytes_per_block();
+    D3D12_RESOURCE_DESC source_capture_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(source_capture_buffer_desc, swap_source_capture_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    if (SUCCEEDED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                                  D3D12_HEAP_FLAG_NONE, &source_capture_buffer_desc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&swap_source_capture_buffer)))) {
+      shared_memory_->UseAsCopySource();
+      SubmitBarriers();
+      deferred_command_list_.D3DCopyBufferRegion(
+          swap_source_capture_buffer.Get(), 0, shared_memory_->GetBuffer(),
+          fetch.base_address << 12, swap_source_capture_size);
+      swap_source_capture_submission = submission_current_;
+      shared_memory_->UseForReading();
+      SubmitBarriers();
+      swap_source_capture_path = swap_texture_capture_path;
+      swap_source_capture_path.replace_extension(".source.bin");
+    } else {
+      REXGPU_ERROR("Failed to create the swap source capture buffer");
+    }
+
+    device->GetCopyableFootprints(&swap_texture_desc, 0, 1, 0, &swap_texture_capture_footprint,
+                                  &swap_texture_capture_row_count, &swap_texture_capture_row_size,
+                                  &swap_texture_capture_buffer_size);
+    D3D12_RESOURCE_DESC capture_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(capture_buffer_desc, swap_texture_capture_buffer_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&swap_texture_capture_buffer)))) {
+      REXGPU_ERROR("Failed to create the pre-gamma swap texture capture buffer");
+    } else {
+      PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+      SubmitBarriers();
+      D3D12_TEXTURE_COPY_LOCATION capture_dest = {};
+      capture_dest.pResource = swap_texture_capture_buffer.Get();
+      capture_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      capture_dest.PlacedFootprint = swap_texture_capture_footprint;
+      D3D12_TEXTURE_COPY_LOCATION capture_source = {};
+      capture_source.pResource = swap_texture_resource;
+      capture_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      capture_source.SubresourceIndex = 0;
+      deferred_command_list_.D3DCopyTextureRegion(&capture_dest, 0, 0, 0, &capture_source, nullptr);
+      PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      SubmitBarriers();
+      swap_texture_capture_submission = submission_current_;
+    }
+  }
+
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
   // from the swap packet, scaled proportionally to the actual source texture.
@@ -2247,19 +2422,106 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
-        EndSubmission(true);
-        return true;
+        return EndSubmission(true);
       });
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
-  EndSubmission(true);
+  if (!EndSubmission(true)) {
+    if (swap_texture_capture_buffer) {
+      submission_retry_resources_.push_back(std::move(swap_texture_capture_buffer));
+    }
+    if (swap_source_capture_buffer) {
+      submission_retry_resources_.push_back(std::move(swap_source_capture_buffer));
+    }
+    return;
+  }
+
+  if (swap_texture_capture_buffer) {
+    if (!CheckSubmissionFence(swap_texture_capture_submission)) {
+      REXGPU_ERROR("Failed to await the pre-gamma swap texture capture submission");
+    } else if (CreateDiagnosticCaptureParent(swap_texture_capture_path, "pre-gamma swap texture")) {
+      D3D12_RANGE read_range = {swap_texture_capture_footprint.Offset,
+                                swap_texture_capture_buffer_size};
+      void* mapping = nullptr;
+      if (FAILED(swap_texture_capture_buffer->Map(0, &read_range, &mapping))) {
+        REXGPU_ERROR("Failed to map the pre-gamma swap texture capture buffer");
+      } else {
+        std::ofstream capture_file(swap_texture_capture_path, std::ios::binary);
+        const uint8_t* capture_base =
+            static_cast<const uint8_t*>(mapping) + swap_texture_capture_footprint.Offset;
+        for (UINT row = 0; row < swap_texture_capture_row_count; ++row) {
+          capture_file.write(
+              reinterpret_cast<const char*>(
+                  capture_base + size_t(row) * swap_texture_capture_footprint.Footprint.RowPitch),
+              swap_texture_capture_row_size);
+        }
+        D3D12_RANGE write_range = {0, 0};
+        swap_texture_capture_buffer->Unmap(0, &write_range);
+        if (!capture_file) {
+          REXGPU_ERROR("Failed to write the pre-gamma swap texture capture");
+        } else {
+          REXGPU_INFO(
+              "Captured pre-gamma swap texture: {}x{}, format {}, row pitch {}, "
+              "row size {}, {} rows, submission {}, path {}",
+              swap_texture_desc.Width, swap_texture_desc.Height, uint32_t(swap_texture_desc.Format),
+              swap_texture_capture_footprint.Footprint.RowPitch, swap_texture_capture_row_size,
+              swap_texture_capture_row_count, swap_texture_capture_submission,
+              rex::path_to_utf8(swap_texture_capture_path));
+        }
+      }
+    }
+  }
+
+  auto write_buffer_capture = [this](ID3D12Resource* buffer, uint32_t size,
+                                     const std::filesystem::path& path, uint64_t submission,
+                                     const char* name) {
+    if (!buffer || !size || path.empty()) {
+      return;
+    }
+    if (!submission || !CheckSubmissionFence(submission)) {
+      REXGPU_ERROR("Skipping the {} capture because submission {} did not complete", name,
+                   submission);
+      return;
+    }
+    if (!CreateDiagnosticCaptureParent(path, name)) {
+      return;
+    }
+    D3D12_RANGE read_range = {0, size};
+    void* mapping = nullptr;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      REXGPU_ERROR("Failed to map the {} capture buffer", name);
+      return;
+    }
+    std::ofstream capture_file(path, std::ios::binary);
+    capture_file.write(reinterpret_cast<const char*>(mapping), size);
+    D3D12_RANGE write_range = {0, 0};
+    buffer->Unmap(0, &write_range);
+    if (!capture_file) {
+      REXGPU_ERROR("Failed to write the {} capture", name);
+    }
+  };
+  write_buffer_capture(swap_source_capture_buffer.Get(), swap_source_capture_size,
+                       swap_source_capture_path, swap_source_capture_submission, "swap source");
+  write_buffer_capture(texture_load_scratch_capture_buffer_.Get(),
+                       texture_load_scratch_capture_size_, texture_load_scratch_capture_path_,
+                       texture_load_scratch_capture_submission_, "texture-load scratch");
+  for (const DiagnosticBufferCapture& capture : diagnostic_buffer_captures_) {
+    write_buffer_capture(capture.buffer.Get(), capture.size, capture.path, capture.submission,
+                         "diagnostic buffer");
+  }
+  diagnostic_buffer_captures_.clear();
+  texture_load_scratch_capture_buffer_.Reset();
+  texture_load_scratch_capture_size_ = 0;
+  texture_load_scratch_capture_submission_ = 0;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
-    EndSubmission(false);
+    if (!EndSubmission(false)) {
+      REXGPU_WARN("Deferred primary-buffer-end submission remains pending");
+    }
   }
 }
 
@@ -2848,12 +3110,12 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   readback.submission_written[write_index] = submission_current_;
   readback.written_size[write_index] = total_size;
 
-  CheckSubmissionFence(0);
-  bool previous_slot_ready = readback.buffers[read_index] && readback.mapped_data[read_index] &&
-                             total_size <= readback.sizes[read_index] &&
-                             total_size <= readback.written_size[read_index] &&
-                             readback.submission_written[read_index] &&
-                             readback.submission_written[read_index] <= submission_completed_;
+  bool fence_ready = CheckSubmissionFence(0);
+  bool previous_slot_ready =
+      fence_ready && readback.buffers[read_index] && readback.mapped_data[read_index] &&
+      total_size <= readback.sizes[read_index] && total_size <= readback.written_size[read_index] &&
+      readback.submission_written[read_index] &&
+      readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
@@ -3102,10 +3364,14 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   return true;
 }
 
-void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+  if (device_removed_ || submission_fence_failed_) {
+    return false;
+  }
+
   if (await_submission >= submission_current_) {
-    if (submission_open_) {
-      EndSubmission(false);
+    if (submission_open_ && !EndSubmission(false)) {
+      return false;
     }
     // Ending an open submission should result in queue operations done directly
     // (like UpdateTileMappings) to be tracked within the scope of that
@@ -3114,39 +3380,85 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (queue_operations_done_since_submission_signal_) {
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
-                        fence_value, fence_completion_event_)))) {
-        PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
-        queue_operations_done_since_submission_signal_ = false;
-      } else {
-        REXGPU_ERROR(
-            "Failed to await an out-of-submission queue operation completion "
-            "Direct3D 12 fence");
+      HRESULT signal_result =
+          direct_queue->Signal(queue_operations_since_submission_fence_, fence_value);
+      if (FAILED(signal_result)) {
+        HandleFenceFailure("Out-of-submission queue operation fence Signal", signal_result, true);
+        return false;
       }
+      HRESULT event_result = queue_operations_since_submission_fence_->SetEventOnCompletion(
+          fence_value, fence_completion_event_);
+      if (FAILED(event_result)) {
+        HandleFenceFailure("Out-of-submission queue operation fence event arming", event_result,
+                           false);
+        return false;
+      }
+      PROFILE_CMD_BUFFER_STALL();
+      DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+      if (wait_result != WAIT_OBJECT_0) {
+        HRESULT wait_error =
+            wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+        HandleFenceFailure("Out-of-submission queue operation fence wait", wait_error, false);
+        return false;
+      }
+      uint64_t queue_operations_completed =
+          queue_operations_since_submission_fence_->GetCompletedValue();
+      if (!diagnostic::IsFenceWaitReady(queue_operations_completed, fence_value, true, true,
+                                        true)) {
+        if (!diagnostic::IsFenceCompletionValueValid(queue_operations_completed)) {
+          HandleFenceFailure("Out-of-submission queue operation fence completion",
+                             DXGI_ERROR_DEVICE_REMOVED, true);
+        } else {
+          REXGPU_ERROR("Out-of-submission queue operation fence wait completed below {}",
+                       fence_value);
+        }
+        return false;
+      }
+      queue_operations_done_since_submission_signal_ = false;
     }
-    // A submission won't be ended if it hasn't been started, or if ending
-    // has failed - clamp the index.
-    await_submission = submission_current_ - 1;
+    // If no submission was open, the current identity has not been signaled.
+    await_submission = submission_last_signaled_;
+  } else if (await_submission > submission_last_signaled_) {
+    REXGPU_ERROR("Submission {} was not successfully signaled", await_submission);
+    return false;
   }
 
   uint64_t submission_completed_before = submission_completed_;
-  submission_completed_ = submission_fence_->GetCompletedValue();
-  if (submission_completed_ < await_submission) {
-    if (SUCCEEDED(
-            submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
-      PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
-      submission_completed_ = submission_fence_->GetCompletedValue();
+  uint64_t submission_completed = submission_fence_->GetCompletedValue();
+  if (!diagnostic::IsFenceCompletionValueValid(submission_completed)) {
+    HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
+    return false;
+  }
+  if (submission_completed < await_submission) {
+    HRESULT event_result =
+        submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_);
+    if (FAILED(event_result)) {
+      HandleFenceFailure("Submission fence event arming", event_result, false);
+      return false;
+    }
+    PROFILE_CMD_BUFFER_STALL();
+    DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+      HRESULT wait_error = wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+      HandleFenceFailure("Submission fence wait", wait_error, false);
+      return false;
+    }
+    submission_completed = submission_fence_->GetCompletedValue();
+    if (!diagnostic::IsFenceWaitReady(submission_completed, await_submission, true, true, true)) {
+      if (!diagnostic::IsFenceCompletionValueValid(submission_completed)) {
+        HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
+      } else {
+        REXGPU_ERROR("Submission fence wait completed below {}", await_submission);
+      }
+      return false;
     }
   }
-  if (submission_completed_ < await_submission) {
-    REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
+  if (submission_completed > submission_completed_) {
+    submission_completed_ = submission_completed;
   }
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
-    return;
+    return submission_completed_ >= await_submission;
   }
 
   // Reclaim command allocators.
@@ -3192,6 +3504,32 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+  return submission_completed_ >= await_submission;
+}
+
+void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
+                                               bool tracking_is_unrecoverable) {
+  REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
+  submission_fence_failed_ |= tracking_is_unrecoverable;
+
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  HRESULT device_removed_reason = device->GetDeviceRemovedReason();
+  if (SUCCEEDED(device_removed_reason) && operation_result == DXGI_ERROR_DEVICE_REMOVED) {
+    device_removed_reason = operation_result;
+  }
+  const bool device_is_removed = FAILED(device_removed_reason);
+  if (device_is_removed && !device_removed_) {
+    LogDeviceRemovalDiagnostics(device, device_removed_reason);
+  }
+  if (diagnostic::IsFenceFailureTerminal(tracking_is_unrecoverable, device_is_removed) &&
+      !device_removed_) {
+    device_removed_ = true;
+    if (graphics_system_) {
+      graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
+                                                   DXGI_ERROR_DEVICE_REMOVED);
+    }
+    rex::FatalError("Graphics submission completion tracking failed");
+  }
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3252,7 +3590,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  if (device_removed_) {
+  if (device_removed_ || submission_fence_failed_) {
     return false;
   }
 
@@ -3277,11 +3615,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
-  // TODO(Triang3l): If failed to await (completed submission < awaited frame
-  // submission), do something like dropping the draw command that wanted to
-  // open the frame.
+  if (!CheckSubmissionFence(
+          is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames] : 0)) {
+    return false;
+  }
   if (is_opening_frame) {
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
@@ -3373,6 +3710,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (device_removed_ || submission_fence_failed_) {
+    return false;
+  }
 
   // Make sure there is a command allocator to write commands to.
   if (submission_open_ && !command_allocator_writable_first_) {
@@ -3442,13 +3782,25 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
-
+    const uint64_t submitted_submission = submission_current_++;
+    HRESULT signal_result = direct_queue->Signal(submission_fence_, submitted_submission);
     submission_open_ = false;
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
     // alongside the last submission if needed.
     queue_operations_done_since_submission_signal_ = false;
+    if (FAILED(signal_result)) {
+      // ExecuteCommandLists has already queued work. Its allocator and identity
+      // must remain submitted even though completion can no longer be tracked.
+      HandleFenceFailure("Submission fence Signal", signal_result, true);
+      return false;
+    }
+    submission_last_signaled_ = submitted_submission;
+
+    for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {
+      resources_for_deletion_.emplace_back(submitted_submission, resource.Detach());
+    }
+    submission_retry_resources_.clear();
   }
 
   if (is_closing_frame) {
@@ -4883,7 +5235,9 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
     if (BeginSubmission(true)) {
       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                          host_index);
-      EndSubmission(false);
+      if (!EndSubmission(false)) {
+        REXGPU_WARN("Occlusion-query disable submission remains pending");
+      }
     }
   } else {
     active_occlusion_query_ = {};
@@ -4944,8 +5298,7 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   }
 
   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
-  CheckSubmissionFence(query_submission);
-  if (submission_completed_ < query_submission) {
+  if (!CheckSubmissionFence(query_submission)) {
     return false;
   }
   if (!occlusion_query_readback_mapping_) {
