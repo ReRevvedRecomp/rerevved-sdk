@@ -42,7 +42,7 @@ endfunction()
 # rexglue_apply_target_settings(<target>) - Common flags
 #
 # Applied to both host apps and guest DLL modules. Compile/link flags only;
-# runtime DLL staging is the host's job (see rexglue_configure_target).
+# runtime library staging is the host's job (see rexglue_configure_target).
 #==========================================================
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
@@ -69,7 +69,7 @@ endfunction()
 #   - SDL3 entry point source (windowed_app_main_sdl.cpp)
 #   - ReXApp base class source (rex_app.cpp)
 #   - Build-config define for the version stamp
-#   - $ORIGIN RPATH on UNIX so the host finds librexruntime.so next to itself
+#   - $ORIGIN RPATH and shared runtime staging on UNIX
 #   - Windows POST_BUILD copy of TARGET_RUNTIME_DLLS and the FidelityFX DLLs.
 #     Guest modules colocate with the host (see rexglue_configure_module_target),
 #     so this single copy handles them transitively.
@@ -89,6 +89,31 @@ function(rexglue_configure_target target_name)
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )
+        # Stage the shared runtime libraries covered by the host's $ORIGIN
+        # contract. rex::runtime is canonical in-tree and when installed.
+        if(TARGET rex::runtime)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:rex::runtime>
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endif()
+        set(_tracy_target)
+        if(TARGET TracyClient)
+            set(_tracy_target TracyClient)
+        elseif(TARGET rex::TracyClient)
+            set(_tracy_target rex::TracyClient)
+        endif()
+        if(_tracy_target)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:${_tracy_target}>
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+            unset(_tracy_target)
+        endif()
     elseif(APPLE)
         # macOS analogue of $ORIGIN: resolve @rpath dylibs (librexruntime,
         # libTracyClient, ...) next to the executable. Pairs with the runtime
@@ -177,8 +202,8 @@ endfunction()
 #
 # Output is colocated with HOST (or CMAKE_RUNTIME_OUTPUT_DIRECTORY) so the
 # host's LoadUserModule finds it; the host is wired to depend on the module
-# so a top-level build of the host pulls in all guest DLLs. No runtime DLL
-# staging here; the host's POST_BUILD copy covers shared dependencies.
+# so a top-level build of the host pulls in all guest DLLs. No runtime-library
+# staging occurs here; the host's POST_BUILD copy covers shared dependencies.
 #==========================================================
 function(rexglue_configure_module_target target_name)
     cmake_parse_arguments(ARG "" "HOST" "" ${ARGN})
