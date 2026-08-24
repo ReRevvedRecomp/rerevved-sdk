@@ -48,7 +48,7 @@ jobs:
             ca-certificates curl wget gnupg git git-lfs
           git config --global --add safe.directory '*'
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           submodules: recursive
@@ -66,28 +66,28 @@ jobs:
         if: inputs.platform == 'win-amd64'
         run: choco install llvm cmake ninja -y
 
-      - name: Install clang 20 (linux-amd64)
+      - name: Install clang 22 (linux-amd64)
         if: inputs.platform == 'linux-amd64'
         run: |
           apt-get install -y --no-install-recommends software-properties-common lsb-release
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          ./llvm.sh 20
-          apt-get install -y clang-20 lld-20
-          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
-          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 200
+          ./llvm.sh 22
+          apt-get install -y clang-22 lld-22
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 220
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-22 220
 
-      - name: Install clang 20 (linux-arm64)
+      - name: Install clang 22 (linux-arm64)
         if: inputs.platform == 'linux-arm64'
         run: |
           sudo apt-get update
           sudo apt-get install -y wget gnupg lsb-release
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 20
-          sudo apt-get install -y clang-20 lld-20
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 200
+          sudo ./llvm.sh 22
+          sudo apt-get install -y clang-22 lld-22
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 220
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-22 220
 
       - name: Install build deps (macOS)
         if: startsWith(inputs.platform, 'mac-')
@@ -125,8 +125,8 @@ jobs:
 
       - name: Configure
         env:
-          CC: ${{ fromJSON('{"win-amd64":"clang","mac-amd64":"/usr/bin/clang","mac-arm64":"/usr/bin/clang","linux-amd64":"clang-20","linux-arm64":"clang-20"}')[inputs.platform] }}
-          CXX: ${{ fromJSON('{"win-amd64":"clang++","mac-amd64":"/usr/bin/clang++","mac-arm64":"/usr/bin/clang++","linux-amd64":"clang++-20","linux-arm64":"clang++-20"}')[inputs.platform] }}
+          CC: ${{ fromJSON('{"win-amd64":"clang","mac-amd64":"/usr/bin/clang","mac-arm64":"/usr/bin/clang","linux-amd64":"clang-22","linux-arm64":"clang-22"}')[inputs.platform] }}
+          CXX: ${{ fromJSON('{"win-amd64":"clang++","mac-amd64":"/usr/bin/clang++","mac-arm64":"/usr/bin/clang++","linux-amd64":"clang++-22","linux-arm64":"clang++-22"}')[inputs.platform] }}
         run: >-
           cmake --preset ${{ inputs.platform }}
           -DREXGLUE_BUILD_TESTS=${{ inputs.platform == 'win-amd64' && 'ON' || 'OFF' }}
@@ -184,7 +184,7 @@ jobs:
 
       - name: Upload SDK artifact
         if: inputs.publish_mode == 'artifact'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.artifact_name || format('rexglue-sdk-{0}-{1}', steps.version.outputs.v, inputs.platform) }}
           path: out/install/rexglue-sdk-*-${{ inputs.platform }}.zip
