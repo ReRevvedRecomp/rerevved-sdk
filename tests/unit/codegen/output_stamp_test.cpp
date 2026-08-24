@@ -113,10 +113,19 @@ TEST_CASE("An unreadable input is not fingerprinted as empty content", "[output_
 
 TEST_CASE("A missing input file still yields a usable fingerprint", "[output_stamp]") {
   Scratch scratch("missing");
-  std::vector<fs::path> inputs{scratch.root / "absent.xex"};
+  auto optional = scratch.root / "game.xexp";
+  std::vector<fs::path> inputs{optional};
   std::vector<std::string> flags;
 
-  CHECK_FALSE(ComputeInputFingerprint(inputs, "1.2.3", flags).empty());
+  auto missing = ComputeInputFingerprint(inputs, "1.2.3", flags);
+  CHECK_FALSE(missing.empty());
+
+  scratch.WriteFile("game.xexp", "patch bytes");
+  auto present = ComputeInputFingerprint(inputs, "1.2.3", flags);
+  CHECK(present != missing);
+
+  fs::remove(optional);
+  CHECK(ComputeInputFingerprint(inputs, "1.2.3", flags) == missing);
 }
 
 TEST_CASE("Stamp round-trips through Serialize and Load", "[output_stamp]") {

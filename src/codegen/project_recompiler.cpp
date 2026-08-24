@@ -60,7 +60,10 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
   namespace fs = std::filesystem;
 
   std::vector<fs::path> inputs;
-  inputs.push_back(configDir / cfg.filePath);
+  fs::path modulePath = configDir / cfg.filePath;
+  inputs.push_back(modulePath);
+  modulePath += "p";
+  inputs.push_back(std::move(modulePath));
   inputs.push_back(manifestPath);
   for (const auto& loaded : cfg.loadedFiles) {
     inputs.emplace_back(loaded);
@@ -361,7 +364,17 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto inputs =
         CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
     fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
-    allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
+    fs::path siblingPatch = entry.ctx.configDir() / entry.ctx.Config().filePath;
+    siblingPatch += "p";
+    std::error_code patchError;
+    bool patchExists = fs::exists(siblingPatch, patchError);
+    for (const auto& input : inputs) {
+      // A missing depfile input would keep the build rule perpetually dirty.
+      // Watch the containing directory until the optional sibling patch
+      // appears, while its missing marker still participates in the stamp.
+      allInputs.push_back(input == siblingPatch && !patchExists ? siblingPatch.parent_path()
+                                                                : input);
+    }
 
     if (opts.ignoreStamp || opts.force)
       continue;
