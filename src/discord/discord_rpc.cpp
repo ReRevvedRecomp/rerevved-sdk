@@ -11,7 +11,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <vector>
 #endif
 
@@ -25,7 +25,7 @@ REXCVAR_DEFINE_BOOL(discord_activity, true, "Thirdparty", "Enable Discord Rich P
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -57,7 +57,7 @@ HANDLE g_pipe = INVALID_HANDLE_VALUE;
 bool IsConnected() {
   return g_pipe != INVALID_HANDLE_VALUE;
 }
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 int g_sock = -1;
 bool IsConnected() {
   return g_sock != -1;
@@ -88,7 +88,7 @@ void CloseConnection() {
   }
 }
 
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 std::vector<std::string> GetSocketDirs() {
   std::vector<std::string> dirs;
@@ -151,7 +151,7 @@ bool WriteFrame(uint32_t op, const std::string& payload) {
   return true;
 }
 
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 bool WriteAll(const void* buf, size_t len) {
   const char* ptr = static_cast<const char*>(buf);
@@ -218,7 +218,7 @@ void DrainMessages(bool* out_ready = nullptr) {
   }
 }
 
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 bool ReadAll(void* buf, size_t len) {
   char* ptr = static_cast<char*>(buf);
@@ -281,7 +281,7 @@ uint32_t GetPid() {
 std::string GetNonce() {
   return std::to_string(::GetTickCount());
 }
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 uint32_t GetPid() {
   return static_cast<uint32_t>(::getpid());
 }

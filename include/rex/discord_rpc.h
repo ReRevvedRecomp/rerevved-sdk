@@ -19,7 +19,7 @@
 
 #include <rex/platform.h>
 
-#if REX_PLATFORM_WIN32 || REX_PLATFORM_LINUX
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 namespace rex::discord_rpc {
 
@@ -49,4 +49,4 @@ void Stop();
 
 }  // namespace rex::discord_rpc
 
-#endif  // REX_PLATFORM_WIN32 || REX_PLATFORM_LINUX
+#endif  // REX_PLATFORM_WIN32 || REX_PLATFORM_LINUX || REX_PLATFORM_MAC

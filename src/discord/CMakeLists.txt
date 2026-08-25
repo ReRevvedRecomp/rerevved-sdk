@@ -1,7 +1,7 @@
 # rexdiscord - Discord Rich Presence client
-# Windows and Linux only
+# Desktop platforms only
 
-if(NOT WIN32 AND NOT LINUX)
+if(NOT WIN32 AND NOT LINUX AND NOT APPLE)
   return()
 endif()
 
