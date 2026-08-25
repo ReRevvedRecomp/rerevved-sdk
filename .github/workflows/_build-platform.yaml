@@ -118,7 +118,7 @@ jobs:
             libasound2-dev libpulse-dev libpipewire-0.3-dev
 
       - name: Set up sccache
-        uses: hendrikmuhs/ccache-action@v1.2.22
+        uses: hendrikmuhs/ccache-action@v1.2.23
         with:
           variant: sccache
           key: ${{ inputs.platform }}
@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload release asset
         if: inputs.publish_mode == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.2
         with:
           files: out/install/rexglue-sdk-*-${{ inputs.platform }}.zip
           generate_release_notes: true
