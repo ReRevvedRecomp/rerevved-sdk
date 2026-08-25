@@ -17,7 +17,6 @@ add_executable(unit_tests
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     system/mod_dependency_test.cpp
-    system/mod_plugin_test.cpp
     graphics/diagnostic_util_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
@@ -43,6 +42,17 @@ target_link_libraries(unit_tests PRIVATE
     Catch2::Catch2WithMain
 )
 
+add_executable(mod_plugin_tests
+    system/mod_plugin_test.cpp
+)
+target_include_directories(mod_plugin_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(mod_plugin_tests PRIVATE
+    rexruntime
+    Catch2::Catch2WithMain
+)
+
 set(REX_TEST_MODS_ROOT "${CMAKE_CURRENT_BINARY_DIR}/mods")
 if(REX_PLATFORM STREQUAL "win-amd64")
     set(REX_TEST_MOD_PLATFORM "windows-x64")
@@ -52,6 +62,10 @@ elseif(REX_PLATFORM STREQUAL "linux-amd64")
     set(REX_TEST_MOD_PLATFORM "linux-x64")
 elseif(REX_PLATFORM STREQUAL "linux-arm64")
     set(REX_TEST_MOD_PLATFORM "linux-arm64")
+elseif(REX_PLATFORM STREQUAL "mac-amd64")
+    set(REX_TEST_MOD_PLATFORM "macos-x64")
+elseif(REX_PLATFORM STREQUAL "mac-arm64")
+    set(REX_TEST_MOD_PLATFORM "macos-arm64")
 else()
     message(FATAL_ERROR "No mod package platform mapping for ${REX_PLATFORM}")
 endif()
@@ -60,6 +74,7 @@ add_library(test_mod_bad_abi SHARED system/test_mod_bad_abi.cpp)
 foreach(target test_mod_plugin test_mod_bad_abi)
     target_link_libraries(${target} PRIVATE rexruntime)
     set_target_properties(${target} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${REX_TEST_MODS_ROOT}/$<TARGET_PROPERTY:${target},OUTPUT_NAME>/code/${REX_TEST_MOD_PLATFORM}"
         RUNTIME_OUTPUT_DIRECTORY "${REX_TEST_MODS_ROOT}/$<TARGET_PROPERTY:${target},OUTPUT_NAME>/code/${REX_TEST_MOD_PLATFORM}"
         DEBUG_POSTFIX "d"
         RELWITHDEBINFO_POSTFIX "rd"
@@ -68,11 +83,11 @@ foreach(target test_mod_plugin test_mod_bad_abi)
 endforeach()
 set_target_properties(test_mod_plugin PROPERTIES OUTPUT_NAME lifecycle)
 set_target_properties(test_mod_bad_abi PROPERTIES OUTPUT_NAME bad_abi)
-target_compile_definitions(unit_tests PRIVATE
+target_compile_definitions(mod_plugin_tests PRIVATE
     REX_TEST_MOD_PLUGIN_PATH="$<TARGET_FILE:test_mod_plugin>"
     REX_TEST_BAD_MOD_PLUGIN_PATH="$<TARGET_FILE:test_mod_bad_abi>"
 )
-add_dependencies(unit_tests test_mod_plugin test_mod_bad_abi)
+add_dependencies(mod_plugin_tests test_mod_plugin test_mod_bad_abi)
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into
 # rexui. Keep its SDK-consumer compilation path covered by the test build.
@@ -88,19 +103,27 @@ target_link_libraries(rexapp_compile_test PRIVATE
 add_dependencies(unit_tests rexapp_compile_test)
 
 # Strip Tracy/profiling instrumentation from test targets
-target_compile_options(unit_tests PRIVATE
-    -UTRACY_ENABLE -UREXGLUE_ENABLE_PROFILING
-    -UREXGLUE_ENABLE_PERF_COUNTERS -UREXGLUE_PROFILE_GUEST_FUNCTIONS
-)
+foreach(target unit_tests mod_plugin_tests)
+    target_compile_options(${target} PRIVATE
+        -UTRACY_ENABLE -UREXGLUE_ENABLE_PROFILING
+        -UREXGLUE_ENABLE_PERF_COUNTERS -UREXGLUE_PROFILE_GUEST_FUNCTIONS
+    )
+endforeach()
 
-set_target_properties(unit_tests PROPERTIES
+set_target_properties(unit_tests mod_plugin_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
 )
 if(UNIX AND NOT APPLE)
-    set_target_properties(unit_tests PROPERTIES
+    set_target_properties(unit_tests mod_plugin_tests PROPERTIES
         INSTALL_RPATH "$ORIGIN"
         BUILD_WITH_INSTALL_RPATH ON
     )
+endif()
+
+# The full historical suite currently includes host-specific cases. Unix
+# artifact builds exercise the portable mod loader executable instead.
+if(NOT REX_PLATFORM MATCHES "^win-")
+    set_target_properties(unit_tests PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
 # Discover tests
@@ -109,5 +132,11 @@ catch_discover_tests(unit_tests
     TEST_PREFIX "unit."
     PROPERTIES
         LABELS "unit"
+        TIMEOUT 60
+)
+catch_discover_tests(mod_plugin_tests
+    TEST_PREFIX "mod_plugin."
+    PROPERTIES
+        LABELS "mod_plugin"
         TIMEOUT 60
 )

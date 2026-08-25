@@ -90,8 +90,8 @@ struct ModInfo {
   std::vector<std::string> platforms;
 };
 
-// Loads code/<platform>/<stem>[<config-postfix>].dll or .so, with a legacy
-// flat code/ fallback. Failures are logged with the owning mod name.
+// Loads a native plugin from code/<platform>/, with a legacy flat code/
+// fallback. Failures are logged with the owning mod name.
 std::unique_ptr<IModPlugin> LoadModPlugin(const std::filesystem::path& mod_root,
                                           std::string_view mod_name, std::string_view code_stem,
                                           const ModHostContext& context);

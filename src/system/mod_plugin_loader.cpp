@@ -1,6 +1,6 @@
 /**
  * @file        system/mod_plugin_loader.cpp
- * @brief       Host-side loader for mod code-plugin DLLs
+ * @brief       Host-side loader for native mod code plugins
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  *              All rights reserved.
@@ -28,6 +28,8 @@ namespace {
 std::string ModFileName(std::string_view stem, std::string_view postfix) {
 #if REX_PLATFORM_WIN32
   return fmt::format("{}{}.dll", stem, postfix);
+#elif REX_PLATFORM_MAC
+  return fmt::format("lib{}{}.dylib", stem, postfix);
 #else
   return fmt::format("lib{}{}.so", stem, postfix);
 #endif
@@ -45,6 +47,14 @@ constexpr std::string_view ModPlatformDir() {
   return "linux-arm64";
 #elif defined(REX_ARCH_AMD64)
   return "linux-x64";
+#else
+  return "";
+#endif
+#elif REX_PLATFORM_MAC
+#if defined(REX_ARCH_ARM64)
+  return "macos-arm64";
+#elif defined(REX_ARCH_AMD64)
+  return "macos-x64";
 #else
   return "";
 #endif
