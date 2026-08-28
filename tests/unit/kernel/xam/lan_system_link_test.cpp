@@ -77,6 +77,22 @@ TEST_CASE("LAN configured XUID reaches the user profile", "[kernel][lan]") {
   REQUIRE(rex::cvar::SetFlagByName("system_link_xuid", "0"));
 }
 
+TEST_CASE("LAN configured name reaches the user profile", "[kernel][lan]") {
+  rex::cvar::testing::ScopedLifecycleOverride lifecycle_override;
+  REQUIRE(rex::cvar::SetFlagByName("system_link_lan_enabled", "true"));
+  REQUIRE(rex::cvar::SetFlagByName("system_link_profile_name", "LAN Host"));
+
+  rex::system::xam::UserProfile profile;
+  CHECK(profile.name() == "LAN Host");
+
+  REQUIRE(rex::cvar::SetFlagByName("system_link_profile_name", "1234567890123456"));
+  rex::system::xam::UserProfile truncated_profile;
+  CHECK(truncated_profile.name() == "123456789012345");
+
+  REQUIRE(rex::cvar::SetFlagByName("system_link_lan_enabled", "false"));
+  REQUIRE(rex::cvar::SetFlagByName("system_link_profile_name", ""));
+}
+
 TEST_CASE("LAN XNADDR conversion round-trips only registered addresses", "[kernel][lan]") {
   LanSystemLinkState state;
   REQUIRE(state.Configure("10.0.0.28", 0xB13E000000000002));
@@ -187,6 +203,37 @@ TEST_CASE("Native UDP port collision fails without address reuse", "[kernel][lan
     second_address.sin_addr = ntohl(endpoint.sin_addr.s_addr);
     second_address.sin_port = ntohs(endpoint.sin_port);
     CHECK(second.Bind(&second_address, sizeof(second_address)) == X_STATUS_UNSUCCESSFUL);
+  }
+
+#if REX_PLATFORM_WIN32
+  WSACleanup();
+#endif
+}
+
+TEST_CASE("XSocket reports its selected native endpoint", "[kernel][lan]") {
+#if REX_PLATFORM_WIN32
+  WSADATA data{};
+  REQUIRE(WSAStartup(MAKEWORD(2, 2), &data) == 0);
+#endif
+
+  {
+    rex::system::XSocket socket(nullptr);
+    REQUIRE(socket.Initialize(rex::system::XSocket::X_AF_INET, rex::system::XSocket::X_SOCK_DGRAM,
+                              rex::system::XSocket::X_IPPROTO_UDP) == X_STATUS_SUCCESS);
+
+    rex::system::N_XSOCKADDR_IN bind_address{};
+    bind_address.sin_family = AF_INET;
+    bind_address.sin_addr = INADDR_LOOPBACK;
+    bind_address.sin_port = 0;
+    REQUIRE(socket.Bind(&bind_address, sizeof(bind_address)) == X_STATUS_SUCCESS);
+
+    rex::system::N_XSOCKADDR_IN endpoint{};
+    uint32_t endpoint_size = sizeof(endpoint);
+    REQUIRE(socket.GetSockName(&endpoint, &endpoint_size) == X_STATUS_SUCCESS);
+    CHECK(endpoint_size == sizeof(endpoint));
+    CHECK(static_cast<uint16_t>(endpoint.sin_family) == AF_INET);
+    CHECK(static_cast<uint32_t>(endpoint.sin_addr) == INADDR_LOOPBACK);
+    CHECK(static_cast<uint16_t>(endpoint.sin_port) != 0);
   }
 
 #if REX_PLATFORM_WIN32

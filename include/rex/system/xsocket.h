@@ -104,6 +104,7 @@ class XSocket : public XObject {
 
   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
+  X_STATUS GetSockName(N_XSOCKADDR_IN* name, uint32_t* name_len);
   X_STATUS Listen(int backlog);
   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
   int Shutdown(int how);

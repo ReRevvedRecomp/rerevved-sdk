@@ -18,6 +18,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
+REXCVAR_DEFINE_STRING(system_link_profile_name, "", "Network",
+                      "Local profile name used by direct LAN System Link")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace system {
 namespace xam {
@@ -36,6 +40,16 @@ UserProfile::UserProfile() {
     }
   }
   name_ = "User";
+  if (REXCVAR_QUERY(bool, system_link_lan_enabled)) {
+    const auto& configured_name = REXCVAR_GET(system_link_profile_name);
+    if (!configured_name.empty()) {
+      constexpr size_t kMaxProfileNameLength = 15;
+      name_ = configured_name.substr(0, kMaxProfileNameLength);
+      if (configured_name.size() > kMaxProfileNameLength) {
+        REXSYS_WARN("Direct LAN profile name was truncated to 15 bytes");
+      }
+    }
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

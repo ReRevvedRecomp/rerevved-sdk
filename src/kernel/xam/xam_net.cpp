@@ -823,6 +823,47 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   return 0;
 }
 
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_len) {
+  if (!name || !name_len || *name_len < sizeof(XSOCKADDR_IN)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  N_XSOCKADDR_IN native_name{};
+  uint32_t native_name_len = *name_len;
+  X_STATUS status = socket->GetSockName(&native_name, &native_name_len);
+  if (XFAILED(status)) {
+#if REX_PLATFORM_WIN32
+    XThread::SetLastError(static_cast<uint32_t>(WSAGetLastError()));
+#else
+    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+#endif
+    return -1;
+  }
+
+  name->sin_family = native_name.sin_family;
+  name->sin_port = native_name.sin_port;
+  name->sin_addr = native_name.sin_addr;
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  *name_len = native_name_len;
+
+  if (LanState().enabled()) {
+    REXKRNL_DEBUG("getsockname: direct LAN socket={} address={} port={}", socket_handle,
+                  Ipv4String(htonl(static_cast<uint32_t>(native_name.sin_addr))),
+                  static_cast<uint16_t>(native_name.sin_port));
+  }
+  return 0;
+}
+
 u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> name, u32 namelen) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
@@ -1136,6 +1177,7 @@ REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
 REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
 REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
 REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
 REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
 REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
@@ -1259,5 +1301,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
 REX_EXPORT_STUB(__imp__NetDll_getsockopt);

@@ -121,6 +121,23 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   return X_STATUS_SUCCESS;
 }
 
+X_STATUS XSocket::GetSockName(N_XSOCKADDR_IN* name, uint32_t* name_len) {
+  sockaddr_in native_name{};
+  socklen_t native_name_len = sizeof(native_name);
+  int ret =
+      getsockname(native_handle_, reinterpret_cast<sockaddr*>(&native_name), &native_name_len);
+  if (ret < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  name->sin_family = native_name.sin_family;
+  name->sin_port = ntohs(native_name.sin_port);
+  name->sin_addr = ntohl(native_name.sin_addr.s_addr);
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  *name_len = native_name_len;
+  return X_STATUS_SUCCESS;
+}
+
 X_STATUS XSocket::Listen(int backlog) {
   int ret = listen(native_handle_, backlog);
   if (ret < 0) {
