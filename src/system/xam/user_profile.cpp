@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -26,6 +27,14 @@ UserProfile::UserProfile() {
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
+  if (REXCVAR_QUERY(bool, system_link_lan_enabled)) {
+    const uint64_t configured_xuid = REXCVAR_QUERY(uint64_t, system_link_xuid);
+    if (configured_xuid) {
+      xuid_ = configured_xuid;
+    } else {
+      REXSYS_ERROR("Direct LAN is enabled without a nonzero local XUID");
+    }
+  }
   name_ = "User";
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195

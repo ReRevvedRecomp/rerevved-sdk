@@ -13,12 +13,14 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <span>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -33,10 +35,13 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "lan_system_link.h"
+
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
+#include <ws2tcpip.h>                    // NOLINT(build/include_order)
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -44,11 +49,37 @@
 #include <sys/socket.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(system_link_lan_enabled, false, "Network",
+                    "Enable experimental direct LAN System Link support")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(system_link_local_address, "", "Network",
+                      "Selected local IPv4 address for direct LAN System Link")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT64(system_link_xuid, 0, "Network",
+                      "Local profile pseudonym used by direct LAN System Link")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+
+lan::LanSystemLinkState& LanState() {
+  static lan::LanSystemLinkState state;
+  return state;
+}
+
+std::string Ipv4String(uint32_t raw_address) {
+  in_addr address{};
+  address.s_addr = raw_address;
+  char text[16]{};
+  return inet_ntop(AF_INET, &address, text, sizeof(text)) ? text : "<invalid>";
+}
+
+}  // namespace
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -69,6 +100,28 @@ typedef struct {
   uint8_t abEnet[6];              // Ethernet MAC address
   uint8_t abOnline[20];           // Online identification
 } XNADDR;
+
+namespace {
+
+lan::XnAddrSnapshot LoadXnAddr(const XNADDR& address) {
+  lan::XnAddrSnapshot snapshot{};
+  snapshot.ipv4 = address.ina.s_addr;
+  snapshot.online_ipv4 = address.inaOnline.s_addr;
+  snapshot.online_port = address.wPortOnline;
+  std::memcpy(snapshot.ethernet.data(), address.abEnet, snapshot.ethernet.size());
+  std::memcpy(snapshot.online.data(), address.abOnline, snapshot.online.size());
+  return snapshot;
+}
+
+void StoreXnAddr(const lan::XnAddrSnapshot& snapshot, XNADDR* address) {
+  address->ina.s_addr = snapshot.ipv4;
+  address->inaOnline.s_addr = snapshot.online_ipv4;
+  address->wPortOnline = snapshot.online_port;
+  std::memcpy(address->abEnet, snapshot.ethernet.data(), snapshot.ethernet.size());
+  std::memcpy(address->abOnline, snapshot.online.data(), snapshot.online.size());
+}
+
+}  // namespace
 
 typedef struct {
   rex::be<int32_t> status;
@@ -188,6 +241,19 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
   }
 
+  if (REXCVAR_GET(system_link_lan_enabled)) {
+    if (!LanState().Configure(REXCVAR_GET(system_link_local_address),
+                              REXCVAR_GET(system_link_xuid))) {
+      REXKRNL_ERROR(
+          "XNetStartup: direct LAN requires a selected IPv4 address and nonzero local XUID");
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    REXKRNL_DEBUG("XNetStartup: direct LAN address={} xuid={:016X}",
+                  REXCVAR_GET(system_link_local_address), REXCVAR_GET(system_link_xuid));
+  } else {
+    LanState().Reset();
+  }
+
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
 
   /*
@@ -210,6 +276,16 @@ u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) {
   // TODO: Shut down and delete.
   // delete xnet;
 
+  if (LanState().enabled()) {
+    auto stats = LanState().stats_snapshot();
+    auto qos = LanState().qos_snapshot();
+    REXKRNL_DEBUG(
+        "XNetCleanup: direct LAN sent={} packets/{} bytes received={} packets/{} bytes "
+        "qos_enabled={} qos_bytes={}",
+        stats.sent_packets, stats.sent_bytes, stats.received_packets, stats.received_bytes,
+        qos.enabled, qos.payload.size());
+  }
+  LanState().Reset();
   return 0;
 }
 
@@ -436,6 +512,12 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  if (LanState().enabled()) {
+    StoreXnAddr(LanState().local_xnaddr(), addr_ptr);
+    REXKRNL_DEBUG("XNetGetTitleXnAddr: direct LAN address={}", Ipv4String(LanState().local_ipv4()));
+    return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  }
+
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -480,6 +562,18 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
+  if (LanState().enabled()) {
+    if (!xn_addr || !in_addr) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    uint32_t converted = 0;
+    if (!LanState().XnAddrToInAddr(LoadXnAddr(*xn_addr), &converted)) {
+      return X_ERROR_FUNCTION_FAILED;
+    }
+    std::memcpy(in_addr.host_address(), &converted, sizeof(converted));
+    REXKRNL_DEBUG("XNetXnAddrToInAddr: direct LAN address={}", Ipv4String(converted));
+    return 0;
+  }
   return 1;
 }
 
@@ -487,6 +581,20 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
 // FIXME: Arguments may not be correct.
 u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
+  if (LanState().enabled()) {
+    if (!in_addr || !xn_addr) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    uint32_t converted = 0;
+    std::memcpy(&converted, in_addr.host_address(), sizeof(converted));
+    lan::XnAddrSnapshot snapshot{};
+    if (!LanState().InAddrToXnAddr(converted, &snapshot)) {
+      return X_ERROR_FUNCTION_FAILED;
+    }
+    StoreXnAddr(snapshot, xn_addr);
+    REXKRNL_DEBUG("XNetInAddrToXnAddr: direct LAN address={}", Ipv4String(converted));
+    return 0;
+  }
   return 1;
 }
 
@@ -559,6 +667,22 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
+  if (LanState().enabled()) {
+    if (data_size && !data) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    auto payload = data_size ? std::span<const uint8_t>(data.as<const uint8_t*>(), data_size)
+                             : std::span<const uint8_t>();
+    auto result = LanState().UpdateQos(payload, r7, flags);
+    if (result != lan::QosUpdateResult::kSuccess) {
+      REXKRNL_ERROR("XNetQosListen: direct LAN rejected flags={:08X} bytes={} result={}", flags,
+                    data_size, static_cast<uint32_t>(result));
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    REXKRNL_DEBUG("XNetQosListen: direct LAN flags={:08X} bytes={} bits_per_second={}", flags,
+                  data_size, r7);
+    return 0;
+  }
   return X_ERROR_FUNCTION_FAILED;
 }
 
@@ -670,9 +794,29 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  const bool lan_enabled = LanState().enabled();
+  if (lan_enabled) {
+    const uint32_t requested_address = htonl(static_cast<uint32_t>(name->sin_addr));
+    native_name.sin_addr = ntohl(LanState().SelectBindIpv4(requested_address));
+  }
+  if (lan_enabled) {
+    REXKRNL_DEBUG("bind: direct LAN socket={} address={} port={}", socket_handle,
+                  Ipv4String(htonl(static_cast<uint32_t>(native_name.sin_addr))),
+                  static_cast<uint16_t>(native_name.sin_port));
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+#if REX_PLATFORM_WIN32
+    const auto native_error = static_cast<uint32_t>(WSAGetLastError());
+#else
+    const auto native_error = xboxkrnl::xeRtlNtStatusToDosError(status);
+#endif
+    if (lan_enabled) {
+      XThread::SetLastError(native_error);
+      REXKRNL_ERROR("bind: direct LAN socket={} failed error={}", socket_handle, native_error);
+    } else {
+      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    }
     return -1;
   }
 
@@ -872,6 +1016,15 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
 
+  if (ret >= 0 && LanState().enabled()) {
+    LanState().RecordReceive(static_cast<size_t>(ret));
+    auto stats = LanState().stats_snapshot();
+    if (stats.received_packets == 1 || (stats.received_packets % 256) == 0) {
+      REXKRNL_DEBUG("recvfrom: direct LAN packets={} bytes={}", stats.received_packets,
+                    stats.received_bytes);
+    }
+  }
+
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
     from_ptr->sin_port = native_from.sin_port;
@@ -916,7 +1069,15 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  if (ret >= 0 && LanState().enabled()) {
+    LanState().RecordSend(static_cast<size_t>(ret));
+    auto stats = LanState().stats_snapshot();
+    if (stats.sent_packets == 1 || (stats.sent_packets % 256) == 0) {
+      REXKRNL_DEBUG("sendto: direct LAN packets={} bytes={}", stats.sent_packets, stats.sent_bytes);
+    }
+  }
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {

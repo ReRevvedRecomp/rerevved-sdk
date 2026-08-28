@@ -18,6 +18,7 @@ add_executable(unit_tests
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     system/mod_dependency_test.cpp
+    kernel/xam/lan_system_link_test.cpp
     graphics/diagnostic_util_test.cpp
     graphics/xenos_fence_trace_test.cpp
     input/input_assignment_test.cpp
@@ -43,6 +44,9 @@ target_link_libraries(unit_tests PRIVATE
     rexruntime
     Catch2::Catch2WithMain
 )
+if(WIN32)
+    target_link_libraries(unit_tests PRIVATE ws2_32)
+endif()
 
 add_executable(mod_plugin_tests
     system/mod_plugin_test.cpp

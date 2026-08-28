@@ -13,6 +13,7 @@ set(REXKERNEL_SOURCES
     xam/xam_input.cpp
     xam/xam_locale.cpp
     xam/xam_msg.cpp
+    xam/lan_system_link.cpp
     xam/xam_net.cpp
     xam/xam_notify.cpp
     xam/xam_nui.cpp
