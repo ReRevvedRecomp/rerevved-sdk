@@ -93,9 +93,9 @@ endfunction()
 #     OUTPUT_DIR <path>
 #     [GPU_PLUGINS <name>...])
 #
-# Owns the stamped codegen edge and wires generated sources into the host. The
-# generated source lists are configure dependencies, so a never-generated tree
-# runs codegen, regenerates CMake, and only then begins compilation.
+# Owns the stamped codegen edge and wires generated sources into the host.
+# Configure again after the first codegen pass to load a newly created source
+# list; later source-list changes are configure dependencies.
 #==========================================================
 function(rexglue_setup_recompiled_target target_name)
     cmake_parse_arguments(ARG "" "MANIFEST;OUTPUT_DIR" "GPU_PLUGINS" ${ARGN})
@@ -121,6 +121,11 @@ function(rexglue_setup_recompiled_target target_name)
     set(_rexglue_dll_targets_file "${_rexglue_output_dir}/dll_targets.cmake")
     set(_rexglue_stamp "${_rexglue_output_dir}/codegen.build.stamp")
     set(_rexglue_depfile "${_rexglue_output_dir}/codegen.d")
+
+    if(NOT EXISTS "${_rexglue_dll_targets_file}")
+        file(MAKE_DIRECTORY "${_rexglue_output_dir}")
+        file(WRITE "${_rexglue_dll_targets_file}" "# No generated DLL targets.\n")
+    endif()
 
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${_rexglue_sources_file}"

@@ -28,8 +28,8 @@ else()
 endif()
 
 # Configure a host and its generated recompilation sources. The SDK owns the
-# stamped custom command, depfile, fresh-tree regeneration, and selective
-# generated-source compilation.
+# stamped custom command, depfile, and selective generated-source compilation.
+# A fresh tree runs the codegen target, reconfigures, and then builds.
 # Usage: rexglue_setup_target(<target> [GPU_PLUGINS xenos])
 macro(rexglue_setup_target target_name)
     rexglue_setup_recompiled_target({{ cmake_var("target_name") }}

@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <rex/codegen/config.h>
+#include <rex/codegen/manifest.h>
 #include <rex/codegen/output_stamp.h>
 
 namespace fs = std::filesystem;
@@ -47,6 +49,18 @@ struct Scratch {
 };
 
 }  // namespace
+
+TEST_CASE("Writing an unchanged SDK stamp preserves the manifest", "[manifest_stamp]") {
+  Scratch scratch("manifest_stamp_stable");
+  auto manifest = scratch.WriteFile(
+      "rerevved_manifest.toml", "[project]\nname = \"rerevved\"\nsdk_version = \"0.10.0\"\n");
+  const auto original_time = fs::file_time_type::clock::now() - std::chrono::hours(1);
+  fs::last_write_time(manifest, original_time);
+
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
+
+  CHECK(fs::last_write_time(manifest) == original_time);
+}
 
 TEST_CASE("Identical inputs produce identical fingerprints", "[output_stamp]") {
   Scratch scratch("stable");
