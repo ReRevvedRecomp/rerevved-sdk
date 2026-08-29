@@ -1,10 +1,11 @@
 #==========================================================
 # rexglue_helpers.cmake
 #
-# Three helpers, each with a single responsibility:
+# Public helpers with separate responsibilities:
 #   rexglue_apply_target_settings(<target>)        - common compile/platform flags
 #   rexglue_configure_target(<target>)             - host application
 #   rexglue_configure_module_target(<target> ...)  - guest DLL module
+#   rexglue_setup_recompiled_target(<target> ...)  - incremental codegen graph
 #==========================================================
 include_guard(GLOBAL)
 
@@ -59,6 +60,120 @@ function(rexglue_apply_target_settings target_name)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_compile_options(${target_name} PRIVATE -msse4.1)
         endif()
+    endif()
+endfunction()
+
+function(rexglue_apply_recomp_settings target_name pch_header)
+    set(REXGLUE_RECOMP_DEBUG_INFO "line-tables-only" CACHE STRING
+        "Debug info level for generated code: line-tables-only, full, or none")
+
+    set(_rexglue_recomp_options)
+    if(WIN32)
+        if(MSVC)
+            list(APPEND _rexglue_recomp_options /EHa)
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            list(APPEND _rexglue_recomp_options -fasync-exceptions)
+        endif()
+    endif()
+    if(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "none")
+        list(APPEND _rexglue_recomp_options
+            $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-g0>)
+    elseif(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "line-tables-only")
+        list(APPEND _rexglue_recomp_options
+            $<$<CXX_COMPILER_ID:Clang,AppleClang>:-gline-tables-only>)
+    endif()
+
+    target_precompile_headers(${target_name} PRIVATE "${pch_header}")
+    target_compile_options(${target_name} PRIVATE ${_rexglue_recomp_options})
+endfunction()
+
+#==========================================================
+# rexglue_setup_recompiled_target(<target>
+#     MANIFEST <path>
+#     OUTPUT_DIR <path>
+#     [GPU_PLUGINS <name>...])
+#
+# Owns the stamped codegen edge and wires generated sources into the host. The
+# generated source lists are configure dependencies, so a never-generated tree
+# runs codegen, regenerates CMake, and only then begins compilation.
+#==========================================================
+function(rexglue_setup_recompiled_target target_name)
+    cmake_parse_arguments(ARG "" "MANIFEST;OUTPUT_DIR" "GPU_PLUGINS" ${ARGN})
+
+    if(NOT TARGET ${target_name})
+        message(FATAL_ERROR
+            "rexglue_setup_recompiled_target: target '${target_name}' does not exist")
+    endif()
+    if(NOT ARG_MANIFEST)
+        message(FATAL_ERROR "rexglue_setup_recompiled_target: MANIFEST is required")
+    endif()
+    if(NOT ARG_OUTPUT_DIR)
+        message(FATAL_ERROR "rexglue_setup_recompiled_target: OUTPUT_DIR is required")
+    endif()
+
+    cmake_path(ABSOLUTE_PATH ARG_MANIFEST
+        BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        NORMALIZE OUTPUT_VARIABLE _rexglue_manifest)
+    cmake_path(ABSOLUTE_PATH ARG_OUTPUT_DIR
+        BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        NORMALIZE OUTPUT_VARIABLE _rexglue_output_dir)
+    set(_rexglue_sources_file "${_rexglue_output_dir}/sources.cmake")
+    set(_rexglue_dll_targets_file "${_rexglue_output_dir}/dll_targets.cmake")
+    set(_rexglue_stamp "${_rexglue_output_dir}/codegen.build.stamp")
+    set(_rexglue_depfile "${_rexglue_output_dir}/codegen.d")
+
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${_rexglue_sources_file}"
+        "${_rexglue_dll_targets_file}")
+
+    unset(GENERATED_SOURCES)
+    include("${_rexglue_sources_file}" OPTIONAL)
+    set(_rexglue_generated_sources ${GENERATED_SOURCES})
+
+    add_custom_command(
+        OUTPUT "${_rexglue_stamp}" ${_rexglue_generated_sources}
+        BYPRODUCTS "${_rexglue_sources_file}" "${_rexglue_dll_targets_file}"
+        COMMAND $<TARGET_FILE:rex::rexglue> codegen "${_rexglue_manifest}"
+        DEPENDS rex::rexglue "${_rexglue_manifest}"
+        DEPFILE "${_rexglue_depfile}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Generating recompiled code for ${target_name}"
+        VERBATIM
+    )
+    add_custom_target(${target_name}_codegen DEPENDS "${_rexglue_stamp}")
+
+    if(_rexglue_generated_sources)
+        add_library(${target_name}_recomp OBJECT ${_rexglue_generated_sources})
+        target_include_directories(${target_name}_recomp PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${_rexglue_output_dir}")
+        target_link_libraries(${target_name}_recomp PRIVATE rex::runtime)
+        rexglue_apply_target_settings(${target_name}_recomp)
+        rexglue_apply_recomp_settings(${target_name}_recomp
+            "${_rexglue_output_dir}/${target_name}_pch.h")
+        add_dependencies(${target_name}_recomp ${target_name}_codegen)
+        target_link_libraries(${target_name} PRIVATE ${target_name}_recomp)
+    endif()
+
+    add_dependencies(${target_name} ${target_name}_codegen)
+    target_include_directories(${target_name} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${_rexglue_output_dir}")
+    target_link_libraries(${target_name} PRIVATE rex::runtime)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons")
+        rexglue_embed_metadata(${target_name}
+            DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons"
+            PREFIX "icons")
+    endif()
+
+    rexglue_configure_target(${target_name} GPU_PLUGINS ${ARG_GPU_PLUGINS})
+
+    if(EXISTS "${_rexglue_dll_targets_file}")
+        set(REXGLUE_HOST_TARGET ${target_name})
+        include("${_rexglue_dll_targets_file}")
     endif()
 endfunction()
 

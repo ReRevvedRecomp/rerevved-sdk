@@ -170,3 +170,61 @@ function(rex_resolve_version out_var)
         BRANCH_NAME "${branch_name}")
     set(${out_var} "${result}" PARENT_SCOPE)
 endfunction()
+
+#==========================================================
+# rex_resolve_git_provenance(<revision_var> <dirty_var>
+#     [SOURCE_DIR <path>])    # defaults to CMAKE_SOURCE_DIR
+#
+# Resolves the exact commit and whether tracked content differs from it. Build
+# outputs and other ignored or untracked files do not make a reproducible source
+# build dirty.
+#==========================================================
+function(rex_resolve_git_provenance revision_var dirty_var)
+    set(one_value SOURCE_DIR)
+    cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
+
+    if(NOT ARG_SOURCE_DIR)
+        set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+    endif()
+
+    find_program(GIT_EXECUTABLE git)
+    if(NOT GIT_EXECUTABLE)
+        message(FATAL_ERROR "rex_resolve_git_provenance: git was not found")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --verify HEAD
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE revision
+        ERROR_VARIABLE revision_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE revision_rc)
+    string(LENGTH "${revision}" revision_length)
+    if(NOT revision_rc EQUAL 0 OR
+       NOT revision_length EQUAL 40 OR
+       NOT revision MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "rex_resolve_git_provenance: could not resolve HEAD: ${revision_error}")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE tracked_status
+        ERROR_VARIABLE status_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE status_rc)
+    if(NOT status_rc EQUAL 0)
+        message(FATAL_ERROR
+            "rex_resolve_git_provenance: could not inspect tracked state: ${status_error}")
+    endif()
+
+    if(tracked_status STREQUAL "")
+        set(dirty_state "clean")
+    else()
+        set(dirty_state "dirty")
+    endif()
+
+    set(${revision_var} "${revision}" PARENT_SCOPE)
+    set(${dirty_var} "${dirty_state}" PARENT_SCOPE)
+endfunction()

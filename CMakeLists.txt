@@ -198,6 +198,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
     FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+rex_resolve_git_provenance(REXGLUE_GIT_REVISION REXGLUE_GIT_DIRTY)
 
 # Strip the -id trailer (if any) for the numeric-only version.
 string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")
