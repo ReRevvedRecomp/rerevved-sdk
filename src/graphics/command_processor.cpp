@@ -22,6 +22,8 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+
+#include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -244,8 +246,15 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+      uint8_t* readback = memory_->TranslatePhysical(read_ptr_writeback_ptr_);
+      auto& fence_trace = diagnostic::GetXenosFenceTrace();
+      if (fence_trace.enabled()) {
+        uint32_t old_value = memory::load_and_swap<uint32_t>(readback);
+        memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
+        fence_trace.ReadPointerWriteback(read_ptr_writeback_ptr_, old_value, read_ptr_index_);
+      } else {
+        memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
+      }
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -315,6 +324,8 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  diagnostic::GetXenosFenceTrace().RingInitialized(ptr, size_log2, read_ptr_index_,
+                                                   write_ptr_index_.load());
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -325,10 +336,19 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+  diagnostic::GetXenosFenceTrace().ReadPointerWritebackConfigured(ptr);
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  auto& fence_trace = diagnostic::GetXenosFenceTrace();
+  uint32_t previous_value = 0;
+  if (fence_trace.enabled()) {
+    previous_value = write_ptr_index_.load();
+  }
   write_ptr_index_ = value;
+  if (fence_trace.enabled()) {
+    fence_trace.WritePointerPublished(previous_value, value);
+  }
   write_ptr_index_event_->Set();
 }
 
@@ -619,16 +639,30 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  auto& fence_trace = diagnostic::GetXenosFenceTrace();
+  uint64_t observed_range = fence_trace.ConsumerRangeBegin(read_index, write_index);
+  bool range_succeeded = true;
   do {
-    if (!ExecutePacket(&reader)) {
+    uint32_t packet_start_index = reader.read_offset() / sizeof(uint32_t);
+    bool packet_succeeded = ExecutePacket(&reader);
+    if (observed_range) {
+      fence_trace.PrimaryPacketObserved(packet_start_index, reader.read_offset() / sizeof(uint32_t),
+                                        packet_succeeded);
+    }
+    if (!packet_succeeded) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
+      range_succeeded = false;
       break;
     }
   } while (reader.read_count());
 
   OnPrimaryBufferEnd();
+
+  if (observed_range) {
+    fence_trace.ConsumerRangeEnd(reader.read_offset() / sizeof(uint32_t), range_succeeded);
+  }
 
   return write_index;
 }
@@ -958,7 +992,23 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  uint64_t correlation_token = 0;
+  auto& fence_trace = diagnostic::GetXenosFenceTrace();
+  if (fence_trace.enabled() &&
+      reader->buffer() == memory_->TranslatePhysical(primary_buffer_ptr_) &&
+      reader->capacity() == primary_buffer_size_) {
+    uint32_t packet_end_index = reader->read_offset() / sizeof(uint32_t);
+    uint32_t packet_start_index =
+        (packet_end_index + primary_buffer_size_ / sizeof(uint32_t) - count - 1) %
+        (primary_buffer_size_ / sizeof(uint32_t));
+    const xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(0);
+    correlation_token = fence_trace.SwapDecoded(
+        packet_start_index, packet_end_index, fetch.base_address << 12,
+        static_cast<uint32_t>(fetch.format), frontbuffer_width, frontbuffer_height);
+  }
+  current_xenos_fence_trace_token_ = correlation_token;
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  current_xenos_fence_trace_token_ = 0;
 
   ++counter_;
   return true;

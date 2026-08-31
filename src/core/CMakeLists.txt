@@ -22,6 +22,7 @@ add_library(rexcore OBJECT
     timer_queue.cpp
     utf8.cpp
     vec128.cpp
+    xenos_fence_trace.cpp
 )
 add_library(rex::core ALIAS rexcore)
 

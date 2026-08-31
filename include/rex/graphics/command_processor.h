@@ -230,6 +230,8 @@ class CommandProcessor {
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
+  uint64_t current_xenos_fence_trace_token() const { return current_xenos_fence_trace_token_; }
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -251,6 +253,8 @@ class CommandProcessor {
   uint32_t read_ptr_index_ = 0;
   uint32_t read_ptr_update_freq_ = 0;
   uint32_t read_ptr_writeback_ptr_ = 0;
+
+  uint64_t current_xenos_fence_trace_token_ = 0;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;

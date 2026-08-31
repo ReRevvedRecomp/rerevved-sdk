@@ -21,6 +21,8 @@
 #include <rex/dbg.h>
 #include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/d3d12/command_processor.h>
+
+#include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -1994,10 +1996,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  const bool submission_had_prior_guest_work = submission_open_;
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
     return;
+  }
+  if (current_xenos_fence_trace_token()) {
+    diagnostic::GetXenosFenceTrace().D3D12SwapRecording(
+        current_xenos_fence_trace_token(), submission_current_, submission_had_prior_guest_work);
   }
 
   static bool swap_texture_capture_attempted = false;
@@ -2522,6 +2529,15 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
     if (!EndSubmission(false)) {
       REXGPU_WARN("Deferred primary-buffer-end submission remains pending");
     }
+  }
+  auto& fence_trace = diagnostic::GetXenosFenceTrace();
+  if (fence_trace.enabled()) {
+    fence_trace.PollTimeouts();
+  }
+  if (fence_trace.enabled() && fence_trace.HasSubmittedWatches() && submission_fence_) {
+    uint64_t completed = submission_fence_->GetCompletedValue();
+    fence_trace.D3D12FenceCompleted(reinterpret_cast<uint64_t>(submission_fence_), completed,
+                                    diagnostic::IsFenceCompletionValueValid(completed));
   }
 }
 
@@ -3456,6 +3472,8 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed > submission_completed_) {
     submission_completed_ = submission_completed;
   }
+  diagnostic::GetXenosFenceTrace().D3D12FenceCompleted(
+      reinterpret_cast<uint64_t>(submission_fence_), submission_completed_, true);
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return submission_completed_ >= await_submission;
@@ -3796,6 +3814,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       return false;
     }
     submission_last_signaled_ = submitted_submission;
+    diagnostic::GetXenosFenceTrace().D3D12Submission(
+        submitted_submission, reinterpret_cast<uint64_t>(command_list_),
+        reinterpret_cast<uint64_t>(submission_fence_), submitted_submission);
 
     for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {
       resources_for_deletion_.emplace_back(submitted_submission, resource.Detach());
