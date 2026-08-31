@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
 
@@ -90,7 +91,10 @@ struct XenosFenceTraceEvent {
 
   uint32_t stored_count = 0;
   uint32_t overflow_count = 0;
-  uint32_t contention_drop_count = 0;
+  uint32_t lock_wait_count = 0;
+  uint64_t maximum_lock_wait_nanoseconds = 0;
+  uint32_t dropped_callback_count = 0;
+  uint32_t reentry_failure_count = 0;
   uint32_t watched_count = 0;
   uint32_t in_flight_count = 0;
   uint32_t unresolved_count = 0;
@@ -99,17 +103,44 @@ struct XenosFenceTraceEvent {
 struct XenosFenceTraceStatistics {
   uint32_t stored = 0;
   uint32_t overflow = 0;
-  uint32_t contention_drops = 0;
+  uint32_t lock_waits = 0;
+  uint64_t maximum_lock_wait_nanoseconds = 0;
+  uint32_t dropped_callbacks = 0;
+  uint32_t reentry_failures = 0;
   uint32_t watched = 0;
   uint32_t in_flight = 0;
   uint32_t unresolved = 0;
   uint32_t epoch = 0;
   uint64_t last_sequence = 0;
+
+  bool valid_for_promotion() const noexcept {
+    return overflow == 0 && dropped_callbacks == 0 && reentry_failures == 0 && watched != 0 &&
+           in_flight == 0 && unresolved == 0;
+  }
 };
 
 class XenosFenceTrace final {
  public:
   XenosFenceTrace() = default;
+
+  class ReadPointerWritebackAdmission final {
+   public:
+    ~ReadPointerWritebackAdmission() noexcept;
+
+    ReadPointerWritebackAdmission(const ReadPointerWritebackAdmission&) = delete;
+    ReadPointerWritebackAdmission& operator=(const ReadPointerWritebackAdmission&) = delete;
+    ReadPointerWritebackAdmission(ReadPointerWritebackAdmission&& other) noexcept;
+    ReadPointerWritebackAdmission& operator=(ReadPointerWritebackAdmission&& other) noexcept;
+
+   private:
+    friend class XenosFenceTrace;
+
+    explicit ReadPointerWritebackAdmission(XenosFenceTrace& trace) noexcept;
+
+    XenosFenceTrace* trace_ = nullptr;
+    uint64_t monotonic_nanoseconds_ = 0;
+    uint32_t thread_id_ = 0;
+  };
 
   bool Start(const std::filesystem::path& output_path);
   bool FinishAndFlush();
@@ -128,7 +159,9 @@ class XenosFenceTrace final {
                        uint32_t fetch_source, uint32_t texture_format, uint32_t width,
                        uint32_t height) noexcept;
   void ConsumerRangeEnd(uint32_t actual_end_index, bool succeeded) noexcept;
-  void ReadPointerWriteback(uint32_t address, uint32_t old_value, uint32_t new_value) noexcept;
+  ReadPointerWritebackAdmission AdmitReadPointerWriteback() noexcept;
+  void ReadPointerWriteback(ReadPointerWritebackAdmission&& admission, uint32_t address,
+                            uint32_t old_value, uint32_t new_value) noexcept;
 
   void D3D12SwapRecording(uint64_t correlation_token, uint64_t submission_identity,
                           bool submission_had_prior_guest_work) noexcept;
@@ -136,7 +169,7 @@ class XenosFenceTrace final {
                        uint64_t fence_identity, uint64_t fence_value) noexcept;
   void D3D12FenceCompleted(uint64_t fence_identity, uint64_t completed_value,
                            bool succeeded) noexcept;
-  bool HasSubmittedWatches() const noexcept;
+  bool HasSubmittedWatches() noexcept;
 
   void PollTimeouts() noexcept;
   void PollTimeoutsAt(uint64_t monotonic_nanoseconds) noexcept;
@@ -149,6 +182,28 @@ class XenosFenceTrace final {
                                  uint32_t capacity_dwords) noexcept;
 
  private:
+  class CallbackScope final {
+   public:
+    explicit CallbackScope(XenosFenceTrace& trace) noexcept;
+    CallbackScope(XenosFenceTrace& trace, ReadPointerWritebackAdmission& admission) noexcept;
+    ~CallbackScope();
+
+    CallbackScope(const CallbackScope&) = delete;
+    CallbackScope& operator=(const CallbackScope&) = delete;
+
+    explicit operator bool() const noexcept { return admitted_; }
+    uint64_t monotonic_nanoseconds() const noexcept { return monotonic_nanoseconds_; }
+    uint32_t thread_id() const noexcept { return thread_id_; }
+
+   private:
+    XenosFenceTrace& trace_;
+    std::unique_lock<std::mutex> state_lock_;
+    uint64_t monotonic_nanoseconds_ = 0;
+    uint32_t thread_id_ = 0;
+    const XenosFenceTrace* previous_callback_trace_ = nullptr;
+    bool admitted_ = false;
+  };
+
   enum class WatchStage : uint8_t {
     kUnused,
     kRegistered,
@@ -186,12 +241,12 @@ class XenosFenceTrace final {
     XenosFenceTraceEvent event{};
   };
 
-  bool TryLock(std::unique_lock<std::mutex>& lock) noexcept;
   static bool IsTerminal(WatchStage stage) noexcept;
   bool StoreEvent(XenosFenceTraceEvent event) noexcept;
-  void FillCommon(XenosFenceTraceEvent& event, uint64_t now) noexcept;
+  void FillCommon(XenosFenceTraceEvent& event, uint64_t monotonic_nanoseconds,
+                  uint32_t thread_id) noexcept;
   void FillRing(XenosFenceTraceEvent& event) const noexcept;
-  void ExpireWatches(uint64_t now) noexcept;
+  void ExpireWatches(uint64_t now, uint32_t thread_id) noexcept;
   uint32_t CountInFlight() const noexcept;
   uint32_t CountUnresolved() const noexcept;
   uint64_t TokensInRange(uint32_t start, uint32_t end) const noexcept;
@@ -200,16 +255,31 @@ class XenosFenceTrace final {
   bool PacketCoveredByWatch(uint32_t start, uint32_t end) const noexcept;
   void ClearRange() noexcept;
   bool Serialize(const XenosFenceTraceEvent* events, size_t event_count) const;
+  bool TryAdmitCallback(uint64_t& monotonic_nanoseconds, uint32_t& thread_id) noexcept;
+  void RecordReadPointerWriteback(const CallbackScope& callback, uint32_t address,
+                                  uint32_t old_value, uint32_t new_value) noexcept;
+  void FinishCallback() noexcept;
+  static void UpdateMaximum(std::atomic<uint64_t>& target, uint64_t value) noexcept;
 
+  friend struct XenosFenceTraceTestAccess;
+
+  mutable std::mutex admission_mutex_;
+  std::condition_variable admission_drained_;
   mutable std::mutex state_mutex_;
   std::array<Slot, kXenosFenceTraceCapacity> slots_{};
   std::array<Watch, kXenosFenceTraceWatchLimit> watches_{};
-  std::atomic<bool> enabled_{false};
+  static constexpr uint64_t kAdmissionOpen = UINT64_C(1) << 63;
+  static constexpr uint64_t kAdmissionCountMask = ~kAdmissionOpen;
+  std::atomic<uint64_t> admission_state_{0};
   std::atomic<uint32_t> next_slot_{0};
   std::atomic<uint32_t> overflow_{0};
-  std::atomic<uint32_t> contention_drops_{0};
+  std::atomic<uint32_t> lock_waits_{0};
+  std::atomic<uint64_t> maximum_lock_wait_nanoseconds_{0};
+  std::atomic<uint32_t> dropped_callbacks_{0};
+  std::atomic<uint32_t> reentry_failures_{0};
   std::atomic<uint64_t> next_sequence_{0};
   std::filesystem::path output_path_;
+  bool start_in_progress_ = false;
   bool flush_in_progress_ = false;
 
   uint32_t epoch_ = 0;

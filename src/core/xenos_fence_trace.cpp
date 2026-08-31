@@ -11,6 +11,8 @@ namespace rex::graphics::diagnostic {
 
 namespace {
 
+thread_local const XenosFenceTrace* active_callback_trace = nullptr;
+
 std::string_view PointName(XenosFenceTracePoint point) noexcept {
   switch (point) {
     case XenosFenceTracePoint::kTraceStarted:
@@ -78,13 +80,156 @@ bool XenosFenceTrace::RangeContainsIndex(uint32_t start, uint32_t end, uint32_t 
   return position < distance;
 }
 
-bool XenosFenceTrace::Start(const std::filesystem::path& output_path) {
-  std::lock_guard lock(state_mutex_);
-  if (enabled_.load(std::memory_order_acquire) || flush_in_progress_ || output_path.empty()) {
+void XenosFenceTrace::UpdateMaximum(std::atomic<uint64_t>& target, uint64_t value) noexcept {
+  uint64_t current = target.load(std::memory_order_relaxed);
+  while (current < value && !target.compare_exchange_weak(current, value, std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {}
+}
+
+bool XenosFenceTrace::TryAdmitCallback(uint64_t& monotonic_nanoseconds,
+                                       uint32_t& thread_id) noexcept {
+  uint64_t admission = admission_state_.load(std::memory_order_acquire);
+  if (!(admission & kAdmissionOpen)) {
     return false;
   }
+  monotonic_nanoseconds = MonotonicNanoseconds();
+  thread_id = rex::thread::current_thread_id();
+  if (active_callback_trace == this) {
+    SaturatingIncrement(reentry_failures_);
+    return false;
+  }
+  while (admission & kAdmissionOpen) {
+    const uint64_t active_count = admission & kAdmissionCountMask;
+    if (active_count == kAdmissionCountMask) {
+      SaturatingIncrement(dropped_callbacks_);
+      return false;
+    }
+    if (admission_state_.compare_exchange_weak(admission, admission + 1, std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+XenosFenceTrace::ReadPointerWritebackAdmission::ReadPointerWritebackAdmission(
+    XenosFenceTrace& trace) noexcept {
+  if (trace.TryAdmitCallback(monotonic_nanoseconds_, thread_id_)) {
+    trace_ = &trace;
+  }
+}
+
+XenosFenceTrace::ReadPointerWritebackAdmission::~ReadPointerWritebackAdmission() noexcept {
+  if (trace_) {
+    SaturatingIncrement(trace_->dropped_callbacks_);
+    trace_->FinishCallback();
+  }
+}
+
+XenosFenceTrace::ReadPointerWritebackAdmission::ReadPointerWritebackAdmission(
+    ReadPointerWritebackAdmission&& other) noexcept
+    : trace_(other.trace_),
+      monotonic_nanoseconds_(other.monotonic_nanoseconds_),
+      thread_id_(other.thread_id_) {
+  other.trace_ = nullptr;
+}
+
+XenosFenceTrace::ReadPointerWritebackAdmission&
+XenosFenceTrace::ReadPointerWritebackAdmission::operator=(
+    ReadPointerWritebackAdmission&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  if (trace_) {
+    SaturatingIncrement(trace_->dropped_callbacks_);
+    trace_->FinishCallback();
+  }
+  trace_ = other.trace_;
+  monotonic_nanoseconds_ = other.monotonic_nanoseconds_;
+  thread_id_ = other.thread_id_;
+  other.trace_ = nullptr;
+  return *this;
+}
+
+XenosFenceTrace::CallbackScope::CallbackScope(XenosFenceTrace& trace) noexcept : trace_(trace) {
+  admitted_ = trace_.TryAdmitCallback(monotonic_nanoseconds_, thread_id_);
+  if (!admitted_) {
+    return;
+  }
+
+  previous_callback_trace_ = active_callback_trace;
+  active_callback_trace = &trace_;
+  state_lock_ = std::unique_lock<std::mutex>(trace_.state_mutex_, std::defer_lock);
+  if (!state_lock_.try_lock()) {
+    SaturatingIncrement(trace_.lock_waits_);
+    const uint64_t wait_started = MonotonicNanoseconds();
+    state_lock_.lock();
+    UpdateMaximum(trace_.maximum_lock_wait_nanoseconds_, MonotonicNanoseconds() - wait_started);
+  }
+}
+
+XenosFenceTrace::CallbackScope::CallbackScope(XenosFenceTrace& trace,
+                                              ReadPointerWritebackAdmission& admission) noexcept
+    : trace_(trace) {
+  if (admission.trace_ != &trace_) {
+    return;
+  }
+  admitted_ = true;
+  monotonic_nanoseconds_ = admission.monotonic_nanoseconds_;
+  thread_id_ = admission.thread_id_;
+  admission.trace_ = nullptr;
+
+  if (active_callback_trace == &trace_) {
+    SaturatingIncrement(trace_.reentry_failures_);
+    trace_.FinishCallback();
+    admitted_ = false;
+    return;
+  }
+  previous_callback_trace_ = active_callback_trace;
+  active_callback_trace = &trace_;
+  state_lock_ = std::unique_lock<std::mutex>(trace_.state_mutex_, std::defer_lock);
+  if (!state_lock_.try_lock()) {
+    SaturatingIncrement(trace_.lock_waits_);
+    const uint64_t wait_started = MonotonicNanoseconds();
+    state_lock_.lock();
+    UpdateMaximum(trace_.maximum_lock_wait_nanoseconds_, MonotonicNanoseconds() - wait_started);
+  }
+}
+
+XenosFenceTrace::CallbackScope::~CallbackScope() {
+  if (!admitted_) {
+    return;
+  }
+  state_lock_.unlock();
+  active_callback_trace = previous_callback_trace_;
+  trace_.FinishCallback();
+}
+
+void XenosFenceTrace::FinishCallback() noexcept {
+  const uint64_t previous = admission_state_.fetch_sub(1, std::memory_order_acq_rel);
+  if ((previous & kAdmissionCountMask) == 1) {
+    std::lock_guard admission_lock(admission_mutex_);
+    admission_drained_.notify_all();
+  }
+}
+
+bool XenosFenceTrace::Start(const std::filesystem::path& output_path) {
+  if (active_callback_trace == this) {
+    SaturatingIncrement(reentry_failures_);
+    return false;
+  }
+  {
+    std::lock_guard admission_lock(admission_mutex_);
+    if (enabled() || start_in_progress_ || flush_in_progress_ || output_path.empty()) {
+      return false;
+    }
+    start_in_progress_ = true;
+  }
+
   std::error_code output_error;
   if (std::filesystem::exists(output_path, output_error) || output_error) {
+    std::lock_guard admission_lock(admission_mutex_);
+    start_in_progress_ = false;
     return false;
   }
   std::filesystem::path temporary_path = output_path;
@@ -92,63 +237,93 @@ bool XenosFenceTrace::Start(const std::filesystem::path& output_path) {
   const auto temporary_status = std::filesystem::symlink_status(temporary_path, output_error);
   if ((output_error && output_error != std::errc::no_such_file_or_directory) ||
       (!output_error && temporary_status.type() != std::filesystem::file_type::not_found)) {
+    std::lock_guard admission_lock(admission_mutex_);
+    start_in_progress_ = false;
     return false;
   }
 
-  output_path_ = output_path;
-  for (Slot& slot : slots_) {
-    slot.committed.store(false, std::memory_order_relaxed);
-    slot.event = {};
-  }
-  watches_ = {};
-  next_slot_.store(0, std::memory_order_relaxed);
-  overflow_.store(0, std::memory_order_relaxed);
-  contention_drops_.store(0, std::memory_order_relaxed);
-  next_sequence_.store(0, std::memory_order_relaxed);
-  epoch_ = 1;
-  ring_generation_ = 0;
-  ring_guest_virtual_base_ = 0;
-  ring_physical_base_ = 0;
-  ring_capacity_bytes_ = 0;
-  ring_capacity_dwords_ = 0;
-  ring_size_log2_ = 0;
-  read_pointer_writeback_address_ = 0;
-  last_read_index_ = 0;
-  last_write_index_ = 0;
-  watched_count_ = 0;
-  next_token_ = 0;
-  next_range_identity_ = 0;
-  ClearRange();
-  finished_range_valid_ = false;
+  bool started = false;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    output_path_ = output_path;
+    for (Slot& slot : slots_) {
+      slot.committed.store(false, std::memory_order_relaxed);
+      slot.event = {};
+    }
+    watches_ = {};
+    next_slot_.store(0, std::memory_order_relaxed);
+    overflow_.store(0, std::memory_order_relaxed);
+    lock_waits_.store(0, std::memory_order_relaxed);
+    maximum_lock_wait_nanoseconds_.store(0, std::memory_order_relaxed);
+    dropped_callbacks_.store(0, std::memory_order_relaxed);
+    reentry_failures_.store(0, std::memory_order_relaxed);
+    next_sequence_.store(0, std::memory_order_relaxed);
+    epoch_ = 1;
+    ring_generation_ = 0;
+    ring_guest_virtual_base_ = 0;
+    ring_physical_base_ = 0;
+    ring_capacity_bytes_ = 0;
+    ring_capacity_dwords_ = 0;
+    ring_size_log2_ = 0;
+    read_pointer_writeback_address_ = 0;
+    last_read_index_ = 0;
+    last_write_index_ = 0;
+    watched_count_ = 0;
+    next_token_ = 0;
+    next_range_identity_ = 0;
+    ClearRange();
+    finished_range_valid_ = false;
 
-  enabled_.store(true, std::memory_order_release);
-  XenosFenceTraceEvent event{};
-  event.point = XenosFenceTracePoint::kTraceStarted;
-  FillCommon(event, MonotonicNanoseconds());
-  return StoreEvent(event);
+    XenosFenceTraceEvent event{};
+    event.point = XenosFenceTracePoint::kTraceStarted;
+    FillCommon(event, MonotonicNanoseconds(), rex::thread::current_thread_id());
+    started = StoreEvent(event);
+  }
+  {
+    std::lock_guard admission_lock(admission_mutex_);
+    start_in_progress_ = false;
+    admission_state_.store(started ? kAdmissionOpen : 0, std::memory_order_release);
+  }
+  return started;
 }
 
 bool XenosFenceTrace::FinishAndFlush() {
+  if (active_callback_trace == this) {
+    SaturatingIncrement(reentry_failures_);
+    return false;
+  }
   std::vector<XenosFenceTraceEvent> events;
   XenosFenceTraceEvent finished_event{};
   {
-    std::lock_guard lock(state_mutex_);
-    if (!enabled_.load(std::memory_order_acquire)) {
+    std::unique_lock admission_lock(admission_mutex_);
+    const uint64_t admission =
+        admission_state_.fetch_and(kAdmissionCountMask, std::memory_order_acq_rel);
+    if (!(admission & kAdmissionOpen)) {
       return false;
     }
+    flush_in_progress_ = true;
+    admission_drained_.wait(admission_lock, [this] {
+      return (admission_state_.load(std::memory_order_acquire) & kAdmissionCountMask) == 0;
+    });
+  }
+  {
+    std::lock_guard state_lock(state_mutex_);
     const uint64_t now = MonotonicNanoseconds();
-    ExpireWatches(now);
+    ExpireWatches(now, rex::thread::current_thread_id());
     finished_event.point = XenosFenceTracePoint::kTraceFinished;
     finished_event.stored_count = std::min<uint32_t>(next_slot_.load(std::memory_order_relaxed),
                                                      uint32_t(kXenosFenceTraceCapacity));
     finished_event.overflow_count = overflow_.load(std::memory_order_relaxed);
-    finished_event.contention_drop_count = contention_drops_.load(std::memory_order_relaxed);
+    finished_event.lock_wait_count = lock_waits_.load(std::memory_order_relaxed);
+    finished_event.maximum_lock_wait_nanoseconds =
+        maximum_lock_wait_nanoseconds_.load(std::memory_order_relaxed);
+    finished_event.dropped_callback_count = dropped_callbacks_.load(std::memory_order_relaxed);
+    finished_event.reentry_failure_count = reentry_failures_.load(std::memory_order_relaxed);
     finished_event.watched_count = watched_count_;
     finished_event.in_flight_count = CountInFlight();
     finished_event.unresolved_count = CountUnresolved();
-    FillCommon(finished_event, now);
-    enabled_.store(false, std::memory_order_release);
-    flush_in_progress_ = true;
+    FillCommon(finished_event, now, rex::thread::current_thread_id());
+    finished_event.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     events.reserve(kXenosFenceTraceCapacity + 1);
     for (size_t i = 0; i < kXenosFenceTraceCapacity; ++i) {
@@ -164,29 +339,18 @@ bool XenosFenceTrace::FinishAndFlush() {
             });
   const bool serialized = Serialize(events.data(), events.size());
   {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard admission_lock(admission_mutex_);
     flush_in_progress_ = false;
     if (!serialized) {
-      enabled_.store(true, std::memory_order_release);
+      next_sequence_.store(finished_event.sequence - 1, std::memory_order_relaxed);
+      admission_state_.store(kAdmissionOpen, std::memory_order_release);
     }
   }
   return serialized;
 }
 
 bool XenosFenceTrace::enabled() const noexcept {
-  return enabled_.load(std::memory_order_acquire);
-}
-
-bool XenosFenceTrace::TryLock(std::unique_lock<std::mutex>& lock) noexcept {
-  if (contention_drops_.load(std::memory_order_relaxed)) {
-    return false;
-  }
-  lock = std::unique_lock<std::mutex>(state_mutex_, std::try_to_lock);
-  if (lock.owns_lock()) {
-    return true;
-  }
-  SaturatingIncrement(contention_drops_);
-  return false;
+  return (admission_state_.load(std::memory_order_acquire) & kAdmissionOpen) != 0;
 }
 
 bool XenosFenceTrace::IsTerminal(WatchStage stage) noexcept {
@@ -194,10 +358,10 @@ bool XenosFenceTrace::IsTerminal(WatchStage stage) noexcept {
          stage == WatchStage::kTimedOut;
 }
 
-void XenosFenceTrace::FillCommon(XenosFenceTraceEvent& event, uint64_t now) noexcept {
-  event.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-  event.monotonic_nanoseconds = now;
-  event.thread_id = rex::thread::current_thread_id();
+void XenosFenceTrace::FillCommon(XenosFenceTraceEvent& event, uint64_t monotonic_nanoseconds,
+                                 uint32_t thread_id) noexcept {
+  event.monotonic_nanoseconds = monotonic_nanoseconds;
+  event.thread_id = thread_id;
   event.epoch = epoch_;
 }
 
@@ -216,30 +380,30 @@ void XenosFenceTrace::FillRing(XenosFenceTraceEvent& event) const noexcept {
 }
 
 bool XenosFenceTrace::StoreEvent(XenosFenceTraceEvent event) noexcept {
-  uint32_t slot = next_slot_.fetch_add(1, std::memory_order_relaxed);
+  uint32_t slot = next_slot_.load(std::memory_order_relaxed);
   if (slot >= kXenosFenceTraceCapacity) {
     SaturatingIncrement(overflow_);
+    SaturatingIncrement(dropped_callbacks_);
     return false;
   }
+  event.sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
   slots_[slot].event = event;
   slots_[slot].committed.store(true, std::memory_order_release);
+  next_slot_.store(slot + 1, std::memory_order_relaxed);
   return true;
 }
 
 void XenosFenceTrace::ResetObservationEpoch() noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return;
-  }
-  const uint64_t now = MonotonicNanoseconds();
+  const uint64_t now = callback.monotonic_nanoseconds();
   XenosFenceTraceEvent event{};
   event.point = XenosFenceTracePoint::kTraceReset;
   event.unresolved_count = CountUnresolved();
   FillRing(event);
-  FillCommon(event, now);
+  FillCommon(event, now, callback.thread_id());
   StoreEvent(event);
   for (Watch& watch : watches_) {
     if (watch.stage != WatchStage::kUnused && !IsTerminal(watch.stage) &&
@@ -263,19 +427,17 @@ void XenosFenceTrace::ResetObservationEpoch() noexcept {
 void XenosFenceTrace::RingInitialized(uint32_t physical_base, uint32_t size_log2,
                                       uint32_t initial_read_index,
                                       uint32_t initial_write_index) noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return;
-  }
+  const uint64_t now = callback.monotonic_nanoseconds();
   if (ring_capacity_bytes_) {
     XenosFenceTraceEvent reset{};
     reset.point = XenosFenceTracePoint::kTraceReset;
     reset.unresolved_count = CountUnresolved();
     FillRing(reset);
-    FillCommon(reset, MonotonicNanoseconds());
+    FillCommon(reset, now, callback.thread_id());
     StoreEvent(reset);
     for (Watch& watch : watches_) {
       if (watch.stage != WatchStage::kUnused && !IsTerminal(watch.stage) &&
@@ -301,37 +463,31 @@ void XenosFenceTrace::RingInitialized(uint32_t physical_base, uint32_t size_log2
   event.read_index = initial_read_index;
   event.write_index = initial_write_index;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, now, callback.thread_id());
   StoreEvent(event);
 }
 
 void XenosFenceTrace::ReadPointerWritebackConfigured(uint32_t address) noexcept {
-  if (!enabled()) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
   read_pointer_writeback_address_ = address;
   XenosFenceTraceEvent event{};
   event.point = XenosFenceTracePoint::kReadPointerWritebackConfigured;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
 }
 
 uint64_t XenosFenceTrace::WatchSwapReservation(uint32_t guest_virtual_address,
                                                uint32_t physical_address) noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return 0;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return 0;
-  }
-  const uint64_t now = MonotonicNanoseconds();
-  ExpireWatches(now);
+  const uint64_t now = callback.monotonic_nanoseconds();
+  ExpireWatches(now, callback.thread_id());
   if (!ring_capacity_dwords_ || watched_count_ >= kXenosFenceTraceWatchLimit ||
       (physical_address & 3) || physical_address < ring_physical_base_) {
     return 0;
@@ -361,7 +517,7 @@ uint64_t XenosFenceTrace::WatchSwapReservation(uint32_t guest_virtual_address,
     mapping.physical_reservation_address = physical_address;
     mapping.reservation_index = watch.reservation_index;
     FillRing(mapping);
-    FillCommon(mapping, now);
+    FillCommon(mapping, now, callback.thread_id());
     StoreEvent(mapping);
   }
 
@@ -373,20 +529,17 @@ uint64_t XenosFenceTrace::WatchSwapReservation(uint32_t guest_virtual_address,
   event.reservation_index = watch.reservation_index;
   event.watched_count = watched_count_;
   FillRing(event);
-  FillCommon(event, now);
+  FillCommon(event, now, callback.thread_id());
   StoreEvent(event);
   return watch.token;
 }
 
 void XenosFenceTrace::WritePointerPublished(uint32_t previous_value, uint32_t value) noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return;
-  }
-  ExpireWatches(MonotonicNanoseconds());
+  ExpireWatches(callback.monotonic_nanoseconds(), callback.thread_id());
   last_write_index_ = value;
   if (!watched_count_ || !CountInFlight()) {
     return;
@@ -397,20 +550,17 @@ void XenosFenceTrace::WritePointerPublished(uint32_t previous_value, uint32_t va
   event.previous_write_index = previous_value;
   event.write_index = value;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
 }
 
 uint64_t XenosFenceTrace::ConsumerRangeBegin(uint32_t start_index, uint32_t target_index) noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return 0;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return 0;
-  }
-  const uint64_t now = MonotonicNanoseconds();
-  ExpireWatches(now);
+  const uint64_t now = callback.monotonic_nanoseconds();
+  ExpireWatches(now, callback.thread_id());
   if (!CountInFlight()) {
     ClearRange();
     return 0;
@@ -434,18 +584,15 @@ uint64_t XenosFenceTrace::ConsumerRangeBegin(uint32_t start_index, uint32_t targ
     event.flags |= kXenosFenceTraceContainsWatchedSwap;
   }
   FillRing(event);
-  FillCommon(event, now);
+  FillCommon(event, now, callback.thread_id());
   StoreEvent(event);
   return range_identity_;
 }
 
 void XenosFenceTrace::PrimaryPacketObserved(uint32_t start_index, uint32_t end_index,
                                             bool succeeded) noexcept {
-  if (!enabled()) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock) || !range_active_) {
+  CallbackScope callback(*this);
+  if (!callback || !range_active_) {
     return;
   }
   range_actual_end_index_ = end_index;
@@ -460,11 +607,8 @@ void XenosFenceTrace::PrimaryPacketObserved(uint32_t start_index, uint32_t end_i
 uint64_t XenosFenceTrace::SwapDecoded(uint32_t packet_start_index, uint32_t packet_end_index,
                                       uint32_t fetch_source, uint32_t texture_format,
                                       uint32_t width, uint32_t height) noexcept {
-  if (!enabled()) {
-    return 0;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock) || !range_active_) {
+  CallbackScope callback(*this);
+  if (!callback || !range_active_) {
     return 0;
   }
   Watch* watch = FindWatchByPacket(packet_start_index);
@@ -489,17 +633,14 @@ uint64_t XenosFenceTrace::SwapDecoded(uint32_t packet_start_index, uint32_t pack
   event.width = width;
   event.height = height;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
   return watch->token;
 }
 
 void XenosFenceTrace::ConsumerRangeEnd(uint32_t actual_end_index, bool succeeded) noexcept {
-  if (!enabled()) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock) || !range_active_) {
+  CallbackScope callback(*this);
+  if (!callback || !range_active_) {
     return;
   }
   range_actual_end_index_ = actual_end_index;
@@ -521,7 +662,7 @@ void XenosFenceTrace::ConsumerRangeEnd(uint32_t actual_end_index, bool succeeded
     event.flags |= kXenosFenceTraceRangeFailed;
   }
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
 
   for (size_t i = 0; i < watches_.size(); ++i) {
@@ -542,7 +683,7 @@ void XenosFenceTrace::ConsumerRangeEnd(uint32_t actual_end_index, bool succeeded
     missed.guest_reservation_address = watch.guest_reservation_address;
     missed.physical_reservation_address = watch.physical_reservation_address;
     FillRing(missed);
-    FillCommon(missed, MonotonicNanoseconds());
+    FillCommon(missed, callback.monotonic_nanoseconds(), callback.thread_id());
     StoreEvent(missed);
   }
 
@@ -556,13 +697,23 @@ void XenosFenceTrace::ConsumerRangeEnd(uint32_t actual_end_index, bool succeeded
   ClearRange();
 }
 
-void XenosFenceTrace::ReadPointerWriteback(uint32_t address, uint32_t old_value,
+XenosFenceTrace::ReadPointerWritebackAdmission
+XenosFenceTrace::AdmitReadPointerWriteback() noexcept {
+  return ReadPointerWritebackAdmission(*this);
+}
+
+void XenosFenceTrace::ReadPointerWriteback(ReadPointerWritebackAdmission&& admission,
+                                           uint32_t address, uint32_t old_value,
                                            uint32_t new_value) noexcept {
-  if (!enabled()) {
-    return;
+  CallbackScope callback(*this, admission);
+  if (callback) {
+    RecordReadPointerWriteback(callback, address, old_value, new_value);
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock) || !finished_range_valid_ || address != read_pointer_writeback_address_ ||
+}
+
+void XenosFenceTrace::RecordReadPointerWriteback(const CallbackScope& callback, uint32_t address,
+                                                 uint32_t old_value, uint32_t new_value) noexcept {
+  if (!finished_range_valid_ || address != read_pointer_writeback_address_ ||
       new_value != finished_range_target_index_) {
     return;
   }
@@ -592,7 +743,7 @@ void XenosFenceTrace::ReadPointerWriteback(uint32_t address, uint32_t old_value,
   event.read_pointer_writeback_old = old_value;
   event.read_pointer_writeback_new = new_value;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
   finished_range_valid_ = false;
 }
@@ -602,8 +753,8 @@ void XenosFenceTrace::D3D12SwapRecording(uint64_t correlation_token, uint64_t su
   if (!enabled() || !correlation_token) {
     return;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
   Watch* watch = FindWatchByToken(correlation_token);
@@ -617,11 +768,8 @@ void XenosFenceTrace::D3D12SwapRecording(uint64_t correlation_token, uint64_t su
 
 void XenosFenceTrace::D3D12Submission(uint64_t submission_identity, uint64_t command_list_identity,
                                       uint64_t fence_identity, uint64_t fence_value) noexcept {
-  if (!enabled()) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
   uint64_t mask = 0;
@@ -653,17 +801,14 @@ void XenosFenceTrace::D3D12Submission(uint64_t submission_identity, uint64_t com
     event.flags |= kXenosFenceTraceSharedSubmission;
   }
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
 }
 
 void XenosFenceTrace::D3D12FenceCompleted(uint64_t fence_identity, uint64_t completed_value,
                                           bool succeeded) noexcept {
-  if (!enabled()) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
   uint64_t mask = 0;
@@ -693,17 +838,14 @@ void XenosFenceTrace::D3D12FenceCompleted(uint64_t fence_identity, uint64_t comp
   event.fence_identity = fence_identity;
   event.fence_completed_value = completed_value;
   FillRing(event);
-  FillCommon(event, MonotonicNanoseconds());
+  FillCommon(event, callback.monotonic_nanoseconds(), callback.thread_id());
   StoreEvent(event);
 }
 
-bool XenosFenceTrace::HasSubmittedWatches() const noexcept {
-  if (!enabled() || contention_drops_.load(std::memory_order_relaxed)) {
+bool XenosFenceTrace::HasSubmittedWatches() noexcept {
+  CallbackScope callback(*this);
+  if (!callback) {
     return false;
-  }
-  std::unique_lock lock(state_mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) {
-    return true;
   }
   for (const Watch& watch : watches_) {
     if (watch.stage == WatchStage::kSubmitted) {
@@ -714,21 +856,21 @@ bool XenosFenceTrace::HasSubmittedWatches() const noexcept {
 }
 
 void XenosFenceTrace::PollTimeouts() noexcept {
+  if (!enabled()) {
+    return;
+  }
   PollTimeoutsAt(MonotonicNanoseconds());
 }
 
 void XenosFenceTrace::PollTimeoutsAt(uint64_t monotonic_nanoseconds) noexcept {
-  if (!enabled()) {
+  CallbackScope callback(*this);
+  if (!callback) {
     return;
   }
-  std::unique_lock<std::mutex> lock;
-  if (!TryLock(lock)) {
-    return;
-  }
-  ExpireWatches(monotonic_nanoseconds);
+  ExpireWatches(monotonic_nanoseconds, callback.thread_id());
 }
 
-void XenosFenceTrace::ExpireWatches(uint64_t now) noexcept {
+void XenosFenceTrace::ExpireWatches(uint64_t now, uint32_t thread_id) noexcept {
   for (Watch& watch : watches_) {
     if (watch.stage == WatchStage::kUnused || IsTerminal(watch.stage) ||
         (watch.completion_observed && watch.readback_observed) ||
@@ -744,7 +886,7 @@ void XenosFenceTrace::ExpireWatches(uint64_t now) noexcept {
     event.fence_identity = watch.fence_identity;
     event.fence_value = watch.fence_value;
     FillRing(event);
-    FillCommon(event, now);
+    FillCommon(event, now, thread_id);
     StoreEvent(event);
   }
 }
@@ -841,29 +983,44 @@ void XenosFenceTrace::ClearRange() noexcept {
 }
 
 XenosFenceTraceStatistics XenosFenceTrace::statistics() const noexcept {
-  XenosFenceTraceStatistics result{};
-  std::unique_lock lock(state_mutex_, std::try_to_lock);
-  result.stored = std::min<uint32_t>(next_slot_.load(std::memory_order_relaxed),
-                                     uint32_t(kXenosFenceTraceCapacity));
-  result.overflow = overflow_.load(std::memory_order_relaxed);
-  result.contention_drops = contention_drops_.load(std::memory_order_relaxed);
-  result.last_sequence = next_sequence_.load(std::memory_order_relaxed);
-  if (lock.owns_lock()) {
+  const auto read_statistics = [this] {
+    XenosFenceTraceStatistics result{};
+    result.stored = std::min<uint32_t>(next_slot_.load(std::memory_order_relaxed),
+                                       uint32_t(kXenosFenceTraceCapacity));
+    result.overflow = overflow_.load(std::memory_order_relaxed);
+    result.lock_waits = lock_waits_.load(std::memory_order_relaxed);
+    result.maximum_lock_wait_nanoseconds =
+        maximum_lock_wait_nanoseconds_.load(std::memory_order_relaxed);
+    result.dropped_callbacks = dropped_callbacks_.load(std::memory_order_relaxed);
+    result.reentry_failures = reentry_failures_.load(std::memory_order_relaxed);
+    result.last_sequence = next_sequence_.load(std::memory_order_relaxed);
     result.watched = watched_count_;
     result.in_flight = CountInFlight();
     result.unresolved = CountUnresolved();
     result.epoch = epoch_;
+    return result;
+  };
+  if (active_callback_trace == this) {
+    return read_statistics();
   }
-  return result;
+  std::lock_guard state_lock(state_mutex_);
+  return read_statistics();
 }
 
 bool XenosFenceTrace::CopyEvent(size_t index, XenosFenceTraceEvent& event) const noexcept {
-  if (index >= kXenosFenceTraceCapacity ||
-      !slots_[index].committed.load(std::memory_order_acquire)) {
-    return false;
+  const auto copy_event = [this, index, &event] {
+    if (index >= kXenosFenceTraceCapacity ||
+        !slots_[index].committed.load(std::memory_order_acquire)) {
+      return false;
+    }
+    event = slots_[index].event;
+    return true;
+  };
+  if (active_callback_trace == this) {
+    return copy_event();
   }
-  event = slots_[index].event;
-  return true;
+  std::lock_guard state_lock(state_mutex_);
+  return copy_event();
 }
 
 bool XenosFenceTrace::Serialize(const XenosFenceTraceEvent* events, size_t event_count) const {
@@ -879,7 +1036,7 @@ bool XenosFenceTrace::Serialize(const XenosFenceTraceEvent* events, size_t event
   if (!output) {
     return false;
   }
-  output << "# schema=xenos_consumer_fence_trace_v1\n";
+  output << "# schema=xenos_consumer_fence_trace_v2\n";
   output << "# capacity=" << kXenosFenceTraceCapacity << '\n';
   output << "# watch_limit=" << kXenosFenceTraceWatchLimit << '\n';
   output << "# timeout_nanoseconds=" << kXenosFenceTraceTimeoutNanoseconds << '\n';
@@ -892,7 +1049,8 @@ bool XenosFenceTrace::Serialize(const XenosFenceTraceEvent* events, size_t event
             "read_pointer_writeback_address,read_pointer_writeback_old,"
             "read_pointer_writeback_new,correlation_token,correlation_mask,range_identity,"
             "command_list_identity,fence_identity,fence_value,fence_completed_value,"
-            "stored_count,overflow_count,contention_drop_count,watched_count,in_flight_count,"
+            "stored_count,overflow_count,lock_wait_count,maximum_lock_wait_nanoseconds,"
+            "dropped_callback_count,reentry_failure_count,watched_count,in_flight_count,"
             "unresolved_count\n";
   output << std::hex;
   for (size_t i = 0; i < event_count; ++i) {
@@ -914,9 +1072,10 @@ bool XenosFenceTrace::Serialize(const XenosFenceTraceEvent* events, size_t event
            << event.correlation_mask << ',' << event.range_identity << ','
            << event.command_list_identity << ',' << event.fence_identity << ',' << event.fence_value
            << ',' << event.fence_completed_value << ',' << event.stored_count << ','
-           << event.overflow_count << ',' << event.contention_drop_count << ','
-           << event.watched_count << ',' << event.in_flight_count << ',' << event.unresolved_count
-           << '\n';
+           << event.overflow_count << ',' << event.lock_wait_count << ','
+           << event.maximum_lock_wait_nanoseconds << ',' << event.dropped_callback_count << ','
+           << event.reentry_failure_count << ',' << event.watched_count << ','
+           << event.in_flight_count << ',' << event.unresolved_count << '\n';
   }
   output.close();
   if (!output) {

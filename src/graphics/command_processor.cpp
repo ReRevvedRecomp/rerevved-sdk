@@ -250,8 +250,10 @@ void CommandProcessor::WorkerThreadMain() {
       auto& fence_trace = diagnostic::GetXenosFenceTrace();
       if (fence_trace.enabled()) {
         uint32_t old_value = memory::load_and_swap<uint32_t>(readback);
+        auto readback_admission = fence_trace.AdmitReadPointerWriteback();
         memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
-        fence_trace.ReadPointerWriteback(read_ptr_writeback_ptr_, old_value, read_ptr_index_);
+        fence_trace.ReadPointerWriteback(std::move(readback_admission), read_ptr_writeback_ptr_,
+                                         old_value, read_ptr_index_);
       } else {
         memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
       }
