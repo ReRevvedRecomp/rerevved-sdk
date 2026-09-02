@@ -7,8 +7,8 @@ branch. `main` is a fast-forward-only mirror of `upstream/main`.
 
 1. Fetch `upstream` and identify the exact accepted upstream release commit.
 2. Create a disposable integration branch from that commit.
-3. Reconstruct the maintained delta as small, coherent landmark commits. Do
-   not merge `main` or the previous maintained branch into the candidate.
+3. Reconstruct the maintained delta as small, coherent landmark commits.
+   Do not merge `main` or the previous maintained branch into the candidate.
 4. Review the linear graph, complete diff, and every file deletion.
 5. Build, test, and install the candidate SDK on Windows.
 6. Validate consuming projects and update their exact commit and version pins
