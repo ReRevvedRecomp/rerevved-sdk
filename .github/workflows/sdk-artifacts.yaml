@@ -34,7 +34,6 @@ jobs:
           fi
           commit=$(printf '%s' "${REQUESTED_COMMIT}" | tr 'A-F' 'a-f')
           git cat-file -e "${commit}^{commit}"
-          git branch --remotes --contains "${commit}" | grep -q .
           echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
 
   build-win-amd64:

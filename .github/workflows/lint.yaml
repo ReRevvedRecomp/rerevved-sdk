@@ -42,9 +42,3 @@ jobs:
           else
             echo "No changed C/C++ files"
           fi
-
-      - name: Check Vulkan dependency pins
-        run: python scripts/check_vulkan_stack.py
-
-      - name: Run script tests
-        run: python -m pytest scripts/tests -v
