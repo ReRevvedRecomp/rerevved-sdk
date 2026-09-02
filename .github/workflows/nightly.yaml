@@ -8,7 +8,7 @@ permissions:
   actions: write
 
 env:
-  DEV_BRANCH: development
+  DEV_BRANCH: main
   NIGHTLY_TAG_PREFIX: nightly-
   NIGHTLY_RETENTION: 10
   RELEASE_LIST_LIMIT: 1000
@@ -51,7 +51,7 @@ jobs:
           fi
           echo "prev_nightly_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch — forcing build as ${tag_name}."
+            echo "Manual dispatch: forcing build as ${tag_name}."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           elif [ "${dev_sha}" = "${prev_sha}" ]; then
             echo "${DEV_BRANCH} unchanged since last nightly (${dev_sha}); skipping build."
