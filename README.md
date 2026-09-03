@@ -2,11 +2,11 @@
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 
 > [!NOTE]
-> This is the maintained ReRevved fork of ReXGlue. Project development uses
-> `main`; `upstream-main` mirrors upstream ReXGlue. See
-> [Maintaining the fork](docs/MAINTAINING.md) for integration and artifact
-> policy. The upstream project links below are preserved for attribution and
-> upstream releases.
+> This is the maintained ReRevved fork of ReXGlue.
+> Project development uses `main`.
+> Accepted upstream changes are compared with `upstream/main`.
+> See [Maintaining the fork](docs/MAINTAINING.md) for integration and artifact policy.
+> The upstream project links below are preserved for attribution and upstream releases.
 
 <h1 align="center">
   <br>

@@ -1,5 +1,7 @@
 # Contributing
 
+Follow [Maintaining the ReRevved fork](docs/MAINTAINING.md) for fork-specific changes.
+
 See the [Contributing Guide](https://github.com/rexglue/rexglue-sdk/wiki/Development/Contributing) in the wiki for:
 
 - Build prerequisites and setup

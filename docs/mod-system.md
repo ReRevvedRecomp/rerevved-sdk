@@ -25,6 +25,8 @@ mods/<name>/
     windows-arm64/<name>.dll
     linux-x64/lib<name>.so
     linux-arm64/lib<name>.so
+    macos-x64/lib<name>.dylib
+    macos-arm64/lib<name>.dylib
 ```
 
 The loader checks the running platform's directory first and retains support
