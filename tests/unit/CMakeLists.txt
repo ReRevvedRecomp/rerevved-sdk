@@ -19,6 +19,7 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     system/mod_dependency_test.cpp
     kernel/xam/lan_system_link_test.cpp
+    kernel/xam/xgi_request_test.cpp
     graphics/diagnostic_util_test.cpp
     graphics/xenos_fence_trace_test.cpp
     input/input_assignment_test.cpp

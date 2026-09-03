@@ -13,6 +13,8 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include "xgi_request.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -274,20 +276,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001B: {
-      assert_true(!buffer_length || buffer_length == 32);
+      assert_true(!buffer_length || buffer_length == kSearchByIdRequestSize);
 
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_ids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
+      SearchByIdRequest request{};
+      if (!TryDecodeSearchByIdRequest(*memory_, buffer_ptr, buffer_length, request)) {
+        return X_E_SUCCESS;
+      }
 
-      REXKRNL_DEBUG("XSessionSearchByID({}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
+      REXKRNL_DEBUG("XSessionSearchByID({}, {:08X}, {:08X}, {:08X}, {:08X})", request.user_index,
+                    request.num_session_ids, request.session_ids_ptr, request.results_buffer_size,
+                    request.search_results_ptr);
 
       return X_E_SUCCESS;
     }
