@@ -81,14 +81,30 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 }
 
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
-    : kernel_state_(kernel_state), root_path_(root_path) {}
+    : ContentManager(kernel_state, root_path, root_path) {}
+
+ContentManager::ContentManager(KernelState* kernel_state,
+                               const std::filesystem::path& base_root_path,
+                               const std::filesystem::path& active_root_path)
+    : kernel_state_(kernel_state),
+      base_root_path_(base_root_path),
+      active_root_path_(active_root_path) {}
 
 ContentManager::~ContentManager() = default;
+
+const std::filesystem::path& ContentManager::ResolveContentRoot(XContentType content_type) const {
+  // Marketplace packages and headers are shared from B; every other content
+  // type is profile-local under P.
+  return content_type == XContentType::kMarketplaceContent ? base_root_path_ : active_root_path_;
+}
 
 std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                                          uint32_t title_id) {
   if (title_id == kCurrentlyRunningTitleId) {
     title_id = kernel_state_->title_id();
+  }
+  if (content_type == XContentType::kMarketplaceContent) {
+    xuid = 0;
   }
   auto xuid_str = fmt::format("{:016X}", xuid);
   auto title_id_str = fmt::format("{:08X}", title_id);
@@ -96,7 +112,7 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 
   // Package root path:
   // content_root/xuid/title_id/content_type/
-  return root_path_ / xuid_str / title_id_str / content_type_str;
+  return ResolveContentRoot(content_type) / xuid_str / title_id_str / content_type_str;
 }
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
@@ -132,14 +148,21 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
 
   // Header root path:
   // content_root/xuid/title_id/Headers/content_type/filename.header
-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
-         final_name;
+  return ResolveContentRoot(content_type) / xuid_str / title_id_str / kGameContentHeaderDirName /
+         content_type_str / final_name;
 }
 
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
                                                                  XContentType content_type,
                                                                  uint32_t title_id) {
   std::vector<XCONTENT_AGGREGATE_DATA> result;
+
+  // XAM enumerates the signed-in user first and then the common XUID-zero
+  // namespace. Marketplace content exists only in the latter; returning
+  // nothing here avoids both a non-zero marketplace path and duplicate rows.
+  if (content_type == XContentType::kMarketplaceContent && xuid != 0) {
+    return result;
+  }
 
   if (title_id == kCurrentlyRunningTitleId) {
     title_id = kernel_state_->title_id();
@@ -446,7 +469,7 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath() {
 
   // Per-game per-profile data location:
   // content_root/title_id/profile/user_name
-  return root_path_ / title_id / kGameUserContentDirName / user_name;
+  return active_root_path_ / title_id / kGameUserContentDirName / user_name;
 }
 
 std::unordered_map<string::string_key_case, ContentPackage*,
@@ -580,8 +603,8 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     return X_ERROR_ACCESS_DENIED;
   }
 
-  // Derive install destination:
-  // root_path_/0000000000000000/{title_id}/00000002/{filename}/
+  // Derive install destination under the shared base root via the marketplace
+  // package resolver.
   auto file_name = rex::path_to_utf8(package_path.filename());
 
   XCONTENT_AGGREGATE_DATA content_data;

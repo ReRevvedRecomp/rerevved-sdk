@@ -31,7 +31,26 @@
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
-REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+std::string& FLAGS_user_data_root_storage_() {
+  static std::string storage;
+  return storage;
+}
+static auto _cvar_reg_user_data_root =
+    rex::cvar::FlagRegistrar({"user_data_root",
+                              rex::cvar::FlagType::String,
+                              "Runtime",
+                              "Override user data path",
+                              [](std::string_view v) {
+                                FLAGS_user_data_root_storage_() = std::string(v);
+                                return true;
+                              },
+                              []() { return FLAGS_user_data_root_storage_(); },
+                              [](std::string_view) {},
+                              rex::cvar::Lifecycle::kInitOnly,
+                              {},
+                              "",
+                              false},
+                             rex::cvar::Audience::kAdvanced, rex::cvar::Persistence::kSessionOnly);
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
@@ -52,8 +71,24 @@ Runtime::Runtime(const std::filesystem::path& game_data_root,
                  const std::filesystem::path& update_data_root,
                  const std::filesystem::path& cache_root,
                  const std::filesystem::path& metadata_root)
+    : Runtime(game_data_root, user_data_root.empty() ? game_data_root : user_data_root,
+              user_data_root.empty() ? game_data_root : user_data_root, update_data_root,
+              cache_root, metadata_root) {}
+
+Runtime::Runtime(const std::filesystem::path& game_data_root,
+                 const std::filesystem::path& base_user_data_root,
+                 const std::filesystem::path& active_user_data_root,
+                 const std::filesystem::path& update_data_root,
+                 const std::filesystem::path& cache_root,
+                 const std::filesystem::path& metadata_root)
     : game_data_root_(game_data_root),
-      user_data_root_(user_data_root.empty() ? game_data_root : user_data_root),
+      base_user_data_root_(
+          base_user_data_root.empty()
+              ? (active_user_data_root.empty() ? game_data_root : active_user_data_root)
+              : base_user_data_root),
+      user_data_root_(active_user_data_root.empty()
+                          ? (base_user_data_root.empty() ? game_data_root : base_user_data_root)
+                          : active_user_data_root),
       update_data_root_(update_data_root),
       cache_root_(cache_root),
       metadata_root_(metadata_root) {}

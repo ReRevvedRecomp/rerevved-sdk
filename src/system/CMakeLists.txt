@@ -1,5 +1,6 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    profile.cpp
     embedded_metadata.cpp
     achievement_manager.cpp
     achievements.cpp

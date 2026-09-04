@@ -162,6 +162,9 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   // Collect sorted unique category paths.
   std::set<std::string> category_set;
   for (auto& entry : registry) {
+    if (entry.audience == rex::cvar::Audience::kHidden) {
+      continue;
+    }
     category_set.insert(entry.category);
   }
 
@@ -291,6 +294,10 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
   for (auto& entry : registry) {
+    if (entry.audience == rex::cvar::Audience::kHidden) {
+      continue;
+    }
+
     // Filter by category (unless searching).
     if (!searching) {
       if (!category_matches(entry.category)) {

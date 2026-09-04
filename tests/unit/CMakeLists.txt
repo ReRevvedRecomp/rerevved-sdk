@@ -15,6 +15,7 @@ add_executable(unit_tests
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
+    system/profile_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     system/mod_dependency_test.cpp

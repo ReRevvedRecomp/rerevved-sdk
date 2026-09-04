@@ -330,6 +330,190 @@ TEST_CASE("cvar source precedence", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 }
 
+TEST_CASE("cvar application defaults rank below config", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_application_default.toml";
+  {
+    std::ofstream file(config_path);
+    file << "test_string_flag = \"from config\"\n";
+  }
+
+  REQUIRE(rex::cvar::SetFlagAsApplicationDefault("test_string_flag", "from application"));
+  CHECK(REXCVAR_GET(test_string_flag) == "from application");
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kApplicationDefault);
+
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_string_flag) == "from config");
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kConfig);
+
+  CHECK_FALSE(rex::cvar::SetFlagAsApplicationDefault("test_string_flag", "too late"));
+  CHECK(REXCVAR_GET(test_string_flag) == "from config");
+
+  SetTestEnv("REX_TEST_STRING_FLAG", "from environment");
+  rex::cvar::ApplyEnvironment();
+  CHECK(REXCVAR_GET(test_string_flag) == "from environment");
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kEnvironment);
+
+  char argv0[] = "cvar_test";
+  char arg1[] = "--test_string_flag=from command line";
+  char* argv[] = {argv0, arg1};
+  rex::cvar::Init(2, argv);
+  CHECK(REXCVAR_GET(test_string_flag) == "from command line");
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kCommandLine);
+
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "from runtime"));
+  CHECK(REXCVAR_GET(test_string_flag) == "from runtime");
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kRuntime);
+
+  SetTestEnv("REX_TEST_STRING_FLAG", "");
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
+TEST_CASE("cvar policy metadata controls deferred config and save", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_cvar_policy.toml";
+  {
+    std::ofstream file(config_path);
+    file << "policy_config_flag = \"config value\"\n";
+    file << "policy_session_flag = \"must not load\"\n";
+    file << "policy_never_flag = \"explicit value\"\n";
+  }
+
+  rex::cvar::LoadConfig(config_path);
+  char argv0[] = "cvar_test";
+  char* argv[] = {argv0};
+  rex::cvar::Init(1, argv);
+
+  std::string config_value = "config default";
+  std::string session_value = "session default";
+  std::string never_value = "never default";
+  {
+    rex::cvar::FlagRegistrar config_flag({.name = "policy_config_flag",
+                                          .type = rex::cvar::FlagType::String,
+                                          .category = "Test",
+                                          .description = "Config policy test",
+                                          .setter =
+                                              [&config_value](std::string_view value) {
+                                                config_value = value;
+                                                return true;
+                                              },
+                                          .getter = [&config_value]() { return config_value; },
+                                          .default_value = "config default"},
+                                         rex::cvar::Audience::kPlayer,
+                                         rex::cvar::Persistence::kConfig);
+    rex::cvar::FlagRegistrar session_flag({.name = "policy_session_flag",
+                                           .type = rex::cvar::FlagType::String,
+                                           .category = "Test",
+                                           .description = "Session policy test",
+                                           .setter =
+                                               [&session_value](std::string_view value) {
+                                                 session_value = value;
+                                                 return true;
+                                               },
+                                           .getter = [&session_value]() { return session_value; },
+                                           .default_value = "session default"},
+                                          rex::cvar::Audience::kPlayer,
+                                          rex::cvar::Persistence::kSessionOnly);
+    rex::cvar::FlagRegistrar never_flag({.name = "policy_never_flag",
+                                         .type = rex::cvar::FlagType::String,
+                                         .category = "Test",
+                                         .description = "Never-persist policy test",
+                                         .setter =
+                                             [&never_value](std::string_view value) {
+                                               never_value = value;
+                                               return true;
+                                             },
+                                         .getter = [&never_value]() { return never_value; },
+                                         .default_value = "never default"},
+                                        rex::cvar::Audience::kAdvanced,
+                                        rex::cvar::Persistence::kNeverPersist);
+
+    CHECK(config_value == "config value");
+    CHECK(session_value == "session default");
+    CHECK(never_value == "explicit value");
+
+    const auto* config_info = rex::cvar::GetFlagInfo("policy_config_flag");
+    const auto* session_info = rex::cvar::GetFlagInfo("policy_session_flag");
+    const auto* never_info = rex::cvar::GetFlagInfo("policy_never_flag");
+    REQUIRE(config_info != nullptr);
+    REQUIRE(session_info != nullptr);
+    REQUIRE(never_info != nullptr);
+    CHECK(config_info->audience == rex::cvar::Audience::kPlayer);
+    CHECK(config_info->persistence == rex::cvar::Persistence::kConfig);
+    CHECK(session_info->persistence == rex::cvar::Persistence::kSessionOnly);
+    CHECK(never_info->persistence == rex::cvar::Persistence::kNeverPersist);
+
+    const auto toml = rex::cvar::SerializeToTOML();
+    CHECK(toml.find("policy_config_flag = \"config value\"") != std::string::npos);
+    CHECK(toml.find("policy_session_flag") == std::string::npos);
+    CHECK(toml.find("policy_never_flag") == std::string::npos);
+
+    rex::cvar::SaveConfig(config_path);
+    std::ifstream saved_file(config_path);
+    const std::string saved((std::istreambuf_iterator<char>(saved_file)),
+                            std::istreambuf_iterator<char>());
+    CHECK(saved.find("policy_config_flag = \"config value\"") != std::string::npos);
+    CHECK(saved.find("policy_session_flag") == std::string::npos);
+    CHECK(saved.find("policy_never_flag") == std::string::npos);
+  }
+
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
+TEST_CASE("cvar legacy registration normalizes policy before replay", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_legacy_policy.toml";
+  {
+    std::ofstream file(config_path);
+    file << "legacy_policy_flag = \"from config\"\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  char argv0[] = "cvar_test";
+  char* argv[] = {argv0};
+  rex::cvar::Init(1, argv);
+
+  std::string value = "default";
+  auto registered = rex::cvar::RegisterFlag({.name = "legacy_policy_flag",
+                                             .type = rex::cvar::FlagType::String,
+                                             .category = "Test",
+                                             .description = "Legacy registration policy test",
+                                             .setter =
+                                                 [&value](std::string_view new_value) {
+                                                   value = new_value;
+                                                   return true;
+                                                 },
+                                             .getter = [&value]() { return value; },
+                                             .default_value = "default",
+                                             .audience = rex::cvar::Audience::kPlayer,
+                                             .persistence = rex::cvar::Persistence::kSessionOnly});
+  REQUIRE(registered.has_value());
+  CHECK(value == "from config");
+  const auto* info = rex::cvar::GetFlagInfo("legacy_policy_flag");
+  REQUIRE(info != nullptr);
+  CHECK(info->audience == rex::cvar::Audience::kAdvanced);
+  CHECK(info->persistence == rex::cvar::Persistence::kConfig);
+
+  rex::cvar::UnregisterFlag("legacy_policy_flag");
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
+TEST_CASE("cvar FlagEntry ABI and source values remain stable", "[cvar]") {
+  CHECK(sizeof(rex::cvar::FlagEntry) == sizeof(rex::cvar::abi_detail::LegacyFlagEntry));
+  CHECK(alignof(rex::cvar::FlagEntry) == alignof(rex::cvar::abi_detail::LegacyFlagEntry));
+  CHECK(static_cast<int>(rex::cvar::Source::kDefault) == 0);
+  CHECK(static_cast<int>(rex::cvar::Source::kConfig) == 1);
+  CHECK(static_cast<int>(rex::cvar::Source::kEnvironment) == 2);
+  CHECK(static_cast<int>(rex::cvar::Source::kCommandLine) == 3);
+  CHECK(static_cast<int>(rex::cvar::Source::kRuntime) == 4);
+  CHECK(static_cast<int>(rex::cvar::Source::kApplicationDefault) == 5);
+}
+
 TEST_CASE("cvar precedence holds for flags registered after startup", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 

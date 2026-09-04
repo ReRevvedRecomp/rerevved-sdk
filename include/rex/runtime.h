@@ -109,6 +109,14 @@ class Runtime {
                    const std::filesystem::path& update_data_root = {},
                    const std::filesystem::path& cache_root = {},
                    const std::filesystem::path& metadata_root = {});
+  // Constructs a runtime with distinct shared base (B) and active (P) roots.
+  // The six-argument form keeps the legacy five-argument construction path
+  // source-compatible while allowing marketplace content to remain shared.
+  Runtime(const std::filesystem::path& game_data_root,
+          const std::filesystem::path& base_user_data_root,
+          const std::filesystem::path& active_user_data_root,
+          const std::filesystem::path& update_data_root, const std::filesystem::path& cache_root,
+          const std::filesystem::path& metadata_root);
   ~Runtime();
 
   // Non-copyable
@@ -133,7 +141,10 @@ class Runtime {
 
   // Path accessors
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
+  const std::filesystem::path& base_user_data_root() const { return base_user_data_root_; }
+  // The active profile root (P); retained under the legacy accessor name.
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
+  const std::filesystem::path& active_user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
   const std::filesystem::path& metadata_root() const { return metadata_root_; }
@@ -194,6 +205,7 @@ class Runtime {
   bool ValidateModDependencies() const;
 
   std::filesystem::path game_data_root_;
+  std::filesystem::path base_user_data_root_;
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;

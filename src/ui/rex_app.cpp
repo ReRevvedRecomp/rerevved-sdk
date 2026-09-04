@@ -53,6 +53,83 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+namespace {
+
+std::string& ProfileStorage() {
+  static std::string storage;
+  return storage;
+}
+
+bool& ProfileCopyFromDefaultStorage() {
+  static bool storage = false;
+  return storage;
+}
+
+static auto profile_registrar = rex::cvar::FlagRegistrar(
+    {.name = "profile",
+     .type = rex::cvar::FlagType::String,
+     .category = "Runtime",
+     .description = "Active host-storage profile (empty or 'default' uses established paths)",
+     .setter =
+         [](std::string_view value) {
+           // Store the raw early value so path resolution can reject invalid IDs
+           // instead of silently falling back to the default environment.
+           ProfileStorage() = value;
+           return true;
+         },
+     .getter = []() { return ProfileStorage(); },
+     .command_callback = [](std::string_view) {},
+     .lifecycle = rex::cvar::Lifecycle::kInitOnly,
+     .default_value = ""},
+    rex::cvar::Audience::kPlayer, rex::cvar::Persistence::kSessionOnly);
+
+static auto profile_copy_registrar = rex::cvar::FlagRegistrar(
+    {.name = "profile_copy_from_default",
+     .type = rex::cvar::FlagType::Boolean,
+     .category = "Runtime",
+     .description = "Copy the default environment into a new named profile once",
+     .setter =
+         [](std::string_view value) {
+           if (value != "true" && value != "false" && value != "1" && value != "0" &&
+               value != "yes" && value != "no") {
+             return false;
+           }
+           ProfileCopyFromDefaultStorage() = rex::string::from_string<bool>(value, false);
+           return true;
+         },
+     .getter = []() { return ProfileCopyFromDefaultStorage() ? "true" : "false"; },
+     .command_callback = [](std::string_view) {},
+     .lifecycle = rex::cvar::Lifecycle::kInitOnly,
+     .default_value = "false"},
+    rex::cvar::Audience::kHidden, rex::cvar::Persistence::kSessionOnly);
+
+const char* ProfileCopyResultName(rex::system::ProfileCopyResult result) {
+  using rex::system::ProfileCopyResult;
+  switch (result) {
+    case ProfileCopyResult::kSuccess:
+      return "success";
+    case ProfileCopyResult::kInvalidProfile:
+      return "invalid profile";
+    case ProfileCopyResult::kDefaultProfile:
+      return "default profile selected";
+    case ProfileCopyResult::kTargetExists:
+      return "target already exists";
+    case ProfileCopyResult::kInvalidSpecification:
+      return "invalid title copy specification";
+    case ProfileCopyResult::kUnsafeSource:
+      return "unsafe source path";
+    case ProfileCopyResult::kDestinationCollision:
+      return "destination collision";
+    case ProfileCopyResult::kIoError:
+      return "I/O error";
+    case ProfileCopyResult::kVerificationFailed:
+      return "verification failed";
+  }
+  return "unknown error";
+}
+
+}  // namespace
+
 namespace rex {
 
 // --- ReXApp ---
@@ -113,14 +190,23 @@ bool ReXApp::SetupEnvironment() {
     game_dir = game_data_cvar;
   }
 
-  // User data: cvar override, or platform user directory
-  std::filesystem::path user_dir;
+  // Base user data (B): cvar override, or platform user directory.
+  std::filesystem::path base_user_dir;
   std::string user_data_cvar = REXCVAR_GET(user_data_root);
   if (!user_data_cvar.empty()) {
-    user_dir = user_data_cvar;
+    base_user_dir = user_data_cvar;
   } else {
-    user_dir = rex::filesystem::GetUserFolder() / GetName();
+    base_user_dir = rex::filesystem::GetUserFolder() / GetName();
   }
+
+  const auto profile_paths = system::ResolveProfile(base_user_dir, ProfileStorage());
+  if (!profile_paths) {
+    auto msg = fmt::format("Invalid or unsafe profile selection: '{}'", ProfileStorage());
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+    return false;
+  }
+  const auto& user_dir = profile_paths->active_root;
 
   // Update data: cvar override, or empty (opt-in)
   std::filesystem::path update_dir;
@@ -132,6 +218,7 @@ bool ReXApp::SetupEnvironment() {
   // Cache: cvar override, or user_dir/cache
   std::filesystem::path cache_dir;
   std::string cache_root_cvar = REXCVAR_GET(cache_root);
+  const bool cache_root_is_default = cache_root_cvar.empty();
   if (!cache_root_cvar.empty()) {
     cache_dir = cache_root_cvar;
   } else {
@@ -144,11 +231,59 @@ bool ReXApp::SetupEnvironment() {
     metadata_dir = metadata_root_cvar;
   }
 
-  PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+  PathConfig path_config{game_dir,
+                         user_dir,
+                         update_dir,
+                         cache_dir,
+                         metadata_dir,
+                         exe_dir / (std::string(GetName()) + ".toml"),
+                         profile_paths->base_root,
+                         profile_paths->profile_id};
   OnConfigurePaths(path_config);
+  if (cache_root_is_default && path_config.cache_root == cache_dir) {
+    path_config.cache_root = path_config.user_data_root / "cache";
+  }
+
+  // Preserve the legacy default-profile hook behavior where a title adjusts
+  // only user_data_root, while keeping the new B/P metadata internally
+  // consistent. Named profiles must remain a resolved child of B.
+  if (path_config.profile_id.empty() &&
+      path_config.base_user_data_root == profile_paths->base_root &&
+      path_config.user_data_root != profile_paths->active_root) {
+    path_config.base_user_data_root = path_config.user_data_root;
+  }
+  const auto configured_profile_paths =
+      system::ResolveProfile(path_config.base_user_data_root, path_config.profile_id);
+  if (!configured_profile_paths || configured_profile_paths->active_root.lexically_normal() !=
+                                       path_config.user_data_root.lexically_normal()) {
+    auto msg = std::string("The configured profile roots are inconsistent or unsafe.");
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+    return false;
+  }
+
+  if (ProfileCopyFromDefaultStorage()) {
+    const auto specification = GetProfileCopySpecification();
+    if (!specification) {
+      auto msg = std::string("This title does not provide a profile copy specification.");
+      REXLOG_ERROR("{}", msg);
+      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+      return false;
+    }
+    const auto result = system::CopyFromDefault(*configured_profile_paths, *specification);
+    if (result != system::ProfileCopyResult::kSuccess) {
+      auto msg = fmt::format("Could not copy the default environment into profile '{}': {}.",
+                             configured_profile_paths->profile_id, ProfileCopyResultName(result));
+      REXLOG_ERROR("{}", msg);
+      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+      return false;
+    }
+  }
+
   game_data_root_ = path_config.game_data_root;
+  base_user_data_root_ = path_config.base_user_data_root;
   user_data_root_ = path_config.user_data_root;
+  active_profile_id_ = path_config.profile_id;
   update_data_root_ = path_config.update_data_root;
   cache_root_ = path_config.cache_root;
   metadata_root_ = path_config.metadata_root;
@@ -192,6 +327,10 @@ bool ReXApp::SetupEnvironment() {
   if (!user_data_root_.empty()) {
     REXLOG_DEBUG("  User data:      {}", user_data_root_.string());
   }
+  REXLOG_DEBUG("  Host profile:   {}", active_profile_id_.empty() ? "default" : active_profile_id_);
+  if (base_user_data_root_ != user_data_root_) {
+    REXLOG_DEBUG("  Shared base:    {}", base_user_data_root_.string());
+  }
   if (!update_data_root_.empty()) {
     REXLOG_DEBUG("  Update data:    {}", update_data_root_.string());
   }
@@ -218,14 +357,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   }
 
   game_data_root_ = paths.game_data_root;
+  base_user_data_root_ =
+      paths.base_user_data_root.empty() ? paths.user_data_root : paths.base_user_data_root;
   user_data_root_ = paths.user_data_root;
+  active_profile_id_ = paths.profile_id;
   update_data_root_ = paths.update_data_root;
   cache_root_ = paths.cache_root;
   metadata_root_ = paths.metadata_root;
 
-  runtime_ =
-      std::make_unique<rex::Runtime>(paths.game_data_root, paths.user_data_root,
-                                     paths.update_data_root, paths.cache_root, paths.metadata_root);
+  runtime_ = std::make_unique<rex::Runtime>(paths.game_data_root, base_user_data_root_,
+                                            paths.user_data_root, paths.update_data_root,
+                                            paths.cache_root, paths.metadata_root);
   runtime_->set_app_context(&app_context());
 
   // Window and ImGui drawer already exist from SetupPresentation; publish them

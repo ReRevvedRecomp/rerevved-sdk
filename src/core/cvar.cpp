@@ -79,9 +79,28 @@ std::string FlagNameToEnvVar(std::string_view name) {
 enum class ApplyResult { kApplied, kSkipped, kRejected };
 
 ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Source source);
+ApplyResult ApplyFlagFromSourceLocked(std::string_view name, std::string_view value, Source source);
+
+int SourceRank(Source source) {
+  switch (source) {
+    case Source::kDefault:
+      return 0;
+    case Source::kApplicationDefault:
+      return 1;
+    case Source::kConfig:
+      return 2;
+    case Source::kEnvironment:
+      return 3;
+    case Source::kCommandLine:
+      return 4;
+    case Source::kRuntime:
+      return 5;
+  }
+  return -1;
+}
 
 bool Outranks(Source source, const FlagEntry& entry) {
-  return source >= entry.source;
+  return SourceRank(source) >= SourceRank(entry.source);
 }
 
 // Unvalidated apply, for the command line and environment paths.
@@ -222,9 +241,18 @@ std::vector<FlagEntry>& GetRegistry() {
 }
 
 std::optional<size_t> RegisterFlag(FlagEntry entry) {
+  // This overload is part of the legacy ABI. The bytes now occupied by the
+  // policy fields were padding in older FlagEntry values and may be arbitrary
+  // when an old module calls into this binary.
+  return RegisterFlag(std::move(entry), Audience::kAdvanced, Persistence::kConfig);
+}
+
+std::optional<size_t> RegisterFlag(FlagEntry entry, Audience audience, Persistence persistence) {
   std::lock_guard lock(GetRegistryMutex());
   (void)GetCallbackStorage();
   (void)GetPendingRestartStorage();
+  entry.audience = audience;
+  entry.persistence = persistence;
   auto& index = GetRegistryIndex();
   auto& storage = GetRegistryStorage();
   auto it = index.find(entry.name);
@@ -242,7 +270,7 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
     auto& pending = GetPendingValuesStorage();
     auto pending_it = pending.find(stored.name);
     if (pending_it != pending.end() && pending_it->second.config) {
-      ApplyFromSource(stored, *pending_it->second.config, Source::kConfig);
+      ApplyFlagFromSourceLocked(stored.name, *pending_it->second.config, Source::kConfig);
     }
     auto env_value = rex::platform::env::get(FlagNameToEnvVar(stored.name));
     if (env_value.has_value()) {
@@ -256,6 +284,16 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
     }
   }
   return pos;
+}
+
+bool SetFlagAsApplicationDefault(std::string_view name, std::string_view value) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) {
+    return false;
+  }
+  return ApplyFlagFromSourceLocked(name, value, Source::kApplicationDefault) ==
+         ApplyResult::kApplied;
 }
 
 void UnregisterFlag(std::string_view name) {
@@ -295,14 +333,19 @@ void FlagRegistrar::apply_(std::function<void(FlagEntry&)> fn) {
 
 namespace {
 
-ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Source source) {
-  std::lock_guard lock(GetRegistryMutex());
+ApplyResult ApplyFlagFromSourceLocked(std::string_view name, std::string_view value,
+                                      Source source) {
   auto it = GetRegistryIndex().find(std::string(name));
   if (it == GetRegistryIndex().end()) {
     return ApplyResult::kRejected;
   }
 
   auto& entry = GetRegistryStorage()[it->second];
+
+  if (source == Source::kConfig && entry.persistence == Persistence::kSessionOnly) {
+    REXLOG_DEBUG("Config: {} ignored, flag is session-only", name);
+    return ApplyResult::kRejected;
+  }
 
   if (!Outranks(source, entry)) {
     return ApplyResult::kSkipped;
@@ -335,6 +378,11 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
   }
 
   return ApplyResult::kApplied;
+}
+
+ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Source source) {
+  std::lock_guard lock(GetRegistryMutex());
+  return ApplyFlagFromSourceLocked(name, value, source);
 }
 
 }  // namespace
@@ -539,7 +587,7 @@ std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
+    if (entry.persistence == Persistence::kConfig && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
         result += entry.name + " = \"" + entry.getter() + "\"\n";
       } else {
@@ -554,7 +602,8 @@ std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.category == category && entry.getter() != entry.default_value) {
+    if (entry.category == category && entry.persistence == Persistence::kConfig &&
+        entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
         result += entry.name + " = \"" + entry.getter() + "\"\n";
       } else {
@@ -801,7 +850,9 @@ void SaveConfigSubset(const std::filesystem::path& config_path,
     if (it == all_entries.end()) {
       continue;
     }
-    to_write[name] = it->second;
+    if (it->second->persistence == Persistence::kConfig) {
+      to_write[name] = it->second;
+    }
   }
 
   auto format_value = [](const FlagEntry& entry) {
