@@ -122,6 +122,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
 
+  /// Returns the default base user-data root when no cvar override is set.
+  virtual std::filesystem::path GetDefaultUserDataRoot() const;
+
   /// Supplies the title-specific facts used by an explicitly requested copy
   /// from the default environment. The SDK derives every generic allowlist
   /// path from these facts. Return nullopt when the title does not support the

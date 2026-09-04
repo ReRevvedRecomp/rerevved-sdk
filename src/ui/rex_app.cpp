@@ -140,6 +140,10 @@ ReXApp::ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo 
                std::string_view usage)
     : WindowedApp(ctx, name, usage), ppc_info_(ppc_info) {}
 
+std::filesystem::path ReXApp::GetDefaultUserDataRoot() const {
+  return rex::filesystem::GetUserFolder() / GetName();
+}
+
 std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
   if (!runtime_ || !runtime_->kernel_state() || !imgui_drawer_ || !immediate_drawer_) {
     return nullptr;
@@ -196,7 +200,7 @@ bool ReXApp::SetupEnvironment() {
   if (!user_data_cvar.empty()) {
     base_user_dir = user_data_cvar;
   } else {
-    base_user_dir = rex::filesystem::GetUserFolder() / GetName();
+    base_user_dir = GetDefaultUserDataRoot();
   }
 
   const auto profile_paths = system::ResolveProfile(base_user_dir, ProfileStorage());
