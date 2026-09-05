@@ -132,8 +132,7 @@ void WriteManifest(const std::filesystem::path& package_root, std::string_view i
   std::filesystem::create_directories(package_root / "code" / CurrentPlatform());
   std::ofstream manifest(package_root / "mod.toml", std::ios::binary);
   manifest << "manifest_version = 1\n"
-           << extra << "[mod]\nid = \"" << id
-           << "\"\nname = \"Display Name\"\nversion = \"1.2.3\"\n"
+           << extra << "[mod]\nid = \"" << id << "\"\nname = \"Display Name\"\nversion = \"1.2\"\n"
            << "code = \"" << code << "\"\nplugin_abi = 1\n";
   std::ofstream binary(package_root / "code" / CurrentPlatform() / BinaryName(code),
                        std::ios::binary);
@@ -168,7 +167,7 @@ TEST_CASE("version 1 catalog parses metadata and warns on unknown fields", "[mod
   CHECK_FALSE(package.HasBlockingError());
   CHECK(package.id == "catalog-package");
   CHECK(package.display_name == "Display Name");
-  CHECK(package.version == "1.2.3");
+  CHECK(package.version == "1.2");
   CHECK(package.plugin_path.filename() == BinaryName("catalog_code"));
   CHECK(HasMessage(package, "unknown manifest field"));
 }
@@ -180,7 +179,7 @@ TEST_CASE("catalog keeps invalid records visible with blocking diagnostics", "[m
   {
     std::ofstream manifest(package_root / "mod.toml", std::ios::binary);
     manifest << "manifest_version = 1\n[mod]\nid = \"different-name\"\nname = \"\"\n"
-                "version = \"1.0\"\ncode = \"../escape\"\nplugin_abi = 99\n";
+                "version = \"1.0.0\"\ncode = \"../escape\"\nplugin_abi = 99\n";
   }
 
   auto catalog = rex::system::DiscoverModCatalog(temp.path(), "1.0.0");
@@ -189,7 +188,7 @@ TEST_CASE("catalog keeps invalid records visible with blocking diagnostics", "[m
   CHECK(package.HasBlockingError());
   CHECK(package.status == rex::system::ModPackageStatus::kInvalidManifest);
   CHECK(HasMessage(package, "does not match manifest id"));
-  CHECK(HasMessage(package, "major.minor.patch"));
+  CHECK(HasMessage(package, "major.minor"));
   CHECK(HasMessage(package, "code must be one filename stem"));
 }
 
@@ -244,7 +243,7 @@ TEST_CASE("catalog reports game, ABI, and platform incompatibility", "[mod_catal
   {
     std::ofstream manifest(abi_root / "mod.toml", std::ios::binary);
     manifest << "manifest_version = 1\n[mod]\nid = \"abi-mismatch\"\nname = \"ABI\"\n"
-                "version = \"1.0.0\"\ncode = \"abi_code\"\nplugin_abi = 9\n";
+                "version = \"1.0\"\ncode = \"abi_code\"\nplugin_abi = 9\n";
   }
   auto platform_root = temp.path() / "other-platform";
   const auto other_platform = OtherPlatform();
@@ -252,7 +251,7 @@ TEST_CASE("catalog reports game, ABI, and platform incompatibility", "[mod_catal
   {
     std::ofstream manifest(platform_root / "mod.toml", std::ios::binary);
     manifest << "manifest_version = 1\n[mod]\nid = \"other-platform\"\nname = \"Other\"\n"
-                "version = \"1.0.0\"\ncode = \"other_code\"\nplugin_abi = 1\n";
+                "version = \"1.0\"\ncode = \"other_code\"\nplugin_abi = 1\n";
   }
   {
     std::ofstream other_binary(platform_root / "code" / other_platform /
@@ -450,7 +449,9 @@ TEST_CASE("package ID and strict version grammar are enforced", "[mod_catalog]")
   CHECK_FALSE(rex::system::IsValidModPackageId(std::string(64, 'a')));
 
   TempDirectory temp("rex_mod_catalog_grammar");
-  const std::array<std::string_view, 4> invalid_versions = {"1.0", "1.0.0-alpha", "", "1.2.3.4"};
+  WriteManifest(temp.path() / "valid-version", "valid-version", "valid_version_code");
+  const std::array<std::string_view, 10> invalid_versions = {
+      "1", "1.0.0", "1..2", ".0", "1.", "1.0-alpha", "", "+1.0", "-1.0", "1.0.2.3"};
   for (size_t index = 0; index < invalid_versions.size(); ++index) {
     const std::string id = "bad-version-" + std::to_string(index);
     const auto package_root = temp.path() / id;
@@ -461,14 +462,21 @@ TEST_CASE("package ID and strict version grammar are enforced", "[mod_catalog]")
              << "\"\nplugin_abi = 1\n";
   }
   auto catalog = rex::system::DiscoverModCatalog(temp.path(), "1.0.0");
-  REQUIRE(catalog.packages.size() == invalid_versions.size());
+  REQUIRE(catalog.packages.size() == invalid_versions.size() + 1);
+  const auto* valid_package = catalog.Find("valid-version");
+  REQUIRE(valid_package != nullptr);
+  CHECK_FALSE(valid_package->HasBlockingError());
+  CHECK(valid_package->version == "1.2");
   for (const auto& package : catalog.packages) {
+    if (package.id == "valid-version") {
+      continue;
+    }
     CHECK(package.HasBlockingError());
     CHECK(package.status == rex::system::ModPackageStatus::kInvalidManifest);
     if (package.version.empty()) {
       CHECK(HasMessage(package, "must be nonempty"));
     } else {
-      CHECK(HasMessage(package, "major.minor.patch"));
+      CHECK(HasMessage(package, "major.minor"));
     }
   }
 }
@@ -488,7 +496,7 @@ TEST_CASE("manifest version and ABI fields require their declared types", "[mod_
     std::ofstream manifest(package_root / "mod.toml", std::ios::binary);
     manifest << prefix << "[mod]\nid = \"" << id << "\"\nname = \"Bad\"\n";
     if (id != "missing-version") {
-      manifest << "version = \"1.0.0\"\n";
+      manifest << "version = \"1.0\"\n";
     }
     manifest << "code = \"" << id << "_code\"\n";
     if (id == "bad-plugin-abi") {
@@ -513,7 +521,7 @@ TEST_CASE("disabled invalid packages stay visible but selected invalid packages 
   {
     std::ofstream manifest(package_root / "mod.toml", std::ios::binary);
     manifest << "manifest_version = 1\n[mod]\nid = \"invalid-package\"\nname = \"Invalid\"\n"
-                "version = \"1.0\"\ncode = \"invalid_code\"\nplugin_abi = 1\n";
+                "version = \"1.0.0\"\ncode = \"invalid_code\"\nplugin_abi = 1\n";
   }
   WriteManifest(temp.path() / "valid-package", "valid-package", "valid_code");
   auto catalog = rex::system::DiscoverModCatalog(temp.path(), "1.0.0");
@@ -536,7 +544,7 @@ TEST_CASE("catalog rejects linked package paths without traversing them", "[mod_
   {
     std::ofstream manifest(target_manifest, std::ios::binary);
     manifest << "manifest_version = 1\n[mod]\nid = \"linked-manifest\"\nname = \"Linked\"\n"
-                "version = \"1.0.0\"\ncode = \"linked_code\"\nplugin_abi = 1\n";
+                "version = \"1.0\"\ncode = \"linked_code\"\nplugin_abi = 1\n";
   }
 
   WriteManifest(mods_root / "linked-manifest", "linked-manifest", "linked_code");

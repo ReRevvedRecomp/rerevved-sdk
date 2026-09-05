@@ -58,6 +58,29 @@ bool ParseVersion(std::string_view text, ParsedVersion& result) {
   return false;
 }
 
+bool IsPackageVersion(std::string_view text) {
+  const size_t first_separator = text.find('.');
+  if (first_separator == std::string_view::npos ||
+      text.find('.', first_separator + 1) != std::string_view::npos) {
+    return false;
+  }
+
+  const std::array<std::string_view, 2> components = {text.substr(0, first_separator),
+                                                      text.substr(first_separator + 1)};
+  for (const std::string_view component : components) {
+    if (component.empty()) {
+      return false;
+    }
+    uint64_t value = 0;
+    auto [last, error] =
+        std::from_chars(component.data(), component.data() + component.size(), value);
+    if (error != std::errc() || last != component.data() + component.size()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int CompareVersions(const ParsedVersion& left, const ParsedVersion& right) {
   if (left.major != right.major) {
     return left.major < right.major ? -1 : 1;
@@ -313,9 +336,9 @@ ModPackage ParsePackage(const std::filesystem::path& mod_root, std::string_view 
   }
 
   ParsedVersion parsed_version;
-  if (!package.version.empty() && !ParseVersion(package.version, parsed_version)) {
+  if (!package.version.empty() && !IsPackageVersion(package.version)) {
     AddDiagnostic(package, ModDiagnosticSeverity::kError, true,
-                  "package version must use major.minor.patch numeric syntax");
+                  "package version must use major.minor numeric syntax");
     valid = false;
   }
   if (min_game_version && min_game_version_is_string && !package.min_game_version.empty() &&

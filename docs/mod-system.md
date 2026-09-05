@@ -39,7 +39,7 @@ manifest_version = 1
 [mod]
 id = "state-inspector"
 name = "State Inspector"
-version = "1.0.0"
+version = "1.0"
 author = "Aeshur"
 description = "Displays title state for development."
 min_game_version = "1.0.0"
@@ -48,12 +48,12 @@ plugin_abi = 1
 ```
 
 `manifest_version`, `[mod].id`, `name`, `version`, `code`, and `plugin_abi` are
-required. Package and minimum-game versions use exactly three non-negative
-numeric components (`major.minor.patch`). `min_game_version` is optional and
-requires the host game version to meet the stated minimum. `code` is one
-filename stem without a path or extension. Every valid package must provide a
-matching native binary for the current runtime platform and declare the
-current plugin ABI.
+required. Package versions use exactly two non-negative numeric components
+(`major.minor`). `min_game_version` is optional, uses exactly three non-negative
+numeric components (`major.minor.patch`), and requires the host game version to
+meet the stated minimum. `code` is one filename stem without a path or
+extension. Every valid package must provide a matching native binary for the
+current runtime platform and declare the current plugin ABI.
 
 `author` and `description` are optional display metadata. Unknown top-level or
 `[mod]` fields produce visible nonblocking warnings. A malformed manifest,
