@@ -28,27 +28,18 @@ constexpr ImVec4 kMutedText{0.60f, 0.62f, 0.66f, 1.00f};
 constexpr ImVec4 kCodeBadge{1.00f, 0.82f, 0.30f, 1.00f};
 constexpr float kIconSize = 40.0f;
 
-std::string JoinRequirements(const std::vector<rex::system::ModRequirement>& requirements) {
-  std::string result;
-  for (const auto& requirement : requirements) {
-    if (!result.empty()) {
-      result += ", ";
-    }
-    result += requirement.name;
-    if (!requirement.min_version.empty()) {
-      result += " >= " + requirement.min_version;
-    }
-  }
-  return result;
+const char* DiagnosticLabel(const rex::system::ModDiagnostic& diagnostic) {
+  return diagnostic.severity == rex::system::ModDiagnosticSeverity::kError ? "error: "
+                                                                           : "warning: ";
 }
 
-std::string JoinNames(const std::vector<std::string>& names) {
+std::string JoinPlatforms(const std::vector<std::string>& platforms) {
   std::string result;
-  for (const auto& name : names) {
+  for (const auto& platform : platforms) {
     if (!result.empty()) {
       result += ", ";
     }
-    result += name;
+    result += platform;
   }
   return result;
 }
@@ -61,7 +52,7 @@ ModManagerDialog::ModManagerDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* i
 
 ModManagerDialog::~ModManagerDialog() = default;
 
-ImmediateTexture* ModManagerDialog::GetIcon(const rex::system::ModInfo& mod) {
+ImmediateTexture* ModManagerDialog::GetIcon(const rex::system::ModPackage& mod) {
   if (mod.icon_path.empty()) {
     return nullptr;
   }
@@ -108,23 +99,50 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
 
   if (ImGui::Begin("Mods##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
-    const auto* mods = runtime_ ? &runtime_->enabled_mods_info() : nullptr;
-    size_t count = mods ? mods->size() : 0;
+    const auto* catalog = runtime_ ? &runtime_->mod_catalog() : nullptr;
+    const auto* selection_errors = runtime_ ? &runtime_->mod_selection_diagnostics() : nullptr;
+    size_t count = catalog ? catalog->packages.size() : 0;
 
     ImGui::PushStyleColor(ImGuiCol_Text, kHeaderText);
-    ImGui::Text("%zu mod%s enabled", count, count == 1 ? "" : "s");
+    ImGui::Text("%zu mod package%s installed", count, count == 1 ? "" : "s");
     ImGui::PopStyleColor();
-    ImGui::TextColored(kMutedText, "Load order: earlier entries have higher priority.");
+    ImGui::TextColored(kMutedText, "Catalog discovery is read-only; restart applies native code.");
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (!mods || mods->empty()) {
-      ImGui::TextDisabled("No mods enabled. Configure enabled_mods and restart.");
+    if (catalog) {
+      bool has_nonblocking_catalog_diagnostics = false;
+      for (const auto& diagnostic : catalog->diagnostics) {
+        if (!diagnostic.blocking) {
+          has_nonblocking_catalog_diagnostics = true;
+          break;
+        }
+      }
+      if (has_nonblocking_catalog_diagnostics) {
+        for (const auto& diagnostic : catalog->diagnostics) {
+          if (!diagnostic.blocking) {
+            ImGui::TextWrapped("%s%s", DiagnosticLabel(diagnostic), diagnostic.message.c_str());
+          }
+        }
+        ImGui::Separator();
+      }
+    }
+    if (selection_errors && !selection_errors->empty()) {
+      ImGui::TextColored(kCodeBadge, "Enabled mod selection has blocking errors:");
+      for (const auto& diagnostic : *selection_errors) {
+        ImGui::TextWrapped("- %s", diagnostic.message.c_str());
+      }
+      ImGui::Separator();
+    }
+
+    if (!catalog || catalog->packages.empty()) {
+      ImGui::TextDisabled("No installed mod packages.");
     } else {
       ImGui::BeginChild("##modlist", ImVec2(0.0f, 0.0f), false);
-      size_t priority = 1;
-      for (const auto& mod : *mods) {
-        ImGui::PushID(mod.folder_name.c_str());
+      for (const auto& mod : catalog->packages) {
+        const std::string package_id = mod.id.empty() ? mod.folder_name : mod.id;
+        const std::string package_key = mod.mod_root.generic_string();
+        ImGui::PushID(package_key.c_str());
         if (ImmediateTexture* icon = GetIcon(mod)) {
           ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon), ImVec2(kIconSize, kIconSize),
                              ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, 1));
@@ -134,8 +152,6 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         ImGui::SameLine();
 
         ImGui::BeginGroup();
-        ImGui::TextColored(kHeaderText, "#%zu", priority);
-        ImGui::SameLine();
         ImGui::Text("%s", mod.display_name.c_str());
         if (!mod.version.empty()) {
           ImGui::SameLine();
@@ -145,13 +161,28 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
           ImGui::SameLine();
           ImGui::TextColored(kCodeBadge, "[code]");
         }
-        ImGui::TextColored(kMutedText, "%s", mod.folder_name.c_str());
-        if (!mod.requires_mods.empty()) {
-          ImGui::TextColored(kMutedText, "requires: %s",
-                             JoinRequirements(mod.requires_mods).c_str());
+        ImGui::TextColored(kMutedText, "%s | %s", package_id.c_str(), mod.StatusText().c_str());
+        ImGui::TextColored(kMutedText, "folder: %s", mod.folder_name.c_str());
+        if (!mod.author.empty()) {
+          ImGui::TextColored(kMutedText, "author: %s", mod.author.c_str());
         }
-        if (!mod.conflicts_mods.empty()) {
-          ImGui::TextColored(kMutedText, "conflicts: %s", JoinNames(mod.conflicts_mods).c_str());
+        if (!mod.available_platforms.empty()) {
+          const auto platforms = JoinPlatforms(mod.available_platforms);
+          ImGui::TextColored(kMutedText, "platform payloads: %s", platforms.c_str());
+        }
+        if (mod.desired) {
+          ImGui::TextColored(kMutedText, "desired load order: #%zu",
+                             mod.desired_order.value_or(0) + 1);
+        }
+        if (mod.active) {
+          ImGui::TextColored(kHeaderText, "active load order: #%zu",
+                             mod.active_order.value_or(0) + 1);
+        }
+        if (!mod.plugin_path.empty()) {
+          ImGui::TextColored(kMutedText, "payload: %s", mod.plugin_path.string().c_str());
+        }
+        for (const auto& diagnostic : mod.diagnostics) {
+          ImGui::TextWrapped("%s%s", DiagnosticLabel(diagnostic), diagnostic.message.c_str());
         }
         if (!mod.description.empty()) {
           ImGui::TextWrapped("%s", mod.description.c_str());
@@ -159,7 +190,6 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         ImGui::EndGroup();
         ImGui::Separator();
         ImGui::PopID();
-        ++priority;
       }
       ImGui::EndChild();
     }

@@ -1,78 +1,76 @@
 # Mod system
 
-ReXGlue can load native code plugins from an ordered set of mod folders. The
-host application owns title-specific APIs and guest semantics; plugins use the
-generic lifecycle defined in `rex/system/mod_plugin.h`.
+ReXGlue discovers manually installed native mod packages under `mods/` beside
+the executable. Set `mods_data_root` to use another root. Discovery reads
+package metadata and payload paths without loading native code or changing the
+filesystem. F1 displays every direct-child package, including invalid records,
+and reports its compatibility and active state.
 
-## Folder layout
-
-The default mod root is `mods/` next to the executable. Set `mods_data_root`
-to use another location. `enabled_mods` is a comma-separated list of folder
-names in priority order:
-
-```toml
-enabled_mods = "game_api,state_inspector"
-```
-
-A distributable code mod uses this layout:
+## Package layout
 
 ```text
-mods/<name>/
+mods/<id>/
   mod.toml
-  icon.png
-  code/
-    windows-x64/<name>.dll
-    windows-arm64/<name>.dll
-    linux-x64/lib<name>.so
-    linux-arm64/lib<name>.so
-    macos-x64/lib<name>.dylib
-    macos-arm64/lib<name>.dylib
+  icon.png                         optional
+  code/<runtime-platform>/<binary>
 ```
 
-The loader checks the running platform's directory first and retains support
-for a flat `code/` directory for local development.
+The folder name is the manifest package ID. IDs contain one to 63 lowercase
+ASCII letters or digits separated by single hyphens. A folder and manifest ID
+must match exactly. Discovery scans one level only; linked package folders are
+not traversed, and linked manifest, platform, or binary paths are not accepted
+as package payloads.
 
-## Manifest
+Recognized runtime platforms are `windows-x64`, `windows-arm64`, `linux-x64`,
+`linux-arm64`, `macos-x64`, and `macos-arm64`. The binary name uses the native
+loader convention: Windows uses `<code><config-postfix>.dll`, Linux uses
+`lib<code><config-postfix>.so`, and macOS uses
+`lib<code><config-postfix>.dylib`. The catalog accepts the current build
+configuration and its unpostfixed release fallback, matching the loader's
+selection order. If that order resolves a flat `code/` fallback, the catalog
+blocks the package instead of loading a path outside the qualified platform
+directory.
 
-`mod.toml` supports these fields:
+## Version-1 manifest
 
-| Field | Meaning |
-|---|---|
-| `name` | Display name; defaults to the folder name. |
-| `version` | Dotted numeric mod version. |
-| `author` | Displayed author. |
-| `description` | Displayed description. |
-| `code` | Plugin binary stem without extension or build postfix. |
-| `requires` | Comma-separated dependencies, optionally with `>= version`. |
-| `load_after` | Comma-separated soft ordering hints. |
-| `conflicts` | Comma-separated incompatible mods. |
-| `game_version` | Minimum host version, with an optional `>=` prefix. |
-| `platform` | Comma-separated packaged platforms. |
+```toml
+manifest_version = 1
 
-Missing dependencies, ordering mistakes, and conflicts are diagnosed without
-preventing the title from starting. A verified mod or host version mismatch is
-fatal because the plugin explicitly rejected that API version.
-
-## Code plugin ABI
-
-Every plugin exports:
-
-```cpp
-extern "C" REX_MOD_PLUGIN_EXPORT uint32_t rex_mod_abi_version();
-extern "C" REX_MOD_PLUGIN_EXPORT rex::system::IModPlugin* rex_mod_create(
-    uint32_t abi_version, const rex::system::ModHostContext* context);
+[mod]
+id = "state-inspector"
+name = "State Inspector"
+version = "1.0.0"
+author = "Aeshur"
+description = "Displays title state for development."
+min_game_version = "1.0.0"
+code = "state_inspector"
+plugin_abi = 1
 ```
 
-The current ABI version is `rex::system::kModPluginAbiVersion`. The loader
-rejects missing exports, ABI mismatches, missing binaries, and incompatible
-runtime build configurations with a message naming the mod and path.
+`manifest_version`, `[mod].id`, `name`, `version`, `code`, and `plugin_abi` are
+required. Package and minimum-game versions use exactly three non-negative
+numeric components (`major.minor.patch`). `min_game_version` is optional and
+requires the host game version to meet the stated minimum. `code` is one
+filename stem without a path or extension. Every valid package must provide a
+matching native binary for the current runtime platform and declare the
+current plugin ABI.
 
-Plugins may implement three lifecycle methods:
+`author` and `description` are optional display metadata. Unknown top-level or
+`[mod]` fields produce visible nonblocking warnings. A malformed manifest,
+identity mismatch, version mismatch, missing current-platform binary, or plugin
+ABI mismatch remains visible as an invalid or incompatible package and blocks
+that package from the enabled set.
 
-- `OnCreateDialogs` registers overlays and keybinds after ImGui exists.
-- `OnModuleLaunched` runs after the guest module and kernel state are ready.
-- `OnShutdown` releases plugin-owned resources before host UI teardown.
+## Transitional enabled set
 
-F1 opens a read-only manager showing enabled mods in priority order. Enabling,
-disabling, reordering, asset overlays, and online catalogs are separate
-capabilities and are not part of this ABI layer.
+The development-only `enabled_mods` cvar is a comma-separated ordered list of
+exact package IDs. Empty entries are skipped, and effective order is preserved
+for native loading. Missing, repeated, malformed, or incompatible entries are
+blocking errors for the complete selection, so ReXApp loads no native plugins
+when selection validation fails. The game still starts and F1 shows the full
+diagnostic set so the configuration can be repaired. An empty cvar selects no
+packages. The active native set remains unchanged until restart.
+
+The catalog does not install, import, update, replace, delete, or reload
+packages. Native plugins retain the `rex_mod_create`, `rex_mod_abi_version`,
+`OnCreateDialogs`, `OnModuleLaunched`, and `OnShutdown` ABI and lifecycle.

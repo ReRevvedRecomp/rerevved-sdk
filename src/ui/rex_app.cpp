@@ -468,10 +468,12 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       continue;
     }
     context.mod_root = mod_root_strings_[i].c_str();
-    context.mod_name = mod.folder_name.c_str();
-    if (auto plugin =
-            rex::system::LoadModPlugin(mod.mod_root, mod.folder_name, mod.code, context)) {
+    context.mod_name = mod.id.c_str();
+    if (auto plugin = rex::system::LoadModPlugin(mod.mod_root, mod.id, mod.code, context)) {
       mod_plugins_.push_back(std::move(plugin));
+      runtime_->MarkModActive(mod.id, true, i);
+    } else {
+      runtime_->MarkModLoadFailed(mod.id, "native plugin load failed");
     }
   }
   if (imgui_drawer_) {

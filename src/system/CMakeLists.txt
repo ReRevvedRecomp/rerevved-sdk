@@ -45,6 +45,7 @@ set(REXSYSTEM_SOURCES
     module.cpp
     function_dispatcher.cpp
     gpu_plugin_loader.cpp
+    mod_catalog.cpp
     mod_config.cpp
     mod_plugin_loader.cpp
     thread.cpp

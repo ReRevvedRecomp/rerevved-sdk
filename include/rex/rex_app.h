@@ -25,6 +25,7 @@
 #include <rex/image_info.h>
 #include <rex/runtime.h>
 #include <rex/system/mod_plugin.h>
+#include <rex/system/mod_catalog.h>
 #include <rex/system/profile.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
@@ -338,7 +339,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::filesystem::path config_path_;
 
   // These values back the borrowed strings passed through ModHostContext.
-  std::vector<system::ModInfo> mod_infos_;
+  std::vector<system::ModPackage> mod_infos_;
   std::vector<std::string> mod_root_strings_;
   std::vector<std::unique_ptr<system::IModPlugin>> mod_plugins_;
 };

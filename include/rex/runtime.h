@@ -18,6 +18,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -29,6 +31,7 @@
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/interfaces/input.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/mod_catalog.h>
 #include <rex/system/mod_plugin.h>
 #include <rex/system/xobject.h>  // object_ref
 
@@ -150,8 +153,19 @@ class Runtime {
   const std::filesystem::path& metadata_root() const { return metadata_root_; }
   const std::string& game_version() const { return game_version_; }
 
-  // Enabled mods in priority order. The metadata is parsed once during Setup.
-  const std::vector<system::ModInfo>& enabled_mods_info() const { return enabled_mods_info_; }
+  // The read-only installed package catalog and the validated enabled set in
+  // the exact enabled_mods order. Native loading is performed by ReXApp.
+  const system::ModCatalog& mod_catalog() const { return mod_catalog_; }
+  const std::vector<system::ModPackage>& enabled_mods_info() const { return enabled_mods_info_; }
+  const std::vector<system::ModDiagnostic>& mod_selection_diagnostics() const {
+    return mod_selection_diagnostics_;
+  }
+  void MarkModActive(std::string_view id, bool active, std::optional<size_t> order = std::nullopt) {
+    mod_catalog_.SetActive(id, active, order);
+  }
+  void MarkModLoadFailed(std::string_view id, std::string message) {
+    mod_catalog_.MarkLoadFailed(id, std::move(message));
+  }
 
   // Finds a metadata file or directory. An explicit metadata_root disables
   // legacy discovery; otherwise existing project layouts remain supported.
@@ -202,7 +216,6 @@ class Runtime {
   // Set up VFS: mounts game_data_root as game:/d:, update_data_root as update:
   bool SetupVfs();
   void ResolveEnabledMods();
-  bool ValidateModDependencies() const;
 
   std::filesystem::path game_data_root_;
   std::filesystem::path base_user_data_root_;
@@ -211,7 +224,9 @@ class Runtime {
   std::filesystem::path cache_root_;
   std::filesystem::path metadata_root_;
   std::string game_version_;
-  std::vector<system::ModInfo> enabled_mods_info_;
+  system::ModCatalog mod_catalog_;
+  std::vector<system::ModPackage> enabled_mods_info_;
+  std::vector<system::ModDiagnostic> mod_selection_diagnostics_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;

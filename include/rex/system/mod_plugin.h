@@ -19,7 +19,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #if defined(_WIN32)
 #define REX_MOD_PLUGIN_EXPORT __declspec(dllexport)
@@ -69,29 +68,9 @@ class IModPlugin {
 using ModAbiVersionFn = uint32_t (*)();
 using ModCreateFn = IModPlugin* (*)(uint32_t abi_version, const ModHostContext* context);
 
-struct ModRequirement {
-  std::string name;
-  std::string min_version;
-};
-
-struct ModInfo {
-  std::filesystem::path mod_root;
-  std::string folder_name;
-  std::string display_name;
-  std::string version;
-  std::string author;
-  std::string description;
-  std::filesystem::path icon_path;
-  std::string code;
-  std::vector<ModRequirement> requires_mods;
-  std::vector<std::string> load_after_mods;
-  std::vector<std::string> conflicts_mods;
-  std::string min_game_version;
-  std::vector<std::string> platforms;
-};
-
 // Loads a native plugin from code/<platform>/, with a legacy flat code/
-// fallback. Failures are logged with the owning mod name.
+// fallback. Failures are logged with the owning mod name. The loader's ABI and
+// lifecycle are independent of catalog metadata.
 std::unique_ptr<IModPlugin> LoadModPlugin(const std::filesystem::path& mod_root,
                                           std::string_view mod_name, std::string_view code_stem,
                                           const ModHostContext& context);

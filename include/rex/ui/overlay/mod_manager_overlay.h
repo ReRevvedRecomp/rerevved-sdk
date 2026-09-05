@@ -15,7 +15,7 @@
 #include <string>
 #include <unordered_map>
 
-#include <rex/system/mod_plugin.h>
+#include <rex/system/mod_catalog.h>
 #include <rex/ui/imgui_dialog.h>
 
 namespace rex {
@@ -37,7 +37,7 @@ class ModManagerDialog : public ImGuiDialog {
   void OnDraw(ImGuiIO& io) override;
 
  private:
-  ImmediateTexture* GetIcon(const rex::system::ModInfo& mod);
+  ImmediateTexture* GetIcon(const rex::system::ModPackage& mod);
 
   ImmediateDrawer* immediate_drawer_ = nullptr;
   rex::Runtime* runtime_ = nullptr;

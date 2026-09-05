@@ -209,9 +209,6 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Tool mode analyzes title binaries without starting the host mod lifecycle.
   if (!tool_mode_) {
     ResolveEnabledMods();
-    if (!ValidateModDependencies()) {
-      return fail(X_STATUS_UNSUCCESSFUL, "mod version validation failed");
-    }
   }
 
   // Set up VFS: game_data_root as game:/d:, update_data_root as update:
@@ -330,7 +327,9 @@ void Runtime::Shutdown() {
   export_resolver_.reset();
   file_system_.reset();
   memory_.reset();
+  mod_catalog_ = {};
   enabled_mods_info_.clear();
+  mod_selection_diagnostics_.clear();
   game_version_.clear();
 
   rex::perf::Profiler::Shutdown();
@@ -342,16 +341,29 @@ uint8_t* Runtime::virtual_membase() const {
 }
 
 void Runtime::ResolveEnabledMods() {
-  std::string enabled = REXCVAR_GET(enabled_mods);
   std::string configured_root = REXCVAR_GET(mods_data_root);
   auto mods_root = configured_root.empty()
                        ? rex::filesystem::GetExecutableFolder() / "mods"
                        : std::filesystem::absolute(std::filesystem::path(configured_root));
-  enabled_mods_info_ = system::ResolveModConfiguration(mods_root, enabled);
-}
+  mod_catalog_ = system::DiscoverModCatalog(mods_root, game_version_);
 
-bool Runtime::ValidateModDependencies() const {
-  return system::ValidateModConfiguration(enabled_mods_info_, game_version_);
+  const std::string enabled = REXCVAR_GET(enabled_mods);
+  const auto selection = system::SelectEnabledMods(mod_catalog_, enabled);
+  for (size_t order = 0; order < selection.requested_ids.size(); ++order) {
+    mod_catalog_.SetDesired(selection.requested_ids[order], true, order);
+  }
+  mod_selection_diagnostics_ = selection.diagnostics;
+  if (selection.IsValid()) {
+    enabled_mods_info_ = selection.packages;
+    return;
+  }
+
+  // A catalog or selection error is shown to F1 and blocks the complete
+  // desired set. The game continues with no native plugins to load.
+  enabled_mods_info_.clear();
+  for (const auto& diagnostic : mod_selection_diagnostics_) {
+    REXSYS_ERROR("Mod selection: {}", diagnostic.message);
+  }
 }
 
 bool Runtime::SetupVfs() {
