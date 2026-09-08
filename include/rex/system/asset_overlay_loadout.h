@@ -17,7 +17,7 @@
 namespace rex::system {
 
 inline constexpr std::string_view kAssetOverlayOrderFileName = "asset_order.txt";
-inline constexpr std::string_view kAssetOverlayDefaultOrderFileName = "default_order.txt";
+inline constexpr std::string_view kAssetOverlayDefaultOrderFileName = "default_asset_order.txt";
 
 struct AssetOverlayLoadoutEntry {
   std::string id;
@@ -70,7 +70,7 @@ struct AssetOverlayLoadoutApplyResult {
 
 AssetOverlayLoadoutFile ReadAssetOverlayLoadout(const std::filesystem::path& profile_root);
 // Reads the profile-local order when present. If it is absent, reads
-// <bundled_root>/default_order.txt. A present profile file, including an
+// <bundled_root>/default_asset_order.txt. A present profile file, including an
 // explicitly empty file, always takes precedence over the bundled default.
 AssetOverlayLoadoutFile ReadAssetOverlayLoadout(const std::filesystem::path& profile_root,
                                                 const std::filesystem::path& bundled_root);

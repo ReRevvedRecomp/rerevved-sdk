@@ -104,7 +104,7 @@ ABI.
 
 The active profile owns `asset_order.txt`, independently of the gameplay
 `mod_order.txt`. The runtime package may also ship
-`asset-overrides/default_order.txt` beside the asset-pack directories. When the
+`asset-overrides/default_asset_order.txt` beside the asset-pack directories. When the
 profile has no `asset_order.txt`, this bundled file supplies the initial order;
 a profile file always wins, including an explicitly empty file. The bundled
 file is parsed and validated with the same rules as the profile file, and a
