@@ -24,6 +24,7 @@ add_executable(unit_tests
     kernel/xam/lan_system_link_test.cpp
     kernel/xam/xgi_request_test.cpp
     graphics/diagnostic_util_test.cpp
+    graphics/diagnostic_draw_capture_test.cpp
     graphics/xenos_fence_trace_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp

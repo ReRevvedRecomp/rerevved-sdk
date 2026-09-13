@@ -1814,6 +1814,37 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   PixelShaderInterlockFullEdramBarrierPlaced();
 }
 
+bool D3D12RenderTargetCache::ScheduleEdramCapture(ID3D12Resource* destination, uint32_t size,
+                                                  bool mark_rov_write_tracking_after_copy) {
+  if (GetPath() != Path::kPixelShaderInterlock || !edram_buffer_ || !destination || !size ||
+      edram_buffer_state_ != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    return false;
+  }
+
+  const uint64_t scale = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+  if (scale > UINT64_MAX / xenos::kEdramSizeBytes) {
+    return false;
+  }
+  const uint64_t capacity = uint64_t(xenos::kEdramSizeBytes) * scale;
+  if (!scale || size > capacity) {
+    return false;
+  }
+
+  // ROV writes need the same tracked interlock commit before a copy source
+  // transition as they do before another overlapping ROV use.
+  CommitEdramBufferUAVWrites(EdramBufferModificationStatus::kAsROV);
+  const D3D12_RESOURCE_STATES previous_state = edram_buffer_state_;
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(destination, 0, edram_buffer_, 0,
+                                                                  size);
+  TransitionEdramBuffer(previous_state);
+  if (mark_rov_write_tracking_after_copy) {
+    MarkEdramBufferModified(EdramBufferModificationStatus::kAsROV);
+  }
+  return true;
+}
+
 ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines(
     TransferShaderKey key) {
   const TransferModeInfo& mode = kTransferModes[size_t(key.mode)];

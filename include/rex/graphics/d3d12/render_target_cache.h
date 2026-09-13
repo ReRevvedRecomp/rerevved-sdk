@@ -56,6 +56,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   Path GetPath() const override { return path_; }
 
+  // Schedules a copy of the tracked ROV EDRAM buffer into a caller-owned
+  // readback resource and restores the prior resource state. The caller must
+  // keep destination alive until the containing submission is complete.
+  bool ScheduleEdramCapture(ID3D12Resource* destination, uint32_t size,
+                            bool mark_rov_write_tracking_after_copy);
+
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
 

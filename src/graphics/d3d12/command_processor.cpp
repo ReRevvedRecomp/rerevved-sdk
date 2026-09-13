@@ -13,7 +13,10 @@
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include <rex/assert.h>
@@ -57,6 +60,9 @@ REXCVAR_DEFINE_STRING(d3d12_capture_swap_texture, "", "GPU/D3D12",
                       "One-shot path for a raw pre-gamma swap texture capture")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(d3d12_capture_draw, "", "GPU/D3D12",
+                      "Output directory for a one-shot Xenos draw snapshot")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -76,6 +82,93 @@ bool CreateDiagnosticCaptureParent(const std::filesystem::path& path, const char
   return true;
 }
 
+void AppendJsonString(std::string& json, std::string_view value) {
+  json.push_back('"');
+  for (char character : value) {
+    switch (character) {
+      case '"':
+        json += "\\\"";
+        break;
+      case '\\':
+        json += "\\\\";
+        break;
+      case '\n':
+        json += "\\n";
+        break;
+      case '\r':
+        json += "\\r";
+        break;
+      case '\t':
+        json += "\\t";
+        break;
+      default:
+        json.push_back(character);
+        break;
+    }
+  }
+  json.push_back('"');
+}
+bool WriteCaptureDwords(const std::filesystem::path& path, const std::vector<uint32_t>& dwords) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return false;
+  }
+  bool success = true;
+  for (uint32_t dword : dwords) {
+    const uint8_t bytes[sizeof(uint32_t)] = {uint8_t(dword), uint8_t(dword >> 8),
+                                             uint8_t(dword >> 16), uint8_t(dword >> 24)};
+    file.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+    if (!file) {
+      success = false;
+      break;
+    }
+  }
+  file.flush();
+  success = success && bool(file);
+  file.close();
+  return success && !file.fail();
+}
+bool WriteCaptureManifest(const std::filesystem::path& path, const std::string& contents) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return false;
+  }
+  file.write(contents.data(), std::streamsize(contents.size()));
+  const bool write_succeeded = bool(file);
+  file.flush();
+  const bool flush_succeeded = bool(file);
+  file.close();
+  return write_succeeded && flush_succeeded && !file.fail();
+}
+bool WriteCaptureMappedBuffer(const std::filesystem::path& path, ID3D12Resource* buffer,
+                              uint32_t size) {
+  if (!buffer || !size) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, size};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  bool success = false;
+  if (file) {
+    file.write(reinterpret_cast<const char*>(mapping), size);
+    file.flush();
+    success = bool(file);
+    file.close();
+    success = success && !file.fail();
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  buffer->Unmap(0, &write_range);
+  return success;
+}
+std::filesystem::path CaptureTemporaryPath(const std::filesystem::path& root,
+                                           std::string_view name) {
+  std::filesystem::path path = root / std::filesystem::path(name);
+  path += ".tmp";
+  return path;
+}
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -149,6 +242,119 @@ ID3D12Resource* D3D12CommandProcessor::RequestDiagnosticBufferCapture(
   return diagnostic_buffer_captures_.back().buffer.Get();
 }
 
+void D3D12CommandProcessor::PollDrawCaptureArmMarker() {
+  if (draw_capture_armed_ || draw_capture_disarmed_) {
+    return;
+  }
+  const std::string path_utf8 = REXCVAR_GET(d3d12_capture_draw);
+  if (path_utf8.empty()) {
+    return;
+  }
+  const std::filesystem::path path = rex::to_path(path_utf8);
+  const std::filesystem::path marker = path / diagnostic::kDrawCaptureArmMarker;
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(marker, error) || error) {
+    return;
+  }
+  draw_capture_path_ = path;
+  draw_capture_armed_ = true;
+  draw_capture_skip_reports_remaining_ = 4;
+  REXGPU_INFO("D3D12 draw capture armed from marker {}", rex::path_to_utf8(marker));
+}
+void D3D12CommandProcessor::RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason) {
+  const size_t index = size_t(reason);
+  if (index >= draw_capture_skip_counts_.size()) {
+    return;
+  }
+  uint32_t& count = draw_capture_skip_counts_[index];
+  if (count != std::numeric_limits<uint32_t>::max()) {
+    ++count;
+  }
+}
+void D3D12CommandProcessor::ReportDrawCaptureSkipCounts() {
+  if (!draw_capture_armed_ || !draw_capture_skip_reports_remaining_) {
+    return;
+  }
+  std::ostringstream counts;
+  bool first = true;
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    const uint32_t count = draw_capture_skip_counts_[i];
+    if (!count) {
+      continue;
+    }
+    if (!first) {
+      counts << ',';
+    }
+    first = false;
+    counts << diagnostic::GetDrawCaptureSkipReasonName(
+                  static_cast<diagnostic::DrawCaptureSkipReason>(i))
+           << '=' << count;
+  }
+  REXGPU_INFO("D3D12 draw capture armed; skip_counts={}", first ? "none" : counts.str());
+  --draw_capture_skip_reports_remaining_;
+}
+void D3D12CommandProcessor::RetainDrawCaptureBuffersForRetry() {
+  if (!draw_capture_pending_) {
+    return;
+  }
+  auto retain = [this](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (buffer) {
+      submission_retry_resources_.push_back(std::move(buffer));
+    }
+  };
+  retain(draw_capture_pending_->edram_before.buffer);
+  retain(draw_capture_pending_->edram_after.buffer);
+  retain(draw_capture_pending_->index_readback.buffer);
+  for (DrawCaptureReadback& readback : draw_capture_pending_->vertex_fetch_readbacks) {
+    retain(readback.buffer);
+  }
+}
+void D3D12CommandProcessor::AbandonDrawCaptureBuffersForTeardown() {
+  if (draw_capture_pending_) {
+    auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
+    abandon(draw_capture_pending_->edram_before.buffer);
+    abandon(draw_capture_pending_->edram_after.buffer);
+    abandon(draw_capture_pending_->index_readback.buffer);
+    for (DrawCaptureReadback& readback : draw_capture_pending_->vertex_fetch_readbacks) {
+      abandon(readback.buffer);
+    }
+    draw_capture_pending_.reset();
+    draw_capture_failure_reason_.clear();
+  }
+  for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {
+    resource.Detach();
+  }
+  submission_retry_resources_.clear();
+}
+void D3D12CommandProcessor::WriteDrawCaptureFailureManifest(const char* reason) {
+  if (!draw_capture_pending_ && draw_capture_path_.empty()) {
+    return;
+  }
+  const std::filesystem::path path =
+      draw_capture_pending_ ? draw_capture_pending_->path : draw_capture_path_;
+  if (!CreateDiagnosticCaptureParent(path / "manifest.json", "draw")) {
+    return;
+  }
+  std::string manifest;
+  manifest += "{\n  \"schema_version\":1,\n  \"status\":\"failed\",\n";
+  manifest += "  \"valid\":false,\n  \"reason\":";
+  AppendJsonString(manifest, reason ? reason : "unknown");
+  manifest += ",\n  \"files\":[],\n  \"skip_counts\":{";
+  bool first = true;
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    if (!first) {
+      manifest += ',';
+    }
+    first = false;
+    AppendJsonString(manifest, diagnostic::GetDrawCaptureSkipReasonName(
+                                   static_cast<diagnostic::DrawCaptureSkipReason>(i)));
+    manifest += ':' + std::to_string(draw_capture_skip_counts_[i]);
+  }
+  manifest += "}\n}\n";
+  if (!WriteCaptureManifest(path / "manifest.json", manifest)) {
+    REXGPU_ERROR("Failed to write the draw capture failure manifest: {}", reason);
+  }
+}
 void D3D12CommandProcessor::UpdateDebugMarkersEnabled() {
   debug_markers_enabled_ = IsGpuDebugMarkersEnabled();
 }
@@ -1714,6 +1920,9 @@ void D3D12CommandProcessor::ShutdownContext() {
   const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
   if (!diagnostic::CanReleaseSubmittedGpuResources(queue_is_idle, device_is_removed)) {
     REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
+    // Keep capture readbacks alive when the queue may still reference them. The detached
+    // COM references remain valid until process/device teardown rather than being released here.
+    AbandonDrawCaptureBuffersForTeardown();
     CommandProcessor::ShutdownContext();
     return;
   }
@@ -1990,6 +2199,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   if (!graphics_system_)
     return;
+  PollDrawCaptureArmMarker();
+  ReportDrawCaptureSkipCounts();
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
@@ -2435,6 +2646,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   if (!EndSubmission(true)) {
+    RetainDrawCaptureBuffersForRetry();
+    if (draw_capture_pending_) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
+      WriteDrawCaptureFailureManifest(draw_capture_failure_reason_.empty()
+                                          ? "submission_failure"
+                                          : draw_capture_failure_reason_.c_str());
+      draw_capture_pending_.reset();
+      draw_capture_failure_reason_.clear();
+    }
     if (swap_texture_capture_buffer) {
       submission_retry_resources_.push_back(std::move(swap_texture_capture_buffer));
     }
@@ -2444,6 +2664,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  FinalizeDrawCapture();
   if (swap_texture_capture_buffer) {
     if (!CheckSubmissionFence(swap_texture_capture_submission)) {
       REXGPU_ERROR("Failed to await the pre-gamma swap texture capture submission");
@@ -2541,6 +2762,444 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+bool D3D12CommandProcessor::ScheduleDrawCapture(
+    const PrimitiveProcessor::ProcessingResult& result, xenos::PrimitiveType primitive_type,
+    uint32_t index_count, const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+    D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
+    uint32_t used_texture_mask, uint32_t normalized_color_mask) {
+  if (!draw_capture_armed_ || draw_capture_disarmed_ || draw_capture_pending_ || !vertex_shader ||
+      !pixel_shader || !shared_memory_->GetBuffer()) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
+  DrawCapture capture;
+  capture.path = draw_capture_path_;
+  capture.frame = frame_current_;
+  capture.submission = submission_current_;
+  capture.primitive_type = uint32_t(primitive_type);
+  capture.requested_index_count = index_count;
+  capture.major_mode_explicit = major_mode_explicit;
+  capture.guest_primitive_type = uint32_t(result.guest_primitive_type);
+  capture.host_primitive_type = uint32_t(result.host_primitive_type);
+  capture.host_vertex_shader_type = uint32_t(result.host_vertex_shader_type);
+  capture.tessellation_mode = uint32_t(result.tessellation_mode);
+  capture.guest_draw_vertex_count = result.guest_draw_vertex_count;
+  capture.host_draw_vertex_count = result.host_draw_vertex_count;
+  capture.guest_index_base = result.guest_index_base;
+  capture.host_index_format = uint32_t(result.host_index_format);
+  capture.host_shader_index_endian = uint32_t(result.host_shader_index_endian);
+  capture.host_primitive_reset_enabled = result.host_primitive_reset_enabled;
+  capture.used_texture_mask = used_texture_mask;
+  capture.normalized_color_mask = normalized_color_mask;
+  capture.color_target_written = normalized_color_mask != 0;
+  capture.native_topology = native_topology;
+  capture.native_instance_count = 1;
+  capture.native_start_vertex = 0;
+  capture.native_start_index = 0;
+  capture.native_base_vertex = 0;
+  capture.native_start_instance = 0;
+  capture.vertex_shader_hash = vertex_shader->ucode_data_hash();
+  capture.pixel_shader_hash = pixel_shader->ucode_data_hash();
+  const uint64_t max_shader_dwords = diagnostic::kDrawCaptureMaxShaderBytes / sizeof(uint32_t);
+  if (vertex_shader->ucode_dword_count() > max_shader_dwords ||
+      pixel_shader->ucode_dword_count() > max_shader_dwords) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+    return false;
+  }
+  capture.registers.assign(register_file_->values,
+                           register_file_->values + RegisterFile::kRegisterCount);
+  capture.vertex_ucode.assign(vertex_shader->ucode_data().begin(),
+                              vertex_shader->ucode_data().end());
+  capture.pixel_ucode.assign(pixel_shader->ucode_data().begin(), pixel_shader->ucode_data().end());
+  uint64_t geometry_size = 0;
+  const RegisterFile& regs = *register_file_;
+  const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+    uint32_t fetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t bit;
+    while (rex::bit_scan_forward(fetch_bits_remaining, &bit)) {
+      fetch_bits_remaining &= ~(uint32_t(1) << bit);
+      const uint32_t fetch_constant_index = i * 32 + bit;
+      const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_constant_index);
+      if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
+        RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+        return false;
+      }
+      diagnostic::DrawCaptureRange range;
+      if (!diagnostic::AppendDrawCaptureRange(
+              uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+              SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes,
+              capture.vertex_fetch_ranges, geometry_size)) {
+        RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+        return false;
+      }
+      capture.vertex_fetch_constants.push_back(fetch_constant_index);
+    }
+  }
+  if (result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+    if (!index_buffer_info || !result.guest_draw_vertex_count ||
+        (result.host_index_format != xenos::IndexFormat::kInt16 &&
+         result.host_index_format != xenos::IndexFormat::kInt32)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    const uint64_t index_element_size = result.host_index_format == xenos::IndexFormat::kInt16
+                                            ? sizeof(uint16_t)
+                                            : sizeof(uint32_t);
+    const uint64_t index_size = uint64_t(result.guest_draw_vertex_count) * index_element_size;
+    if (index_buffer_info->guest_base != result.guest_index_base ||
+        index_buffer_info->format != result.host_index_format ||
+        index_buffer_info->length < index_size ||
+        index_buffer_info->count < result.guest_draw_vertex_count) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    diagnostic::DrawCaptureRange index_range;
+    if (!diagnostic::ValidateDrawCaptureRange(
+            result.guest_index_base, index_size, SharedMemory::kBufferSize,
+            diagnostic::kDrawCaptureMaxGeometryBytes - geometry_size, index_range)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+      return false;
+    }
+    geometry_size += index_range.size;
+    capture.indexed = true;
+    capture.guest_index_size = index_range.size;
+    capture.guest_index_dma_count = index_buffer_info->count;
+    capture.guest_index_dma_format = uint32_t(index_buffer_info->format);
+    capture.guest_index_dma_endianness = uint32_t(index_buffer_info->endianness);
+    if (index_buffer_info->length > std::numeric_limits<uint32_t>::max()) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    capture.guest_index_dma_length = uint32_t(index_buffer_info->length);
+    capture.index_readback.name = "index.bin";
+    capture.index_readback.size = index_range.size;
+  } else if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kIndexSource);
+    return false;
+  } else {
+    capture.native_vertex_count = result.host_draw_vertex_count;
+  }
+  if (capture.indexed) {
+    capture.native_index_count = result.host_draw_vertex_count;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto create_readback = [device](DrawCaptureReadback& readback) {
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, readback.size, D3D12_RESOURCE_FLAG_NONE);
+    return SUCCEEDED(device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.buffer)));
+  };
+  capture.edram_before.name = "edram_before.bin";
+  capture.edram_before.size = xenos::kEdramSizeBytes;
+  capture.edram_after.name = "edram_after.bin";
+  capture.edram_after.size = xenos::kEdramSizeBytes;
+  if (!create_readback(capture.edram_before) || !create_readback(capture.edram_after)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+    return false;
+  }
+  capture.vertex_fetch_readbacks.reserve(capture.vertex_fetch_ranges.size());
+  for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+    DrawCaptureReadback readback;
+    readback.name = "vertex_fetch_" + std::to_string(capture.vertex_fetch_constants[i]) + ".bin";
+    readback.size = capture.vertex_fetch_ranges[i].size;
+    if (!create_readback(readback)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+      return false;
+    }
+    capture.vertex_fetch_readbacks.push_back(std::move(readback));
+  }
+  if (capture.indexed && !create_readback(capture.index_readback)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+    return false;
+  }
+  if (!render_target_cache_->ScheduleEdramCapture(capture.edram_before.buffer.Get(),
+                                                  capture.edram_before.size, true)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
+  if (!capture.vertex_fetch_ranges.empty() || capture.indexed) {
+    shared_memory_->UseAsCopySource();
+    SubmitBarriers();
+    for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+      const diagnostic::DrawCaptureRange& range = capture.vertex_fetch_ranges[i];
+      deferred_command_list_.D3DCopyBufferRegion(capture.vertex_fetch_readbacks[i].buffer.Get(), 0,
+                                                 shared_memory_->GetBuffer(), range.base,
+                                                 range.size);
+    }
+    if (capture.indexed) {
+      deferred_command_list_.D3DCopyBufferRegion(
+          capture.index_readback.buffer.Get(), 0, shared_memory_->GetBuffer(),
+          capture.guest_index_base, capture.guest_index_size);
+    }
+    shared_memory_->UseForReading();
+    SubmitBarriers();
+  }
+  draw_capture_pending_ = std::move(capture);
+  return true;
+}
+void D3D12CommandProcessor::FinalizeDrawCapture() {
+  if (!draw_capture_pending_) {
+    return;
+  }
+  DrawCapture& capture = *draw_capture_pending_;
+  const std::filesystem::path capture_path = capture.path;
+  auto fail = [this](const char* reason, bool retain_buffers) {
+    if (retain_buffers) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
+      RetainDrawCaptureBuffersForRetry();
+    }
+    WriteDrawCaptureFailureManifest(reason);
+    draw_capture_pending_.reset();
+    draw_capture_failure_reason_.clear();
+  };
+  if (!capture.submission || !CheckSubmissionFence(capture.submission)) {
+    fail("submission_failure", true);
+    return;
+  }
+  if (!draw_capture_failure_reason_.empty()) {
+    fail(draw_capture_failure_reason_.c_str(), false);
+    return;
+  }
+  if (!CreateDiagnosticCaptureParent(capture_path / "manifest.json", "draw")) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+    fail("output_directory", false);
+    return;
+  }
+  std::vector<std::string> file_names;
+  file_names.reserve(5 + capture.vertex_fetch_readbacks.size() + size_t(capture.indexed));
+  file_names.emplace_back("registers.bin");
+  file_names.emplace_back("vertex.ucode.bin");
+  file_names.emplace_back("pixel.ucode.bin");
+  for (const DrawCaptureReadback& readback : capture.vertex_fetch_readbacks) {
+    file_names.push_back(readback.name);
+  }
+  if (capture.indexed) {
+    file_names.push_back(capture.index_readback.name);
+  }
+  file_names.emplace_back(capture.edram_before.name);
+  file_names.emplace_back(capture.edram_after.name);
+  std::error_code error;
+  for (const std::string& name : file_names) {
+    const bool exists = std::filesystem::exists(capture_path / name, error);
+    if (error || exists) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+      fail(exists ? "output_exists" : "output_stat", false);
+      return;
+    }
+  }
+  std::vector<std::filesystem::path> temporary_paths;
+  std::vector<std::filesystem::path> published_paths;
+  std::vector<std::pair<std::string, uint64_t>> files;
+  auto cleanup = [&] {
+    for (const std::filesystem::path& path : temporary_paths) {
+      std::error_code cleanup_error;
+      std::filesystem::remove(path, cleanup_error);
+    }
+    for (const std::filesystem::path& path : published_paths) {
+      std::error_code cleanup_error;
+      std::filesystem::remove(path, cleanup_error);
+    }
+  };
+  auto fail_with_cleanup = [&](const char* reason) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+    cleanup();
+    fail(reason, false);
+  };
+  auto write_dwords = [&](const std::string& name, const std::vector<uint32_t>& dwords) {
+    if (dwords.empty()) {
+      return false;
+    }
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, name);
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_path, remove_error);
+    if (!WriteCaptureDwords(temporary_path, dwords)) {
+      return false;
+    }
+    temporary_paths.push_back(temporary_path);
+    files.emplace_back(name, uint64_t(dwords.size()) * sizeof(uint32_t));
+    return true;
+  };
+  auto write_readback = [&](const DrawCaptureReadback& readback) {
+    if (readback.name.empty() || !readback.buffer || !readback.size) {
+      return false;
+    }
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, readback.name);
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_path, remove_error);
+    if (!WriteCaptureMappedBuffer(temporary_path, readback.buffer.Get(), readback.size)) {
+      return false;
+    }
+    temporary_paths.push_back(temporary_path);
+    files.emplace_back(readback.name, readback.size);
+    return true;
+  };
+  if (!write_dwords("registers.bin", capture.registers) ||
+      !write_dwords("vertex.ucode.bin", capture.vertex_ucode) ||
+      !write_dwords("pixel.ucode.bin", capture.pixel_ucode)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  for (const DrawCaptureReadback& readback : capture.vertex_fetch_readbacks) {
+    if (!write_readback(readback)) {
+      fail_with_cleanup("file_write");
+      return;
+    }
+  }
+  if (capture.indexed && !write_readback(capture.index_readback)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  if (!write_readback(capture.edram_before) || !write_readback(capture.edram_after)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  auto shader_hash = [](uint64_t hash) {
+    std::ostringstream value;
+    value << "0x" << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return value.str();
+  };
+  std::ostringstream manifest;
+  manifest << "{\n"
+           << "  \"schema_version\":1,\n"
+           << "  \"status\":\"complete\",\n"
+           << "  \"valid\":true,\n"
+           << "  \"completion\":\"queue_fence_and_all_files\",\n"
+           << "  \"encoding\":\"uint32-little-endian\",\n"
+           << "  \"bounds\":{\"max_range_count\":" << diagnostic::kDrawCaptureMaxRangeCount
+           << ",\"max_geometry_bytes\":" << diagnostic::kDrawCaptureMaxGeometryBytes
+           << ",\"max_shader_bytes\":" << diagnostic::kDrawCaptureMaxShaderBytes << "},\n"
+           << "  \"provenance\":{\"backend\":\"d3d12\",\"producer\":"
+           << "\"D3D12CommandProcessor::IssueDraw\",\"intended_consumer\":\"native_replay\","
+           << "\"frame\":" << capture.frame << ",\"submission\":" << capture.submission << "},\n"
+           << "  \"draw\":{\n"
+           << "    \"guest\":{\"primitive_type\":" << capture.primitive_type
+           << ",\"index_count\":" << capture.requested_index_count
+           << ",\"major_mode_explicit\":" << (capture.major_mode_explicit ? "true" : "false")
+           << ",\"guest_draw_vertex_count\":" << capture.guest_draw_vertex_count << ",\"source\":\""
+           << (capture.indexed ? "guest_dma" : "auto_index") << "\"";
+  if (capture.indexed) {
+    manifest << ",\"dma\":{\"base\":" << capture.guest_index_base
+             << ",\"length_bytes\":" << capture.guest_index_dma_length
+             << ",\"count\":" << capture.guest_index_dma_count
+             << ",\"format\":" << capture.guest_index_dma_format
+             << ",\"endianness\":" << capture.guest_index_dma_endianness << "}";
+  }
+  manifest << "},\n"
+           << "    \"processed\":{\"guest_primitive_type\":" << capture.guest_primitive_type
+           << ",\"host_primitive_type\":" << capture.host_primitive_type
+           << ",\"host_vertex_shader_type\":" << capture.host_vertex_shader_type
+           << ",\"tessellation_mode\":" << capture.tessellation_mode
+           << ",\"host_draw_vertex_count\":" << capture.host_draw_vertex_count
+           << ",\"index_buffer_type\":"
+           << (capture.indexed ? uint32_t(PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA)
+                               : uint32_t(PrimitiveProcessor::ProcessedIndexBufferType::kNone))
+           << ",\"host_index_format\":" << capture.host_index_format
+           << ",\"host_shader_index_endian\":" << capture.host_shader_index_endian
+           << ",\"primitive_reset\":" << (capture.host_primitive_reset_enabled ? "true" : "false")
+           << "},\n"
+           << "    \"native\":{\"indexed\":" << (capture.indexed ? "true" : "false")
+           << ",\"topology\":" << uint32_t(capture.native_topology)
+           << ",\"vertex_count\":" << capture.native_vertex_count
+           << ",\"index_count\":" << capture.native_index_count
+           << ",\"instance_count\":" << capture.native_instance_count
+           << ",\"start_vertex\":" << capture.native_start_vertex
+           << ",\"start_index\":" << capture.native_start_index
+           << ",\"base_vertex\":" << capture.native_base_vertex
+           << ",\"start_instance\":" << capture.native_start_instance << "},\n"
+           << "    \"used_texture_mask\":" << capture.used_texture_mask
+           << ",\"normalized_color_mask\":" << capture.normalized_color_mask
+           << ",\"resolution_scale\":[1,1],\n"
+           << "    \"resources\":{\n      \"vertex_fetch_ranges\":[";
+  for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << "{\"fetch_constant\":" << capture.vertex_fetch_constants[i]
+             << ",\"base\":" << capture.vertex_fetch_ranges[i].base
+             << ",\"size_bytes\":" << capture.vertex_fetch_ranges[i].size
+             << ",\"file\":\"vertex_fetch_" << capture.vertex_fetch_constants[i] << ".bin\"}";
+  }
+  manifest << "],\n      \"index\":";
+  if (capture.indexed) {
+    manifest << "{\"file\":\"index.bin\",\"base\":" << capture.guest_index_base
+             << ",\"size_bytes\":" << capture.guest_index_size << "}";
+  } else {
+    manifest << "null";
+  }
+  manifest << "\n    }\n  },\n"
+           << "  \"shaders\":{\n"
+           << "    \"vertex\":{\"stage\":\"vertex\",\"hash\":\""
+           << shader_hash(capture.vertex_shader_hash)
+           << "\",\"dword_count\":" << capture.vertex_ucode.size()
+           << ",\"file\":\"vertex.ucode.bin\"},\n"
+           << "    \"pixel\":{\"stage\":\"pixel\",\"hash\":\""
+           << shader_hash(capture.pixel_shader_hash)
+           << "\",\"dword_count\":" << capture.pixel_ucode.size()
+           << ",\"file\":\"pixel.ucode.bin\"}\n"
+           << "  },\n"
+           << "  \"registers\":{\"dword_count\":" << capture.registers.size()
+           << ",\"file\":\"registers.bin\"},\n"
+           << "  \"edram\":{\"path\":\"rov\",\"scale_x\":1,\"scale_y\":1,"
+           << "\"snapshot_size_bytes\":" << capture.edram_before.size
+           << ",\"before_file\":\"edram_before.bin\",\"after_file\":\"edram_after.bin\","
+           << "\"copy_state\":\"copy_source\",\"restored_state\":\"unordered_access\"},\n"
+           << "  \"skip_counts\":{";
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << '"'
+             << diagnostic::GetDrawCaptureSkipReasonName(
+                    static_cast<diagnostic::DrawCaptureSkipReason>(i))
+             << "\":" << draw_capture_skip_counts_[i];
+  }
+  manifest << "},\n  \"files\":[";
+  for (size_t i = 0; i < files.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << "{\"name\":\"" << files[i].first << "\",\"size_bytes\":" << files[i].second << "}";
+  }
+  manifest << "]\n}\n";
+  const std::filesystem::path manifest_temporary_path =
+      CaptureTemporaryPath(capture_path, "manifest.json");
+  std::error_code remove_error;
+  std::filesystem::remove(manifest_temporary_path, remove_error);
+  if (!WriteCaptureManifest(manifest_temporary_path, manifest.str())) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  temporary_paths.push_back(manifest_temporary_path);
+  for (const std::pair<std::string, uint64_t>& file : files) {
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, file.first);
+    const std::filesystem::path final_path = capture_path / file.first;
+    std::filesystem::rename(temporary_path, final_path, error);
+    if (error) {
+      fail_with_cleanup("file_publish");
+      return;
+    }
+    published_paths.push_back(final_path);
+  }
+  const std::filesystem::path manifest_path = capture_path / "manifest.json";
+  std::filesystem::remove(manifest_path, error);
+  if (error) {
+    fail_with_cleanup("manifest_publish");
+    return;
+  }
+  std::filesystem::rename(manifest_temporary_path, manifest_path, error);
+  if (error) {
+    fail_with_cleanup("manifest_publish");
+    return;
+  }
+  const uint64_t captured_frame = capture.frame;
+  const uint64_t captured_submission = capture.submission;
+  draw_capture_pending_.reset();
+  draw_capture_failure_reason_.clear();
+  REXGPU_INFO("Captured D3D12 Xenos draw at frame {}, submission {}, path {}", captured_frame,
+              captured_submission, rex::path_to_utf8(capture_path));
+}
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
@@ -2895,6 +3554,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
+  bool draw_capture_selected_this_draw = false;
+  if (draw_capture_armed_ && !draw_capture_disarmed_ && !draw_capture_pending_) {
+    diagnostic::DrawCaptureEligibility eligibility;
+    eligibility.rov_path =
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+    eligibility.resolution_scale_is_one =
+        draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1;
+    eligibility.vertex_shader_present = vertex_shader != nullptr;
+    eligibility.pixel_shader_present = pixel_shader != nullptr;
+    eligibility.rasterized_triangle_list =
+        is_rasterization_done &&
+        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList &&
+        primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleList;
+    eligibility.color_target_written = normalized_color_mask != 0;
+    eligibility.memexport_unused = !memexport_used;
+    eligibility.tessellation_disabled = !primitive_processing_result.IsTessellated();
+    eligibility.original_index_source = primitive_processing_result.index_buffer_type ==
+                                            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+                                        primitive_processing_result.index_buffer_type ==
+                                            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+    eligibility.used_texture_mask = used_texture_mask;
+    if (const auto skip_reason = diagnostic::GetDrawCaptureSkipReason(eligibility)) {
+      RecordDrawCaptureSkip(*skip_reason);
+    } else if (ScheduleDrawCapture(primitive_processing_result, primitive_type, index_count,
+                                   index_buffer_info, major_mode_explicit, primitive_topology,
+                                   vertex_shader, pixel_shader, used_texture_mask,
+                                   normalized_color_mask)) {
+      draw_capture_disarmed_ = true;
+      draw_capture_armed_ = false;
+      draw_capture_selected_this_draw = true;
+    }
+  }
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -2972,6 +3663,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // A pending readback survives later draws until swap; only this draw owns
+  // the after image, so later draws must not overwrite it.
+  if (draw_capture_selected_this_draw && draw_capture_pending_ &&
+      draw_capture_pending_->edram_after.buffer) {
+    if (!render_target_cache_->ScheduleEdramCapture(draw_capture_pending_->edram_after.buffer.Get(),
+                                                    draw_capture_pending_->edram_after.size,
+                                                    false)) {
+      draw_capture_failure_reason_ = "edram_after_schedule";
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    }
+  }
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.

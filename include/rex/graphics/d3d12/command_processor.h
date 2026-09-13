@@ -25,6 +25,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/diagnostic_draw_capture.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -44,6 +45,8 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
+
+class D3D12Shader;
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
@@ -218,6 +221,20 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+
+  void PollDrawCaptureArmMarker();
+  void ReportDrawCaptureSkipCounts();
+  bool ScheduleDrawCapture(const PrimitiveProcessor::ProcessingResult& result,
+                           xenos::PrimitiveType primitive_type, uint32_t index_count,
+                           const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                           D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader,
+                           D3D12Shader* pixel_shader, uint32_t used_texture_mask,
+                           uint32_t normalized_color_mask);
+  void FinalizeDrawCapture();
+  void RetainDrawCaptureBuffersForRetry();
+  void AbandonDrawCaptureBuffersForTeardown();
+  void RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason);
+  void WriteDrawCaptureFailureManifest(const char* reason);
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -573,6 +590,66 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t submission;
   };
   std::vector<DiagnosticBufferCapture> diagnostic_buffer_captures_;
+
+  struct DrawCaptureReadback {
+    std::string name;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint32_t size = 0;
+  };
+  struct DrawCapture {
+    std::filesystem::path path;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    uint32_t primitive_type = 0;
+    uint32_t requested_index_count = 0;
+    bool major_mode_explicit = false;
+    bool indexed = false;
+    uint32_t guest_draw_vertex_count = 0;
+    uint32_t host_draw_vertex_count = 0;
+    uint32_t guest_primitive_type = 0;
+    uint32_t host_primitive_type = 0;
+    uint32_t host_vertex_shader_type = 0;
+    uint32_t tessellation_mode = 0;
+    uint32_t guest_index_base = 0;
+    uint32_t guest_index_size = 0;
+    uint32_t guest_index_dma_length = 0;
+    uint32_t guest_index_dma_count = 0;
+    uint32_t guest_index_dma_format = 0;
+    uint32_t guest_index_dma_endianness = 0;
+    uint32_t host_index_format = 0;
+    uint32_t host_shader_index_endian = 0;
+    bool host_primitive_reset_enabled = false;
+    bool color_target_written = false;
+    uint32_t used_texture_mask = 0;
+    uint32_t normalized_color_mask = 0;
+    D3D12_PRIMITIVE_TOPOLOGY native_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    uint32_t native_vertex_count = 0;
+    uint32_t native_index_count = 0;
+    uint32_t native_instance_count = 1;
+    uint32_t native_start_vertex = 0;
+    uint32_t native_start_index = 0;
+    int32_t native_base_vertex = 0;
+    uint32_t native_start_instance = 0;
+    uint64_t vertex_shader_hash = 0;
+    uint64_t pixel_shader_hash = 0;
+    std::vector<uint32_t> registers;
+    std::vector<uint32_t> vertex_ucode;
+    std::vector<uint32_t> pixel_ucode;
+    std::vector<diagnostic::DrawCaptureRange> vertex_fetch_ranges;
+    std::vector<uint32_t> vertex_fetch_constants;
+    std::vector<DrawCaptureReadback> vertex_fetch_readbacks;
+    DrawCaptureReadback index_readback;
+    DrawCaptureReadback edram_before;
+    DrawCaptureReadback edram_after;
+  };
+  std::optional<DrawCapture> draw_capture_pending_;
+  std::filesystem::path draw_capture_path_;
+  std::string draw_capture_failure_reason_;
+  bool draw_capture_armed_ = false;
+  bool draw_capture_disarmed_ = false;
+  std::array<uint32_t, size_t(diagnostic::DrawCaptureSkipReason::kCount)>
+      draw_capture_skip_counts_{};
+  uint32_t draw_capture_skip_reports_remaining_ = 0;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
