@@ -1,6 +1,7 @@
 # Unit Tests for ReXGlue core components
 
 add_executable(unit_tests
+    graphics/draw_capture_mailbox_test.cpp
     test_memory.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp

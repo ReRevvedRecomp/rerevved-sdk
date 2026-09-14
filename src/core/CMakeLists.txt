@@ -2,6 +2,7 @@
 # Foundation types, data structures, and threading primitives
 
 add_library(rexcore OBJECT
+    draw_capture_mailbox.cpp
     arena.cpp
     bit_map.cpp
     bit_stream.cpp

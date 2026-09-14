@@ -43,6 +43,8 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DECLARE(bool, half_pixel_offset);
+
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -147,14 +149,21 @@ bool WriteCaptureManifest(const std::filesystem::path& path, const std::string& 
   return write_succeeded && flush_succeeded && !file.fail();
 }
 bool WriteCaptureMappedBuffer(const std::filesystem::path& path, ID3D12Resource* buffer,
-                              uint32_t size) {
+                              uint32_t size, std::vector<uint8_t>* bytes_out = nullptr) {
   if (!buffer || !size) {
     return false;
+  }
+  if (bytes_out) {
+    bytes_out->resize(size);
   }
   D3D12_RANGE read_range = {0, size};
   void* mapping = nullptr;
   if (FAILED(buffer->Map(0, &read_range, &mapping))) {
     return false;
+  }
+  if (bytes_out) {
+    const uint8_t* mapped_bytes = static_cast<const uint8_t*>(mapping);
+    std::memcpy(bytes_out->data(), mapped_bytes, size);
   }
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   bool success = false;
@@ -265,6 +274,7 @@ void D3D12CommandProcessor::PollDrawCaptureArmMarker() {
     return;
   }
   draw_capture_path_ = path;
+  draw_capture_armed_mailbox_token_ = diagnostic::GetDrawCaptureMailbox()->GetRequestToken(path);
   draw_capture_armed_ = true;
   draw_capture_skip_reports_remaining_ = 4;
   REXGPU_INFO("D3D12 draw capture armed from marker {}", rex::path_to_utf8(marker));
@@ -317,7 +327,13 @@ void D3D12CommandProcessor::RetainDrawCaptureBuffersForRetry() {
     retain(readback.buffer);
   }
 }
+void D3D12CommandProcessor::FailPendingDrawCaptureMailbox() {
+  if (draw_capture_pending_ && draw_capture_pending_->mailbox_token) {
+    diagnostic::GetDrawCaptureMailbox()->Fail(draw_capture_pending_->mailbox_token);
+  }
+}
 void D3D12CommandProcessor::AbandonDrawCaptureBuffersForTeardown() {
+  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
   if (draw_capture_pending_) {
     auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
     abandon(draw_capture_pending_->edram_before.buffer);
@@ -1924,6 +1940,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
+  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
   frame_capture_->Abort(device, "shutdown_before_completed_swap");
   const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
   const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
@@ -2207,6 +2224,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_) {
+    FailPendingDrawCaptureMailbox();
     frame_capture_->Abort(nullptr, "graphics_system_unavailable");
     return;
   }
@@ -2215,6 +2233,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
+    FailPendingDrawCaptureMailbox();
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "presenter_unavailable");
     return;
   }
@@ -2223,6 +2242,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+    FailPendingDrawCaptureMailbox();
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     return;
   }
@@ -2271,6 +2291,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    FailPendingDrawCaptureMailbox();
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "swap_texture_unavailable");
     return;
   }
@@ -2682,6 +2703,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   const bool outer_submission_succeeded = EndSubmission(true);
   if (!outer_submission_succeeded || swap_submission_failed) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
+    FailPendingDrawCaptureMailbox();
     RetainDrawCaptureBuffersForRetry();
     if (draw_capture_pending_) {
       RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
@@ -2823,14 +2845,20 @@ bool D3D12CommandProcessor::ScheduleDrawCapture(
     const PrimitiveProcessor::ProcessingResult& result, xenos::PrimitiveType primitive_type,
     uint32_t index_count, const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
     D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
-    uint32_t used_texture_mask, uint32_t normalized_color_mask) {
+    uint32_t used_texture_mask, uint32_t normalized_color_mask,
+    diagnostic::DrawCaptureMailbox::Token mailbox_token) {
   if (!draw_capture_armed_ || draw_capture_disarmed_ || draw_capture_pending_ || !vertex_shader ||
       !pixel_shader || !shared_memory_->GetBuffer()) {
     RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
     return false;
   }
+  if (!mailbox_token && diagnostic::GetDrawCaptureMailbox()->HasActiveRequest()) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
   DrawCapture capture;
   capture.path = draw_capture_path_;
+  capture.mailbox_token = mailbox_token;
   capture.frame = frame_current_;
   capture.submission = submission_current_;
   capture.primitive_type = uint32_t(primitive_type);
@@ -2870,6 +2898,9 @@ bool D3D12CommandProcessor::ScheduleDrawCapture(
   capture.pixel_ucode.assign(pixel_shader->ucode_data().begin(), pixel_shader->ucode_data().end());
   uint64_t geometry_size = 0;
   const RegisterFile& regs = *register_file_;
+  capture.half_pixel_offset =
+      REXCVAR_GET(half_pixel_offset) &&
+      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t fetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -3003,6 +3034,7 @@ void D3D12CommandProcessor::FinalizeDrawCapture() {
   DrawCapture& capture = *draw_capture_pending_;
   const std::filesystem::path capture_path = capture.path;
   auto fail = [this](const char* reason, bool retain_buffers) {
+    FailPendingDrawCaptureMailbox();
     if (retain_buffers) {
       RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
       RetainDrawCaptureBuffersForRetry();
@@ -3018,6 +3050,57 @@ void D3D12CommandProcessor::FinalizeDrawCapture() {
   if (!draw_capture_failure_reason_.empty()) {
     fail(draw_capture_failure_reason_.c_str(), false);
     return;
+  }
+  std::shared_ptr<diagnostic::DrawCaptureSnapshot> snapshot;
+  if (capture.mailbox_token) {
+    snapshot = std::make_shared<diagnostic::DrawCaptureSnapshot>();
+    snapshot->frame = capture.frame;
+    snapshot->submission = capture.submission;
+    snapshot->vertex_shader_hash = capture.vertex_shader_hash;
+    snapshot->pixel_shader_hash = capture.pixel_shader_hash;
+    snapshot->primitive_type = capture.primitive_type;
+    snapshot->requested_index_count = capture.requested_index_count;
+    snapshot->major_mode_explicit = capture.major_mode_explicit;
+    snapshot->indexed = capture.indexed;
+    snapshot->guest_draw_vertex_count = capture.guest_draw_vertex_count;
+    snapshot->host_draw_vertex_count = capture.host_draw_vertex_count;
+    snapshot->guest_primitive_type = capture.guest_primitive_type;
+    snapshot->host_primitive_type = capture.host_primitive_type;
+    snapshot->host_vertex_shader_type = capture.host_vertex_shader_type;
+    snapshot->tessellation_mode = capture.tessellation_mode;
+    snapshot->guest_index_base = capture.guest_index_base;
+    snapshot->guest_index_size = capture.guest_index_size;
+    snapshot->host_index_format = capture.host_index_format;
+    snapshot->host_shader_index_endian = capture.host_shader_index_endian;
+    snapshot->host_primitive_reset_enabled = capture.host_primitive_reset_enabled;
+    snapshot->color_target_written = capture.color_target_written;
+    snapshot->used_texture_mask = capture.used_texture_mask;
+    snapshot->normalized_color_mask = capture.normalized_color_mask;
+    snapshot->native_topology = static_cast<uint32_t>(capture.native_topology);
+    snapshot->native_vertex_count = capture.native_vertex_count;
+    snapshot->native_index_count = capture.native_index_count;
+    snapshot->native_instance_count = capture.native_instance_count;
+    snapshot->native_start_vertex = capture.native_start_vertex;
+    snapshot->native_start_index = capture.native_start_index;
+    snapshot->native_base_vertex = capture.native_base_vertex;
+    snapshot->native_start_instance = capture.native_start_instance;
+    snapshot->half_pixel_offset = capture.half_pixel_offset;
+    snapshot->registers = capture.registers;
+    snapshot->vertex_ucode = capture.vertex_ucode;
+    snapshot->pixel_ucode = capture.pixel_ucode;
+    snapshot->vertex_fetches.reserve(capture.vertex_fetch_readbacks.size());
+    for (size_t i = 0; i < capture.vertex_fetch_readbacks.size(); ++i) {
+      diagnostic::DrawCaptureVertexFetch& fetch = snapshot->vertex_fetches.emplace_back();
+      fetch.fetch_constant = capture.vertex_fetch_constants[i];
+      fetch.base = capture.vertex_fetch_ranges[i].base;
+    }
+    snapshot->index.present = capture.indexed;
+    snapshot->index.guest_base = capture.guest_index_base;
+    snapshot->index.format = capture.guest_index_dma_format;
+    snapshot->index.endianness = capture.guest_index_dma_endianness;
+    snapshot->index.count = capture.guest_draw_vertex_count;
+    snapshot->index.dma_count = capture.guest_index_dma_count;
+    snapshot->index.dma_length = capture.guest_index_dma_length;
   }
   if (!CreateDiagnosticCaptureParent(capture_path / "manifest.json", "draw")) {
     RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
@@ -3078,14 +3161,15 @@ void D3D12CommandProcessor::FinalizeDrawCapture() {
     files.emplace_back(name, uint64_t(dwords.size()) * sizeof(uint32_t));
     return true;
   };
-  auto write_readback = [&](const DrawCaptureReadback& readback) {
+  auto write_readback = [&](const DrawCaptureReadback& readback, std::vector<uint8_t>* bytes_out) {
     if (readback.name.empty() || !readback.buffer || !readback.size) {
       return false;
     }
     const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, readback.name);
     std::error_code remove_error;
     std::filesystem::remove(temporary_path, remove_error);
-    if (!WriteCaptureMappedBuffer(temporary_path, readback.buffer.Get(), readback.size)) {
+    if (!WriteCaptureMappedBuffer(temporary_path, readback.buffer.Get(), readback.size,
+                                  bytes_out)) {
       return false;
     }
     temporary_paths.push_back(temporary_path);
@@ -3098,17 +3182,20 @@ void D3D12CommandProcessor::FinalizeDrawCapture() {
     fail_with_cleanup("file_write");
     return;
   }
-  for (const DrawCaptureReadback& readback : capture.vertex_fetch_readbacks) {
-    if (!write_readback(readback)) {
+  for (size_t i = 0; i < capture.vertex_fetch_readbacks.size(); ++i) {
+    const DrawCaptureReadback& readback = capture.vertex_fetch_readbacks[i];
+    if (!write_readback(readback, snapshot ? &snapshot->vertex_fetches[i].bytes : nullptr)) {
       fail_with_cleanup("file_write");
       return;
     }
   }
-  if (capture.indexed && !write_readback(capture.index_readback)) {
+  if (capture.indexed &&
+      !write_readback(capture.index_readback, snapshot ? &snapshot->index.bytes : nullptr)) {
     fail_with_cleanup("file_write");
     return;
   }
-  if (!write_readback(capture.edram_before) || !write_readback(capture.edram_after)) {
+  if (!write_readback(capture.edram_before, snapshot ? &snapshot->edram_before : nullptr) ||
+      !write_readback(capture.edram_after, snapshot ? &snapshot->edram_after : nullptr)) {
     fail_with_cleanup("file_write");
     return;
   }
@@ -3249,6 +3336,10 @@ void D3D12CommandProcessor::FinalizeDrawCapture() {
   if (error) {
     fail_with_cleanup("manifest_publish");
     return;
+  }
+  if (snapshot &&
+      !diagnostic::GetDrawCaptureMailbox()->Publish(capture.mailbox_token, std::move(snapshot))) {
+    diagnostic::GetDrawCaptureMailbox()->Fail(capture.mailbox_token);
   }
   const uint64_t captured_frame = capture.frame;
   const uint64_t captured_submission = capture.submission;
@@ -3686,6 +3777,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   bool draw_capture_selected_this_draw = false;
+  if (draw_capture_armed_ &&
+      (REXCVAR_GET(d3d12_capture_draw).empty() ||
+       (draw_capture_armed_mailbox_token_ &&
+        !diagnostic::GetDrawCaptureMailbox()->IsPending(draw_capture_armed_mailbox_token_)))) {
+    draw_capture_armed_ = false;
+    draw_capture_disarmed_ = true;
+  }
   if (draw_capture_armed_ && !draw_capture_disarmed_ && !draw_capture_pending_) {
     diagnostic::DrawCaptureEligibility eligibility;
     eligibility.rov_path =
@@ -3708,13 +3806,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     eligibility.used_texture_mask = used_texture_mask;
     if (const auto skip_reason = diagnostic::GetDrawCaptureSkipReason(eligibility)) {
       RecordDrawCaptureSkip(*skip_reason);
-    } else if (ScheduleDrawCapture(primitive_processing_result, primitive_type, index_count,
-                                   index_buffer_info, major_mode_explicit, primitive_topology,
-                                   vertex_shader, pixel_shader, used_texture_mask,
-                                   normalized_color_mask)) {
-      draw_capture_disarmed_ = true;
-      draw_capture_armed_ = false;
-      draw_capture_selected_this_draw = true;
+    } else {
+      const bool live_capture_requested = bool(draw_capture_armed_mailbox_token_);
+      diagnostic::DrawCaptureMailbox::Token mailbox_token;
+      if (live_capture_requested) {
+        mailbox_token = diagnostic::GetDrawCaptureMailbox()->Claim(
+            draw_capture_armed_mailbox_token_, draw_capture_path_, vertex_shader->ucode_data_hash(),
+            pixel_shader->ucode_data_hash());
+      }
+      if (!live_capture_requested || mailbox_token) {
+        const bool scheduled = ScheduleDrawCapture(
+            primitive_processing_result, primitive_type, index_count, index_buffer_info,
+            major_mode_explicit, primitive_topology, vertex_shader, pixel_shader, used_texture_mask,
+            normalized_color_mask, mailbox_token);
+        if (scheduled) {
+          draw_capture_disarmed_ = true;
+          draw_capture_armed_ = false;
+          draw_capture_selected_this_draw = true;
+        } else if (mailbox_token) {
+          draw_capture_disarmed_ = true;
+          draw_capture_armed_ = false;
+          diagnostic::GetDrawCaptureMailbox()->Fail(mailbox_token);
+        }
+      }
     }
   }
   // Draw.
@@ -4391,6 +4505,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
                                                bool tracking_is_unrecoverable) {
   REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
+  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
   frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
   submission_fence_failed_ |= tracking_is_unrecoverable;
 

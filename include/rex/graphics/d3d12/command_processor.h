@@ -26,6 +26,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/diagnostic_draw_capture.h>
+#include <rex/graphics/draw_capture_mailbox.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -230,8 +231,10 @@ class D3D12CommandProcessor : public CommandProcessor {
                            const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
                            D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader,
                            D3D12Shader* pixel_shader, uint32_t used_texture_mask,
-                           uint32_t normalized_color_mask);
+                           uint32_t normalized_color_mask,
+                           diagnostic::DrawCaptureMailbox::Token mailbox_token);
   void FinalizeDrawCapture();
+  void FailPendingDrawCaptureMailbox();
   void RetainDrawCaptureBuffersForRetry();
   void AbandonDrawCaptureBuffersForTeardown();
   void RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason);
@@ -623,6 +626,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_shader_index_endian = 0;
     bool host_primitive_reset_enabled = false;
     bool color_target_written = false;
+    bool half_pixel_offset = false;
     uint32_t used_texture_mask = 0;
     uint32_t normalized_color_mask = 0;
     D3D12_PRIMITIVE_TOPOLOGY native_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -638,6 +642,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     std::vector<uint32_t> registers;
     std::vector<uint32_t> vertex_ucode;
     std::vector<uint32_t> pixel_ucode;
+    diagnostic::DrawCaptureMailbox::Token mailbox_token;
     std::vector<diagnostic::DrawCaptureRange> vertex_fetch_ranges;
     std::vector<uint32_t> vertex_fetch_constants;
     std::vector<DrawCaptureReadback> vertex_fetch_readbacks;
@@ -649,6 +654,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::filesystem::path draw_capture_path_;
   std::string draw_capture_failure_reason_;
   bool draw_capture_armed_ = false;
+  diagnostic::DrawCaptureMailbox::Token draw_capture_armed_mailbox_token_;
   bool draw_capture_disarmed_ = false;
   std::array<uint32_t, size_t(diagnostic::DrawCaptureSkipReason::kCount)>
       draw_capture_skip_counts_{};
