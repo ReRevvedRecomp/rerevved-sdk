@@ -47,6 +47,7 @@
 namespace rex::graphics::d3d12 {
 
 class D3D12Shader;
+class FrameCapture;
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
@@ -577,6 +578,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
+
+  std::unique_ptr<FrameCapture> frame_capture_;
 
   bool texture_load_scratch_capture_armed_ = false;
   std::filesystem::path texture_load_scratch_capture_path_;

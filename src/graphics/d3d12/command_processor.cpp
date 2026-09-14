@@ -25,6 +25,8 @@
 #include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/d3d12/command_processor.h>
 
+#include "frame_capture.h"
+
 #include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -62,6 +64,10 @@ REXCVAR_DEFINE_STRING(d3d12_capture_swap_texture, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_STRING(d3d12_capture_draw, "", "GPU/D3D12",
                       "Output directory for a one-shot Xenos draw snapshot")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(d3d12_capture_frame, "", "GPU/D3D12",
+                      "Output directory for one complete Xenos frame RenderDoc capture")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace rex::graphics::d3d12 {
 
@@ -184,7 +190,9 @@ namespace shaders {
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
-    : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
+    : CommandProcessor(graphics_system, kernel_state),
+      deferred_command_list_(*this),
+      frame_capture_(std::make_unique<FrameCapture>()) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
 D3D12CommandProcessor::~D3D12CommandProcessor() = default;
@@ -1915,8 +1923,9 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
-  const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
   ID3D12Device* device = GetD3D12Provider().GetDevice();
+  frame_capture_->Abort(device, "shutdown_before_completed_swap");
+  const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
   const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
   if (!diagnostic::CanReleaseSubmittedGpuResources(queue_is_idle, device_is_removed)) {
     REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
@@ -2197,13 +2206,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
-  if (!graphics_system_)
+  if (!graphics_system_) {
+    frame_capture_->Abort(nullptr, "graphics_system_unavailable");
     return;
+  }
   PollDrawCaptureArmMarker();
   ReportDrawCaptureSkipCounts();
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "presenter_unavailable");
     return;
   }
 
@@ -2211,12 +2223,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     return;
   }
   if (current_xenos_fence_trace_token()) {
     diagnostic::GetXenosFenceTrace().D3D12SwapRecording(
         current_xenos_fence_trace_token(), submission_current_, submission_had_prior_guest_work);
   }
+
+  bool swap_marker_recorded = false;
+  bool swap_submission_failed = false;
+  auto record_swap_marker = [&]() {
+    if (swap_marker_recorded) {
+      return;
+    }
+    const std::string marker = frame_capture_->RecordSwapEnd(
+        frame_current_, submission_current_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+        register_file_->values, RegisterFile::kRegisterCount);
+    if (!marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(marker.c_str());
+      swap_marker_recorded = true;
+    }
+  };
 
   static bool swap_texture_capture_attempted = false;
   std::string swap_texture_capture_path_utf8 = REXCVAR_GET(d3d12_capture_swap_texture);
@@ -2243,6 +2271,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "swap_texture_unavailable");
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
@@ -2381,7 +2410,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       guest_output_height, &record_swap_marker,
+       &swap_submission_failed](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2640,12 +2670,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
-        return EndSubmission(true);
+        record_swap_marker();
+        const bool submission_result = EndSubmission(true);
+        swap_submission_failed |= !submission_result;
+        return submission_result;
       });
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
-  if (!EndSubmission(true)) {
+  record_swap_marker();
+  const bool outer_submission_succeeded = EndSubmission(true);
+  if (!outer_submission_succeeded || swap_submission_failed) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
     RetainDrawCaptureBuffersForRetry();
     if (draw_capture_pending_) {
       RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
@@ -2662,6 +2698,27 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       submission_retry_resources_.push_back(std::move(swap_source_capture_buffer));
     }
     return;
+  }
+
+  std::filesystem::path frame_capture_path;
+  const std::string frame_capture_path_utf8 = REXCVAR_GET(d3d12_capture_frame);
+  if (frame_capture_->IsIdle() && !frame_capture_path_utf8.empty()) {
+    const std::filesystem::path requested_path = rex::to_path(frame_capture_path_utf8);
+    const std::filesystem::path arm_marker = requested_path / diagnostic::kDrawCaptureArmMarker;
+    std::error_code error;
+    if (std::filesystem::is_regular_file(arm_marker, error) && !error) {
+      frame_capture_path = requested_path;
+    }
+  }
+  if (frame_capture_->IsActive() || !frame_capture_path.empty()) {
+    // Both captured boundaries must own completed guest work. A successful
+    // submission alone does not establish that its GPU execution succeeded.
+    if (CheckSubmissionFence(submission_current_ - 1)) {
+      frame_capture_->OnCompletedSwap(GetD3D12Provider().GetDevice(), frame_capture_path,
+                                      frame_current_, submission_current_);
+    } else {
+      frame_capture_->Abort(GetD3D12Provider().GetDevice(), "frame_boundary_fence_failure");
+    }
   }
 
   FinalizeDrawCapture();
@@ -3215,19 +3272,59 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
 
+  D3D12Shader* active_vertex_shader_at_entry = static_cast<D3D12Shader*>(active_vertex_shader());
+  D3D12Shader* active_pixel_shader_at_entry = static_cast<D3D12Shader*>(active_pixel_shader());
+  FrameCapture::ShaderView vertex_shader_at_entry;
+  FrameCapture::DrawScope draw_frame_capture;
+  if (frame_capture_->IsActive() && active_vertex_shader_at_entry) {
+    vertex_shader_at_entry.present = true;
+    vertex_shader_at_entry.hash = active_vertex_shader_at_entry->ucode_data_hash();
+    vertex_shader_at_entry.dwords = active_vertex_shader_at_entry->ucode_dwords();
+    vertex_shader_at_entry.dword_count = active_vertex_shader_at_entry->ucode_dword_count();
+  }
+  FrameCapture::ShaderView pixel_shader_at_entry;
+  if (frame_capture_->IsActive() && active_pixel_shader_at_entry) {
+    pixel_shader_at_entry.present = true;
+    pixel_shader_at_entry.hash = active_pixel_shader_at_entry->ucode_data_hash();
+    pixel_shader_at_entry.dwords = active_pixel_shader_at_entry->ucode_dwords();
+    pixel_shader_at_entry.dword_count = active_pixel_shader_at_entry->ucode_dword_count();
+  }
+  FrameCapture::IndexInfo original_index_info;
+  if (frame_capture_->IsActive() && index_buffer_info) {
+    original_index_info.present = true;
+    original_index_info.format = static_cast<uint32_t>(index_buffer_info->format);
+    original_index_info.endianness = static_cast<uint32_t>(index_buffer_info->endianness);
+    original_index_info.count = index_buffer_info->count;
+    original_index_info.guest_base = index_buffer_info->guest_base;
+    original_index_info.length = index_buffer_info->length;
+  }
+  if (frame_capture_->IsActive()) {
+    draw_frame_capture = frame_capture_->BeginDraw(
+        frame_current_, submission_current_, static_cast<uint32_t>(primitive_type), index_count,
+        major_mode_explicit, original_index_info, regs.values, RegisterFile::kRegisterCount,
+        vertex_shader_at_entry, pixel_shader_at_entry);
+  }
+
+  auto finish_frame_capture_draw = [&draw_frame_capture](bool success) {
+    draw_frame_capture.SetResult(success);
+    return success;
+  };
+
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    const bool copy_result = IssueCopy();
+    draw_frame_capture.MarkCopy(copy_result);
+    return finish_frame_capture_draw(copy_result);
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   // Vertex shader analysis.
-  auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
+  auto vertex_shader = active_vertex_shader_at_entry;
   if (!vertex_shader) {
     // Always need a vertex shader.
-    return false;
+    return finish_frame_capture_draw(false);
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -3238,7 +3335,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
-    return true;
+    return finish_frame_capture_draw(true);
   }
   D3D12Shader* pixel_shader = nullptr;
   if (is_rasterization_done) {
@@ -3258,24 +3355,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
-      return true;
+      return finish_frame_capture_draw(true);
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
   if (!BeginSubmission(true)) {
-    return false;
+    frame_capture_->Abort(device, "begin_submission_failure");
+    return finish_frame_capture_draw(false);
   }
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
-    return true;
+    return finish_frame_capture_draw(true);
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -3303,7 +3401,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -3333,11 +3431,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    return finish_frame_capture_draw(true);
   }
 
   // Update the textures - this may bind pipelines.
@@ -3408,7 +3506,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   // Must not call anything that can change the descriptor heap from now on!
 
@@ -3437,11 +3535,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               "This is incorrect behavior, but you can try bypassing this by "
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return finish_frame_capture_draw(false);
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return finish_frame_capture_draw(false);
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
@@ -3453,7 +3551,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
+        return finish_frame_capture_draw(false);
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -3478,7 +3576,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
-      return false;
+      return finish_frame_capture_draw(false);
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
@@ -3486,7 +3584,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
-      return false;
+      return finish_frame_capture_draw(false);
     }
   }
 
@@ -3519,7 +3617,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "processor is not supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -3548,11 +3646,44 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
+
+  const std::string frame_capture_draw_marker = draw_frame_capture.marker();
+  FrameCapture::HostDrawInfo frame_capture_host_info;
+  if (!frame_capture_draw_marker.empty()) {
+    frame_capture_host_info.used_texture_mask = used_texture_mask;
+    frame_capture_host_info.vertex_shader_hash = vertex_shader->ucode_data_hash();
+    frame_capture_host_info.pixel_shader_hash =
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
+    frame_capture_host_info.guest_primitive_type =
+        static_cast<uint32_t>(primitive_processing_result.guest_primitive_type);
+    frame_capture_host_info.host_primitive_type =
+        static_cast<uint32_t>(primitive_processing_result.host_primitive_type);
+    frame_capture_host_info.host_vertex_shader_type =
+        static_cast<uint32_t>(primitive_processing_result.host_vertex_shader_type);
+    frame_capture_host_info.tessellation_mode =
+        static_cast<uint32_t>(primitive_processing_result.tessellation_mode);
+    frame_capture_host_info.guest_draw_vertex_count =
+        primitive_processing_result.guest_draw_vertex_count;
+    frame_capture_host_info.host_draw_vertex_count =
+        primitive_processing_result.host_draw_vertex_count;
+    frame_capture_host_info.line_loop_closing_index =
+        primitive_processing_result.line_loop_closing_index;
+    frame_capture_host_info.index_buffer_type =
+        static_cast<uint32_t>(primitive_processing_result.index_buffer_type);
+    frame_capture_host_info.guest_index_base = primitive_processing_result.guest_index_base;
+    frame_capture_host_info.host_index_format =
+        static_cast<uint32_t>(primitive_processing_result.host_index_format);
+    frame_capture_host_info.host_shader_index_endian =
+        static_cast<uint32_t>(primitive_processing_result.host_shader_index_endian);
+    frame_capture_host_info.host_primitive_reset_enabled =
+        primitive_processing_result.host_primitive_reset_enabled;
+    frame_capture_host_info.native_topology = static_cast<uint32_t>(primitive_topology);
+  }
 
   bool draw_capture_selected_this_draw = false;
   if (draw_capture_armed_ && !draw_capture_disarmed_ && !draw_capture_pending_) {
@@ -3597,8 +3728,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (!frame_capture_draw_marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(frame_capture_draw_marker.c_str());
+    }
     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
                                             0, 0);
+    draw_frame_capture.MarkHostIssued(frame_capture_host_info);
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -3619,7 +3754,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           scratch_index_buffer = RequestScratchGPUBuffer(index_buffer_view.SizeInBytes,
                                                          D3D12_RESOURCE_STATE_COPY_DEST);
           if (scratch_index_buffer == nullptr) {
-            return false;
+            return finish_frame_capture_draw(false);
           }
           shared_memory_->UseAsCopySource();
           SubmitBarriers();
@@ -3645,7 +3780,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
     if (memexport_used) {
@@ -3656,8 +3791,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (!frame_capture_draw_marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(frame_capture_draw_marker.c_str());
+    }
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    draw_frame_capture.MarkHostIssued(frame_capture_host_info);
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
@@ -3707,7 +3846,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
-  return true;
+  return finish_frame_capture_draw(true);
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -3854,16 +3993,34 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  FrameCapture::CopyScope frame_capture_copy;
+  if (frame_capture_->IsActive()) {
+    frame_capture_copy = frame_capture_->BeginCopy(
+        frame_current_, submission_current_, register_file_->values, RegisterFile::kRegisterCount);
+  }
   if (!BeginSubmission(true)) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
+    frame_capture_copy.SetResult(false, "submission_failure");
     return false;
   }
+  const std::string frame_capture_copy_marker = frame_capture_copy.marker();
+  if (!frame_capture_copy_marker.empty()) {
+    deferred_command_list_.InsertDebugMarker(frame_capture_copy_marker.c_str());
+  }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  bool copy_result;
+  const char* copy_mode;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    copy_mode = "resolve";
+    copy_result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                written_address, written_length);
+  } else {
+    copy_mode = "resolve_readback";
+    copy_result = IssueCopy_ReadbackResolvePath();
   }
-  return IssueCopy_ReadbackResolvePath();
+  frame_capture_copy.SetResult(copy_result, copy_mode);
+  return copy_result;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4084,6 +4241,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
 bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (device_removed_ || submission_fence_failed_) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
     return false;
   }
 
@@ -4129,6 +4287,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         } else {
           REXGPU_ERROR("Out-of-submission queue operation fence wait completed below {}",
                        fence_value);
+          frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
         }
         return false;
       }
@@ -4138,6 +4297,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     await_submission = submission_last_signaled_;
   } else if (await_submission > submission_last_signaled_) {
     REXGPU_ERROR("Submission {} was not successfully signaled", await_submission);
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
     return false;
   }
 
@@ -4167,6 +4327,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
       } else {
         REXGPU_ERROR("Submission fence wait completed below {}", await_submission);
+        frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
       }
       return false;
     }
@@ -4230,6 +4391,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
                                                bool tracking_is_unrecoverable) {
   REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
+  frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
   submission_fence_failed_ |= tracking_is_unrecoverable;
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -4431,6 +4593,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   if (device_removed_ || submission_fence_failed_) {
+    frame_capture_->Abort(provider.GetDevice(), "submission_failure");
     return false;
   }
 
@@ -4442,6 +4605,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to create a command allocator");
       // Try to submit later. Completely dropping the submission is not
       // permitted because resources would be left in an undefined state.
+      frame_capture_->Abort(provider.GetDevice(), "submission_allocator_failure");
       return false;
     }
     command_allocator_writable_first_ = new CommandAllocator;
@@ -4513,6 +4677,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       // ExecuteCommandLists has already queued work. Its allocator and identity
       // must remain submitted even though completion can no longer be tracked.
       HandleFenceFailure("Submission fence Signal", signal_result, true);
+      frame_capture_->Abort(provider.GetDevice(), "submission_signal_failure");
       return false;
     }
     submission_last_signaled_ = submitted_submission;
