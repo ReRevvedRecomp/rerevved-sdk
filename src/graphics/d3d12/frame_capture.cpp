@@ -362,6 +362,186 @@ std::string FrameCapture::RecordSwapEnd(uint64_t frame, uint64_t submission,
   }
 }
 
+bool FrameCapture::AppendOwnedStartSwap(uint64_t frame, uint64_t submission,
+                                        uint64_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height, const uint32_t* registers,
+                                        size_t register_count) {
+  if (RecordSwapEnd(frame, submission, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+                    registers, register_count)
+          .empty() ||
+      pending_swap_event_id_ == 0) {
+    return false;
+  }
+  const auto it = std::find_if(events_.begin(), events_.end(), [this](const Event& event) {
+    return event.id == pending_swap_event_id_;
+  });
+  if (it == events_.end()) {
+    MarkFailure("owned_start_swap_missing");
+    return false;
+  }
+  it->outcome = "completed";
+  it->success = true;
+  pending_swap_event_id_ = 0;
+  return true;
+}
+
+bool FrameCapture::BeginOwnedFrame(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                                   uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                                   const uint32_t* registers, size_t register_count) {
+  if (owned_active_ || state_ == State::kCapturing) {
+    return false;
+  }
+  state_ = State::kIdle;
+  output_path_.clear();
+  renderdoc_capture_path_.clear();
+  events_.clear();
+  shaders_.clear();
+  shader_indices_.clear();
+  bytes_used_ = 0;
+  next_event_id_ = 1;
+  start_frame_ = frame;
+  start_submission_ = submission;
+  end_frame_ = 0;
+  end_submission_ = 0;
+  pending_swap_event_id_ = 0;
+  failure_reason_.clear();
+  renderdoc_started_ = false;
+  renderdoc_device_ = nullptr;
+  artifacts_written_ = false;
+  owned_active_ = true;
+  if (!AppendOwnedStartSwap(frame, submission, frontbuffer_ptr, frontbuffer_width,
+                            frontbuffer_height, registers, register_count)) {
+    owned_active_ = false;
+    return false;
+  }
+  return true;
+}
+
+bool FrameCapture::BuildOwnedFrameSnapshot(uint64_t end_frame, uint64_t end_submission,
+                                           diagnostic::DrawCaptureFrameSnapshot& snapshot) const {
+  snapshot = {};
+  snapshot.start_frame = start_frame_;
+  snapshot.start_submission = start_submission_;
+  snapshot.end_frame = end_frame;
+  snapshot.end_submission = end_submission;
+  snapshot.events.reserve(events_.size());
+  for (const Event& event : events_) {
+    diagnostic::DrawCaptureFrameEvent output;
+    output.id = event.id;
+    output.frame = event.frame;
+    output.submission = event.submission;
+    output.success = event.success;
+    output.host_issued = event.host_issued;
+    output.draw.draw.registers = event.registers;
+    output.draw.draw.frame = event.frame;
+    output.draw.draw.submission = event.submission;
+    switch (event.kind) {
+      case EventKind::kDraw: {
+        output.kind = diagnostic::DrawCaptureFrameEvent::Kind::kDraw;
+        diagnostic::DrawCaptureSnapshot& draw = output.draw.draw;
+        draw.frame = event.frame;
+        draw.submission = event.submission;
+        output.draw.guest_vertex_shader_hash = event.vertex_shader_hash;
+        output.draw.guest_pixel_shader_hash = event.pixel_shader_hash;
+        output.draw.texture_bindings_complete = event.host_issued;
+        draw.vertex_shader_hash = event.vertex_shader_hash;
+        draw.pixel_shader_hash = event.pixel_shader_hash;
+        draw.primitive_type = event.primitive_type;
+        draw.requested_index_count = event.index_count;
+        draw.major_mode_explicit = event.major_mode_explicit;
+        draw.indexed = event.index_info.present;
+        draw.guest_index_base = event.index_info.guest_base;
+        draw.guest_index_size =
+            event.index_info.length > UINT32_MAX ? 0 : uint32_t(event.index_info.length);
+        draw.index.present = event.index_info.present;
+        draw.index.guest_base = event.index_info.guest_base;
+        draw.index.format = event.index_info.format;
+        draw.index.endianness = event.index_info.endianness;
+        draw.index.count = event.index_info.count;
+        draw.index.dma_count = event.index_info.count;
+        draw.index.dma_length =
+            event.index_info.length > UINT32_MAX ? 0 : uint32_t(event.index_info.length);
+        for (const ShaderRecord& shader : shaders_) {
+          if (shader.file == event.vertex_shader_file) {
+            draw.vertex_ucode = shader.dwords;
+          }
+          if (shader.file == event.pixel_shader_file) {
+            draw.pixel_ucode = shader.dwords;
+          }
+        }
+        if (event.host_issued) {
+          const HostDrawInfo& host = event.host_info;
+          draw.used_texture_mask = host.used_texture_mask;
+          draw.normalized_color_mask = host.normalized_color_mask;
+          draw.vertex_shader_hash = host.vertex_shader_hash;
+          draw.pixel_shader_hash = host.pixel_shader_hash;
+          draw.guest_primitive_type = host.guest_primitive_type;
+          draw.host_primitive_type = host.host_primitive_type;
+          draw.host_vertex_shader_type = host.host_vertex_shader_type;
+          draw.tessellation_mode = host.tessellation_mode;
+          draw.guest_draw_vertex_count = host.guest_draw_vertex_count;
+          draw.host_draw_vertex_count = host.host_draw_vertex_count;
+          draw.host_index_format = host.host_index_format;
+          draw.host_shader_index_endian = host.host_shader_index_endian;
+          draw.host_primitive_reset_enabled = host.host_primitive_reset_enabled;
+          draw.color_target_written = host.normalized_color_mask != 0;
+          draw.native_topology = host.native_topology;
+          draw.native_vertex_count = host.native_vertex_count;
+          draw.native_index_count = host.native_index_count;
+          draw.native_instance_count = 1;
+          draw.half_pixel_offset = host.half_pixel_offset;
+        }
+      } break;
+      case EventKind::kCopy:
+        output.kind = diagnostic::DrawCaptureFrameEvent::Kind::kCopy;
+        output.copy_mode = event.copy_mode;
+        break;
+      case EventKind::kSwap:
+        output.kind = diagnostic::DrawCaptureFrameEvent::Kind::kSwap;
+        output.frontbuffer_ptr = event.frontbuffer_ptr;
+        output.frontbuffer_width = event.frontbuffer_width;
+        output.frontbuffer_height = event.frontbuffer_height;
+        break;
+    }
+    snapshot.events.push_back(std::move(output));
+  }
+  return true;
+}
+
+std::shared_ptr<diagnostic::DrawCaptureFrameSnapshot> FrameCapture::TakeOwnedFrame(
+    uint64_t end_frame, uint64_t end_submission) {
+  if (!owned_active_ || !failure_reason_.empty()) {
+    return {};
+  }
+  if (pending_swap_event_id_ != 0) {
+    const auto it = std::find_if(events_.begin(), events_.end(), [this](const Event& event) {
+      return event.id == pending_swap_event_id_;
+    });
+    if (it == events_.end()) {
+      MarkFailure("owned_end_swap_missing");
+      owned_active_ = false;
+      return {};
+    }
+    it->outcome = "completed";
+    it->success = true;
+    pending_swap_event_id_ = 0;
+  }
+  try {
+    auto snapshot = std::make_shared<diagnostic::DrawCaptureFrameSnapshot>();
+    if (!BuildOwnedFrameSnapshot(end_frame, end_submission, *snapshot)) {
+      owned_active_ = false;
+      return {};
+    }
+    owned_active_ = false;
+    failure_reason_.clear();
+    return snapshot;
+  } catch (const std::bad_alloc&) {
+    MarkFailure("owned_snapshot_allocation_failed");
+    owned_active_ = false;
+    return {};
+  }
+}
+
 bool FrameCapture::CopyRegisters(Event& event, const uint32_t* registers, size_t register_count) {
   if (!registers || register_count != kRegisterCountExpected) {
     return false;
@@ -689,6 +869,9 @@ bool FrameCapture::GetRenderDocCapturePath(std::filesystem::path& path_out) cons
 
 void FrameCapture::OnCompletedSwap(void* device, const std::filesystem::path& requested_path,
                                    uint64_t completed_frame, uint64_t completed_submission) {
+  if (owned_active_) {
+    return;
+  }
   if (state_ == State::kFinished || state_ == State::kFailed) {
     return;
   }
@@ -747,6 +930,11 @@ void FrameCapture::OnCompletedSwap(void* device, const std::filesystem::path& re
 }
 
 void FrameCapture::Abort(void* device, std::string_view reason) {
+  if (owned_active_) {
+    MarkFailure(reason);
+    owned_active_ = false;
+    return;
+  }
   if (state_ != State::kCapturing) {
     return;
   }

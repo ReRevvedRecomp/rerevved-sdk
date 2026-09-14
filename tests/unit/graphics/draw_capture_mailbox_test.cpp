@@ -24,6 +24,15 @@ std::shared_ptr<const DrawCaptureSnapshot> MakeSnapshot(uint64_t vertex_shader_h
   return snapshot;
 }
 
+std::shared_ptr<const DrawCaptureFrameSnapshot> MakeFrameSnapshot() {
+  auto snapshot = std::make_shared<DrawCaptureFrameSnapshot>();
+  snapshot->start_frame = 10;
+  snapshot->end_frame = 11;
+  snapshot->events.push_back({});
+  snapshot->events.back().kind = DrawCaptureFrameEvent::Kind::kSwap;
+  return snapshot;
+}
+
 TEST_CASE("draw capture mailbox requires a complete selector") {
   DrawCaptureMailbox mailbox;
 
@@ -95,6 +104,49 @@ TEST_CASE("draw capture mailbox failure releases the request") {
   CHECK_FALSE(mailbox.IsPending(token));
   CHECK_FALSE(mailbox.TryTake(token));
   CHECK(mailbox.Start(request));
+}
+
+TEST_CASE("draw capture mailbox hands off an owned frame") {
+  DrawCaptureMailbox mailbox;
+  const DrawCaptureMailbox::Token token = mailbox.StartFrame("frame");
+  REQUIRE(token);
+  CHECK(mailbox.IsPending(token));
+  CHECK(mailbox.IsFrameRequest(token));
+  CHECK(mailbox.GetFrameRequestToken() == token);
+  CHECK(mailbox.GetRequestPath(token) == std::filesystem::path("frame"));
+  CHECK_FALSE(mailbox.TryTakeFrame(token));
+  CHECK_FALSE(mailbox.ClaimFrame(token, "other"));
+  REQUIRE(mailbox.ClaimFrame(token, "frame") == token);
+  CHECK_FALSE(mailbox.GetFrameRequestToken());
+  CHECK_FALSE(mailbox.ClaimFrame(token, "frame"));
+  REQUIRE(mailbox.PublishFrame(token, MakeFrameSnapshot()));
+  CHECK(mailbox.IsPending(token));
+  CHECK_FALSE(mailbox.GetFrameRequestToken());
+  CHECK_FALSE(mailbox.PublishFrame(token, MakeFrameSnapshot()));
+
+  const std::shared_ptr<const DrawCaptureFrameSnapshot> snapshot = mailbox.TryTakeFrame(token);
+  REQUIRE(snapshot);
+  CHECK(snapshot->start_frame == 10);
+  CHECK(snapshot->events.size() == 1);
+  CHECK_FALSE(mailbox.IsPending(token));
+  CHECK_FALSE(mailbox.GetFrameRequestToken());
+}
+
+TEST_CASE("draw capture mailbox rejects stale owned frame completion") {
+  DrawCaptureMailbox mailbox;
+  const DrawCaptureMailbox::Token stale_token = mailbox.StartFrame();
+  REQUIRE(stale_token);
+  REQUIRE(mailbox.Cancel(stale_token));
+  CHECK_FALSE(mailbox.IsFrameRequest(stale_token));
+  CHECK_FALSE(mailbox.ClaimFrame(stale_token));
+  CHECK_FALSE(mailbox.PublishFrame(stale_token, MakeFrameSnapshot()));
+
+  const DrawCaptureMailbox::Token current_token = mailbox.StartFrame();
+  REQUIRE(current_token);
+  REQUIRE(mailbox.ClaimFrame(current_token));
+  CHECK_FALSE(mailbox.PublishFrame(stale_token, MakeFrameSnapshot()));
+  REQUIRE(mailbox.PublishFrame(current_token, MakeFrameSnapshot()));
+  REQUIRE(mailbox.TryTakeFrame(current_token));
 }
 
 }  // namespace

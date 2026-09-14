@@ -14,6 +14,7 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -764,6 +765,122 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
   }
+}
+
+D3D12TextureCache::TextureCaptureResult D3D12TextureCache::ScheduleActiveTextureCapture(
+    const D3D12Shader::TextureBinding& host_shader_binding, TextureCaptureReadback& capture_out,
+    uint64_t max_readback_bytes) {
+  capture_out = {};
+  const uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  if (!AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension) ||
+      binding->key.dimension != xenos::DataDimension::k2DOrStacked ||
+      binding->key.GetDepthOrArraySize() != 1 || binding->key.scaled_resolve) {
+    return TextureCaptureResult::kUnsupported;
+  }
+
+  Texture* texture = nullptr;
+  if (host_shader_binding.is_signed) {
+    if (!texture_util::IsAnySignSigned(binding->swizzled_signs)) {
+      return TextureCaptureResult::kUnresolved;
+    }
+    texture =
+        IsSignedVersionSeparateForFormat(binding->key) ? binding->texture_signed : binding->texture;
+  } else {
+    if (!texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
+      return TextureCaptureResult::kUnresolved;
+    }
+    texture = binding->texture;
+  }
+  if (!texture) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
+  ID3D12Resource* source = d3d12_texture->resource();
+  if (!source) {
+    return TextureCaptureResult::kFailed;
+  }
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      source_desc.DepthOrArraySize != 1 || source_desc.MipLevels == 0 ||
+      source_desc.Width > UINT32_MAX || source_desc.Height > UINT32_MAX) {
+    return TextureCaptureResult::kUnsupported;
+  }
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&source_desc, 0, 1, 0, &footprint, &row_count, &row_size,
+                                &buffer_size);
+  if (!row_count || !row_size || row_size > UINT32_MAX || buffer_size > UINT32_MAX ||
+      buffer_size > max_readback_bytes) {
+    return TextureCaptureResult::kUnsupported;
+  }
+
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return TextureCaptureResult::kFailed;
+  }
+
+  texture->MarkAsUsed();
+  const D3D12_RESOURCE_STATES previous_state =
+      d3d12_texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(source, previous_state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&destination, 0, 0, 0,
+                                                                   &source_location, nullptr);
+  d3d12_texture->SetResourceState(previous_state);
+  command_processor_.PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                           previous_state);
+  command_processor_.SubmitBarriers();
+
+  const TextureKey& key = texture->key();
+  diagnostic::DrawCaptureTexture& texture_out = capture_out.texture;
+  texture_out.guest_base_page = key.base_page;
+  texture_out.guest_mip_page = key.mip_page;
+  texture_out.guest_width = key.GetWidth();
+  texture_out.guest_height = key.GetHeight();
+  texture_out.guest_depth_or_array_size = key.GetDepthOrArraySize();
+  texture_out.guest_pitch = key.pitch;
+  texture_out.guest_format = uint32_t(key.format);
+  texture_out.guest_endianness = uint32_t(key.endianness);
+  texture_out.guest_tiled = key.tiled;
+  texture_out.guest_packed_mips = key.packed_mips;
+  texture_out.scaled_resolve = key.scaled_resolve;
+  texture_out.host_format = uint32_t(source_desc.Format);
+  texture_out.host_width = uint32_t(source_desc.Width);
+  texture_out.host_height = uint32_t(source_desc.Height);
+  texture_out.host_depth_or_array_size = source_desc.DepthOrArraySize;
+  texture_out.mip_level = 0;
+  texture_out.row_pitch = footprint.Footprint.RowPitch;
+  texture_out.row_size = uint32_t(row_size);
+  texture_out.row_count = row_count;
+  capture_out.footprint = footprint;
+  capture_out.buffer_size = uint32_t(buffer_size);
+  capture_out.buffer = std::move(capture_buffer);
+  return TextureCaptureResult::kCaptured;
 }
 
 bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(

@@ -6,9 +6,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <rex/graphics/draw_capture_mailbox.h>
 
 namespace rex::graphics::d3d12 {
 
@@ -51,6 +54,7 @@ class FrameCapture {
 
   struct HostDrawInfo {
     uint32_t used_texture_mask = 0;
+    uint32_t normalized_color_mask = 0;
     uint64_t vertex_shader_hash = 0;
     uint64_t pixel_shader_hash = 0;
     uint32_t guest_primitive_type = 0;
@@ -66,6 +70,9 @@ class FrameCapture {
     uint32_t host_shader_index_endian = 0;
     bool host_primitive_reset_enabled = false;
     uint32_t native_topology = 0;
+    uint32_t native_vertex_count = 0;
+    uint32_t native_index_count = 0;
+    bool half_pixel_offset = false;
   };
 
   class DrawScope {
@@ -78,6 +85,7 @@ class FrameCapture {
     DrawScope& operator=(DrawScope&& other) noexcept;
 
     std::string marker() const;
+    uint64_t event_id() const { return event_id_; }
     void MarkHostIssued(const HostDrawInfo& host_info);
     void MarkCopy(bool success);
     void SetResult(bool success) { success_ = success; }
@@ -105,6 +113,7 @@ class FrameCapture {
     CopyScope& operator=(CopyScope&& other) noexcept;
 
     std::string marker() const;
+    uint64_t event_id() const { return event_id_; }
     void SetResult(bool success, std::string_view mode);
 
    private:
@@ -139,15 +148,27 @@ class FrameCapture {
                             uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                             const uint32_t* registers, size_t register_count);
 
+  // Starts a device-independent journal after a completed swap. The initial
+  // swap is stored as the first completed event so consumers can verify both
+  // frame boundaries without RenderDoc or filesystem artifacts.
+  bool BeginOwnedFrame(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                       uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                       const uint32_t* registers, size_t register_count);
+  std::shared_ptr<diagnostic::DrawCaptureFrameSnapshot> TakeOwnedFrame(uint64_t end_frame,
+                                                                       uint64_t end_submission);
+  bool IsOwnedActive() const { return owned_active_; }
+
   // A successful IssueSwap/EndSubmission starts the next frame capture when
   // idle, or closes the currently captured guest frame when active.
   void OnCompletedSwap(void* device, const std::filesystem::path& requested_path,
                        uint64_t completed_frame, uint64_t completed_submission);
   void Abort(void* device, std::string_view reason);
 
-  bool IsActive() const { return state_ == State::kCapturing; }
-  bool IsIdle() const { return state_ == State::kIdle; }
-  bool HasFailed() const { return state_ == State::kFailed; }
+  bool IsActive() const { return state_ == State::kCapturing || owned_active_; }
+  bool IsIdle() const { return state_ == State::kIdle && !owned_active_; }
+  bool HasFailed() const {
+    return state_ == State::kFailed || (!owned_active_ && !failure_reason_.empty());
+  }
 
  private:
   enum class State { kIdle, kCapturing, kFinished, kFailed };
@@ -214,6 +235,11 @@ class FrameCapture {
                    bool guest_big_endian) const;
   bool WriteJournal(std::vector<std::string>& files_out);
   bool WriteManifest(bool complete, const std::vector<std::string>& files);
+  bool AppendOwnedStartSwap(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                            uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                            const uint32_t* registers, size_t register_count);
+  bool BuildOwnedFrameSnapshot(uint64_t end_frame, uint64_t end_submission,
+                               diagnostic::DrawCaptureFrameSnapshot& snapshot) const;
 
   State state_ = State::kIdle;
   std::filesystem::path output_path_;
@@ -240,6 +266,8 @@ class FrameCapture {
   int renderdoc_api_minor_ = 0;
   int renderdoc_api_patch_ = 0;
   bool artifacts_written_ = false;
+
+  bool owned_active_ = false;
 };
 
 }  // namespace rex::graphics::d3d12

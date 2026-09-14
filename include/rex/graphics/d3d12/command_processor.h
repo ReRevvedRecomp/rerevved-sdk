@@ -225,6 +225,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
 
   void PollDrawCaptureArmMarker();
+  void PollLiveFrameCaptureRequest();
   void ReportDrawCaptureSkipCounts();
   bool ScheduleDrawCapture(const PrimitiveProcessor::ProcessingResult& result,
                            xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -239,6 +240,81 @@ class D3D12CommandProcessor : public CommandProcessor {
   void AbandonDrawCaptureBuffersForTeardown();
   void RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason);
   void WriteDrawCaptureFailureManifest(const char* reason);
+
+  struct LiveFrameVertexReadback {
+    uint32_t fetch_constant = 0;
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  struct LiveFrameIndexReadback {
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  struct LiveFrameCopyReadback {
+    uint64_t event_id = 0;
+    uint32_t fetch_constant = 0;
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    std::vector<uint8_t> cpu_bytes;
+  };
+  struct LiveFrameTextureReadback {
+    diagnostic::DrawCaptureTextureUse use;
+    D3D12TextureCache::TextureCaptureReadback capture;
+  };
+  struct LiveFrameDraw {
+    uint64_t event_id = 0;
+    bool texture_bindings_complete = true;
+    std::vector<LiveFrameVertexReadback> vertex_fetches;
+    std::optional<LiveFrameIndexReadback> index;
+    std::vector<LiveFrameTextureReadback> textures;
+  };
+  struct LiveFrameTextureReadbackSurface {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    uint32_t row_count = 0;
+    uint32_t row_size = 0;
+    uint32_t buffer_size = 0;
+  };
+  struct LiveFrameCapture {
+    diagnostic::DrawCaptureMailbox::Token mailbox_token;
+    std::vector<LiveFrameDraw> draws;
+    std::vector<LiveFrameCopyReadback> copies;
+    LiveFrameTextureReadbackSurface source;
+    LiveFrameTextureReadbackSurface output;
+    uint64_t source_submission = 0;
+    uint64_t output_submission = 0;
+    uint64_t readback_bytes = 0;
+    uint64_t frontbuffer_ptr = 0;
+    uint32_t source_format = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t output_format = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    diagnostic::DrawCaptureGamma gamma;
+  };
+
+  bool ScheduleLiveFrameDraw(uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
+                             const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader,
+                             D3D12Shader* pixel_shader, uint32_t used_texture_mask,
+                             bool memexport_used, bool pixel_shader_was_bound);
+  bool ScheduleLiveFrameCopy(uint64_t event_id);
+  bool ScheduleLiveFrameSwapSource(ID3D12Resource* source, DXGI_FORMAT format, uint32_t width,
+                                   uint32_t height);
+  bool ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width, uint32_t height);
+  bool BeginLiveFrameCapture(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                             uint32_t frontbuffer_width, uint32_t frontbuffer_height);
+  bool ReadLiveFrameSurface(const LiveFrameTextureReadbackSurface& surface,
+                            std::vector<uint8_t>& bytes) const;
+  bool ReadLiveFrameBuffer(ID3D12Resource* buffer, uint32_t size,
+                           std::vector<uint8_t>& bytes) const;
+  void FinalizeLiveFrameCapture(uint64_t completed_frame, uint64_t completed_submission);
+  void FailLiveFrameCapture(const char* reason);
+  void RetainLiveFrameBuffersForRetry();
+  void AbandonLiveFrameBuffersForTeardown();
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -659,6 +735,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::array<uint32_t, size_t(diagnostic::DrawCaptureSkipReason::kCount)>
       draw_capture_skip_counts_{};
   uint32_t draw_capture_skip_reports_remaining_ = 0;
+
+  bool live_frame_capture_armed_ = false;
+  diagnostic::DrawCaptureMailbox::Token live_frame_capture_armed_mailbox_token_;
+  std::optional<LiveFrameCapture> live_frame_capture_;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

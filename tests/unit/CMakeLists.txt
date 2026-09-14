@@ -36,6 +36,7 @@ add_executable(unit_tests
 
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
 )
@@ -43,6 +44,7 @@ target_sources(unit_tests PRIVATE
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
+    ${REXGLUE_ROOT}/thirdparty/renderdoc
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

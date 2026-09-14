@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/draw_capture_mailbox.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
@@ -95,6 +97,26 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
+
+  // Schedules a fence-owned copy of the currently selected 2D texture binding
+  // at the point of use. The source resource is transitioned back to its
+  // tracked state before returning; the caller owns the readback until its
+  // submission fence completes.
+  struct TextureCaptureReadback {
+    diagnostic::DrawCaptureTexture texture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    uint32_t buffer_size = 0;
+  };
+  enum class TextureCaptureResult : uint32_t {
+    kCaptured,
+    kUnresolved,
+    kUnsupported,
+    kFailed,
+  };
+  TextureCaptureResult ScheduleActiveTextureCapture(
+      const D3D12Shader::TextureBinding& host_shader_binding, TextureCaptureReadback& capture_out,
+      uint64_t max_readback_bytes);
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

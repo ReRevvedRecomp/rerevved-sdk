@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -74,6 +75,8 @@ REXCVAR_DEFINE_STRING(d3d12_capture_frame, "", "GPU/D3D12",
 namespace rex::graphics::d3d12 {
 
 namespace {
+
+constexpr uint64_t kLiveFrameMaxReadbackBytes = UINT64_C(512) * 1024 * 1024;
 
 bool CreateDiagnosticCaptureParent(const std::filesystem::path& path, const char* name) {
   const std::filesystem::path parent = path.parent_path();
@@ -279,6 +282,60 @@ void D3D12CommandProcessor::PollDrawCaptureArmMarker() {
   draw_capture_skip_reports_remaining_ = 4;
   REXGPU_INFO("D3D12 draw capture armed from marker {}", rex::path_to_utf8(marker));
 }
+
+void D3D12CommandProcessor::PollLiveFrameCaptureRequest() {
+  if (live_frame_capture_armed_ || live_frame_capture_) {
+    return;
+  }
+  const diagnostic::DrawCaptureMailbox::Token token =
+      diagnostic::GetDrawCaptureMailbox()->GetFrameRequestToken();
+  if (!token) {
+    return;
+  }
+  live_frame_capture_armed_ = true;
+  live_frame_capture_armed_mailbox_token_ = token;
+  REXGPU_INFO("D3D12 owned frame capture armed for mailbox token {}", token.value);
+}
+
+bool D3D12CommandProcessor::BeginLiveFrameCapture(uint64_t frame, uint64_t submission,
+                                                  uint64_t frontbuffer_ptr,
+                                                  uint32_t frontbuffer_width,
+                                                  uint32_t frontbuffer_height) {
+  if (!live_frame_capture_armed_ || live_frame_capture_) {
+    return false;
+  }
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (!mailbox->IsPending(live_frame_capture_armed_mailbox_token_)) {
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+  const auto path = mailbox->GetRequestPath(live_frame_capture_armed_mailbox_token_);
+  const auto claimed = mailbox->ClaimFrame(live_frame_capture_armed_mailbox_token_, path);
+  if (!claimed || !frame_capture_->BeginOwnedFrame(
+                      frame, submission, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+                      register_file_->values, RegisterFile::kRegisterCount)) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+  try {
+    LiveFrameCapture capture;
+    capture.mailbox_token = claimed;
+    capture.frontbuffer_ptr = frontbuffer_ptr;
+    live_frame_capture_ = std::move(capture);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return true;
+  } catch (const std::bad_alloc&) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "owned_frame_allocation");
+    mailbox->Fail(claimed);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+}
 void D3D12CommandProcessor::RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason) {
   const size_t index = size_t(reason);
   if (index >= draw_capture_skip_counts_.size()) {
@@ -327,13 +384,99 @@ void D3D12CommandProcessor::RetainDrawCaptureBuffersForRetry() {
     retain(readback.buffer);
   }
 }
+
+void D3D12CommandProcessor::RetainLiveFrameBuffersForRetry() {
+  if (!live_frame_capture_) {
+    return;
+  }
+  auto retain = [this](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (buffer) {
+      submission_retry_resources_.push_back(std::move(buffer));
+    }
+  };
+  for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+    for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+      retain(readback.buffer);
+    }
+    if (draw.index) {
+      retain(draw.index->buffer);
+    }
+    for (LiveFrameTextureReadback& texture : draw.textures) {
+      retain(texture.capture.buffer);
+    }
+  }
+  for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+    retain(copy.buffer);
+  }
+  retain(live_frame_capture_->source.buffer);
+  retain(live_frame_capture_->output.buffer);
+}
+
+void D3D12CommandProcessor::FailLiveFrameCapture(const char* reason) {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (live_frame_capture_) {
+    const diagnostic::DrawCaptureMailbox::Token token = live_frame_capture_->mailbox_token;
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), reason ? reason : "owned_frame_failed");
+    RetainLiveFrameBuffersForRetry();
+    live_frame_capture_.reset();
+    if (token) {
+      mailbox->Fail(token);
+    }
+  }
+  if (live_frame_capture_armed_) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+  }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
+  if (reason) {
+    REXGPU_ERROR("D3D12 owned frame capture failed: {}", reason);
+  }
+}
+
+void D3D12CommandProcessor::AbandonLiveFrameBuffersForTeardown() {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (live_frame_capture_) {
+    mailbox->Fail(live_frame_capture_->mailbox_token);
+    auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
+    for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+      for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+        abandon(readback.buffer);
+      }
+      if (draw.index) {
+        abandon(draw.index->buffer);
+      }
+      for (LiveFrameTextureReadback& texture : draw.textures) {
+        abandon(texture.capture.buffer);
+      }
+    }
+    for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+      abandon(copy.buffer);
+    }
+    abandon(live_frame_capture_->source.buffer);
+    abandon(live_frame_capture_->output.buffer);
+    live_frame_capture_.reset();
+  }
+  if (live_frame_capture_armed_) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+  }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
+}
+
 void D3D12CommandProcessor::FailPendingDrawCaptureMailbox() {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
   if (draw_capture_pending_ && draw_capture_pending_->mailbox_token) {
-    diagnostic::GetDrawCaptureMailbox()->Fail(draw_capture_pending_->mailbox_token);
+    mailbox->Fail(draw_capture_pending_->mailbox_token);
+  }
+  if (draw_capture_armed_mailbox_token_) {
+    mailbox->Fail(draw_capture_armed_mailbox_token_);
+    draw_capture_armed_mailbox_token_ = {};
+    draw_capture_armed_ = false;
+    draw_capture_disarmed_ = true;
   }
 }
 void D3D12CommandProcessor::AbandonDrawCaptureBuffersForTeardown() {
-  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
+  FailPendingDrawCaptureMailbox();
   if (draw_capture_pending_) {
     auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
     abandon(draw_capture_pending_->edram_before.buffer);
@@ -1940,7 +2083,8 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
-  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
+  FailPendingDrawCaptureMailbox();
+  FailLiveFrameCapture("shutdown_before_completed_swap");
   frame_capture_->Abort(device, "shutdown_before_completed_swap");
   const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
   const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
@@ -1948,10 +2092,13 @@ void D3D12CommandProcessor::ShutdownContext() {
     REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
     // Keep capture readbacks alive when the queue may still reference them. The detached
     // COM references remain valid until process/device teardown rather than being released here.
+    AbandonLiveFrameBuffersForTeardown();
     AbandonDrawCaptureBuffersForTeardown();
     CommandProcessor::ShutdownContext();
     return;
   }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2225,15 +2372,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   if (!graphics_system_) {
     FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("graphics_system_unavailable");
     frame_capture_->Abort(nullptr, "graphics_system_unavailable");
     return;
   }
   PollDrawCaptureArmMarker();
+  PollLiveFrameCaptureRequest();
   ReportDrawCaptureSkipCounts();
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("IssueSwap: presenter is null");
     FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("presenter_unavailable");
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "presenter_unavailable");
     return;
   }
@@ -2243,6 +2393,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
     FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("begin_submission_failure");
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     return;
   }
@@ -2292,10 +2443,19 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("swap_texture_unavailable");
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "swap_texture_unavailable");
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+  if (live_frame_capture_) {
+    live_frame_capture_->frontbuffer_ptr = frontbuffer_ptr;
+    if (!ScheduleLiveFrameSwapSource(
+            swap_texture_resource, static_cast<DXGI_FORMAT>(swap_texture_desc.Format),
+            uint32_t(swap_texture_desc.Width), uint32_t(swap_texture_desc.Height))) {
+      FailLiveFrameCapture("owned_swap_source_capture_failed");
+    }
+  }
 
   Microsoft::WRL::ComPtr<ID3D12Resource> swap_texture_capture_buffer;
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT swap_texture_capture_footprint = {};
@@ -2431,7 +2591,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height, &record_swap_marker,
+       guest_output_height, frontbuffer_ptr, &record_swap_marker,
        &swap_submission_failed](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
@@ -2489,6 +2649,26 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        if (live_frame_capture_) {
+          try {
+            live_frame_capture_->frontbuffer_ptr = frontbuffer_ptr;
+            live_frame_capture_->gamma.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
+            live_frame_capture_->gamma.use_fxaa = use_fxaa;
+            live_frame_capture_->gamma.is_8bpc = !use_pwl_gamma_ramp && !use_fxaa;
+            live_frame_capture_->gamma.source_format = uint32_t(frontbuffer_format);
+            live_frame_capture_->gamma.gamma_256.resize(256);
+            for (size_t i = 0; i < live_frame_capture_->gamma.gamma_256.size(); ++i) {
+              live_frame_capture_->gamma.gamma_256[i] = gamma_ramp_256_entry_table()[i].value;
+            }
+            live_frame_capture_->gamma.gamma_pwl_rgb.resize(128 * 3);
+            for (size_t i = 0; i < live_frame_capture_->gamma.gamma_pwl_rgb.size(); ++i) {
+              live_frame_capture_->gamma.gamma_pwl_rgb[i] = gamma_ramp_pwl_rgb()[i].value;
+            }
+          } catch (const std::bad_alloc&) {
+            FailLiveFrameCapture("owned_gamma_capture_allocation");
+            return false;
+          }
+        }
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2691,6 +2871,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
+        if (live_frame_capture_) {
+          if (!ScheduleLiveFrameSwapOutput(guest_output_resource, guest_output_width,
+                                           guest_output_height)) {
+            FailLiveFrameCapture("owned_swap_output_capture_failed");
+            return false;
+          }
+          live_frame_capture_->gamma.output_format = live_frame_capture_->output_format;
+          live_frame_capture_->gamma.output_width = guest_output_width;
+          live_frame_capture_->gamma.output_height = guest_output_height;
+        }
         record_swap_marker();
         const bool submission_result = EndSubmission(true);
         swap_submission_failed |= !submission_result;
@@ -2704,6 +2894,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (!outer_submission_succeeded || swap_submission_failed) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
     FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("submission_failure");
     RetainDrawCaptureBuffersForRetry();
     if (draw_capture_pending_) {
       RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
@@ -2722,6 +2913,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   }
 
+  bool swap_boundary_fence_succeeded = true;
   std::filesystem::path frame_capture_path;
   const std::string frame_capture_path_utf8 = REXCVAR_GET(d3d12_capture_frame);
   if (frame_capture_->IsIdle() && !frame_capture_path_utf8.empty()) {
@@ -2735,11 +2927,27 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (frame_capture_->IsActive() || !frame_capture_path.empty()) {
     // Both captured boundaries must own completed guest work. A successful
     // submission alone does not establish that its GPU execution succeeded.
-    if (CheckSubmissionFence(submission_current_ - 1)) {
+    swap_boundary_fence_succeeded = CheckSubmissionFence(submission_current_ - 1);
+    if (swap_boundary_fence_succeeded) {
       frame_capture_->OnCompletedSwap(GetD3D12Provider().GetDevice(), frame_capture_path,
                                       frame_current_, submission_current_);
     } else {
       frame_capture_->Abort(GetD3D12Provider().GetDevice(), "frame_boundary_fence_failure");
+    }
+  }
+
+  if (live_frame_capture_) {
+    if (swap_boundary_fence_succeeded) {
+      FinalizeLiveFrameCapture(frame_current_, submission_current_);
+    } else {
+      FailLiveFrameCapture("frame_boundary_fence_failure");
+    }
+  } else if (live_frame_capture_armed_) {
+    if (swap_boundary_fence_succeeded && CheckSubmissionFence(submission_current_ - 1)) {
+      BeginLiveFrameCapture(frame_current_, submission_current_, frontbuffer_ptr, frontbuffer_width,
+                            frontbuffer_height);
+    } else {
+      FailLiveFrameCapture("frame_boundary_fence_failure");
     }
   }
 
@@ -3027,6 +3235,547 @@ bool D3D12CommandProcessor::ScheduleDrawCapture(
   draw_capture_pending_ = std::move(capture);
   return true;
 }
+
+bool D3D12CommandProcessor::ScheduleLiveFrameDraw(
+    uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
+    const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
+    uint32_t used_texture_mask, bool memexport_used, bool pixel_shader_was_bound) {
+  if (!live_frame_capture_ || !event_id || !vertex_shader ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+      texture_cache_->draw_resolution_scale_x() != 1 ||
+      texture_cache_->draw_resolution_scale_y() != 1 || memexport_used ||
+      result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted ||
+      result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto ||
+      result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
+    return false;
+  }
+  LiveFrameCapture& frame = *live_frame_capture_;
+  LiveFrameDraw capture;
+  capture.event_id = event_id;
+  capture.texture_bindings_complete = !pixel_shader_was_bound || pixel_shader != nullptr;
+  bool moved_to_frame = false;
+  auto fail = [&]() {
+    if (!moved_to_frame) {
+      frame.draws.push_back(std::move(capture));
+      moved_to_frame = true;
+    }
+    return false;
+  };
+  auto reserve_readback = [&frame](uint64_t size) {
+    if (!size || size > kLiveFrameMaxReadbackBytes - frame.readback_bytes) {
+      return false;
+    }
+    frame.readback_bytes += size;
+    return true;
+  };
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto create_readback = [device](uint32_t size, Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (!size) {
+      return false;
+    }
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_NONE);
+    return SUCCEEDED(device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)));
+  };
+
+  try {
+    uint64_t geometry_size = 0;
+    std::vector<diagnostic::DrawCaptureRange> geometry_ranges;
+    const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+    const RegisterFile& regs = *register_file_;
+    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+      uint32_t fetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+      uint32_t bit;
+      while (rex::bit_scan_forward(fetch_bits_remaining, &bit)) {
+        fetch_bits_remaining &= ~(uint32_t(1) << bit);
+        const uint32_t fetch_constant_index = i * 32 + bit;
+        const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_constant_index);
+        if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
+          return fail();
+        }
+        diagnostic::DrawCaptureRange range;
+        if (!diagnostic::AppendDrawCaptureRange(
+                uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+                SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes,
+                geometry_ranges, geometry_size)) {
+          return fail();
+        }
+        if (!diagnostic::ValidateDrawCaptureRange(
+                uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+                SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes, range)) {
+          return fail();
+        }
+        if (!reserve_readback(range.size)) {
+          return fail();
+        }
+        LiveFrameVertexReadback readback;
+        readback.fetch_constant = fetch_constant_index;
+        readback.base = range.base;
+        readback.size = range.size;
+        if (!create_readback(readback.size, readback.buffer)) {
+          return fail();
+        }
+        capture.vertex_fetches.push_back(std::move(readback));
+      }
+    }
+
+    if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+      if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+          !index_buffer_info || !result.guest_draw_vertex_count ||
+          (index_buffer_info->format != xenos::IndexFormat::kInt16 &&
+           index_buffer_info->format != xenos::IndexFormat::kInt32) ||
+          index_buffer_info->guest_base != result.guest_index_base) {
+        return fail();
+      }
+      const uint64_t index_element_size = index_buffer_info->format == xenos::IndexFormat::kInt16
+                                              ? sizeof(uint16_t)
+                                              : sizeof(uint32_t);
+      const uint64_t index_size = uint64_t(result.guest_draw_vertex_count) * index_element_size;
+      if (index_size > UINT32_MAX || index_buffer_info->length < index_size ||
+          index_buffer_info->count < result.guest_draw_vertex_count) {
+        return fail();
+      }
+      diagnostic::DrawCaptureRange range;
+      if (!diagnostic::ValidateDrawCaptureRange(
+              result.guest_index_base, index_size, SharedMemory::kBufferSize,
+              diagnostic::kDrawCaptureMaxGeometryBytes - geometry_size, range) ||
+          !reserve_readback(range.size)) {
+        return fail();
+      }
+      LiveFrameIndexReadback readback;
+      readback.base = range.base;
+      readback.size = range.size;
+      if (!create_readback(readback.size, readback.buffer)) {
+        return fail();
+      }
+      capture.index = std::move(readback);
+    }
+
+    if (!capture.vertex_fetches.empty() || capture.index) {
+      shared_memory_->UseAsCopySource();
+      SubmitBarriers();
+      for (const LiveFrameVertexReadback& readback : capture.vertex_fetches) {
+        deferred_command_list_.D3DCopyBufferRegion(
+            readback.buffer.Get(), 0, shared_memory_->GetBuffer(), readback.base, readback.size);
+      }
+      if (capture.index) {
+        deferred_command_list_.D3DCopyBufferRegion(capture.index->buffer.Get(), 0,
+                                                   shared_memory_->GetBuffer(), capture.index->base,
+                                                   capture.index->size);
+      }
+      shared_memory_->UseForReading();
+      SubmitBarriers();
+    }
+
+    auto append_texture_uses = [&](uint32_t stage,
+                                   const std::vector<D3D12Shader::TextureBinding>& texture_bindings,
+                                   const std::vector<D3D12Shader::SamplerBinding>& samplers) {
+      for (size_t binding_index = 0; binding_index < texture_bindings.size(); ++binding_index) {
+        const D3D12Shader::TextureBinding& binding = texture_bindings[binding_index];
+        diagnostic::DrawCaptureTextureUse use;
+        use.stage = stage;
+        use.shader_binding_index = uint32_t(binding_index);
+        use.fetch_constant = binding.fetch_constant;
+        use.dimension = uint32_t(binding.dimension);
+        use.is_signed = binding.is_signed;
+        use.host_swizzle = texture_cache_->GetActiveTextureHostSwizzle(binding.fetch_constant);
+        use.swizzled_signs = texture_cache_->GetActiveTextureSwizzledSigns(binding.fetch_constant);
+        // The active host swizzle already includes the guest fetch swizzle.
+        use.component_mapping =
+            use.host_swizzle |
+            D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        for (size_t sampler_index = 0; sampler_index < samplers.size(); ++sampler_index) {
+          if (samplers[sampler_index].fetch_constant == binding.fetch_constant) {
+            use.sampler_value = texture_cache_->GetSamplerParameters(samplers[sampler_index]).value;
+            break;
+          }
+        }
+        LiveFrameTextureReadback texture_readback;
+        texture_readback.use = use;
+        const uint64_t remaining_readback_bytes =
+            frame.readback_bytes <= kLiveFrameMaxReadbackBytes
+                ? kLiveFrameMaxReadbackBytes - frame.readback_bytes
+                : 0;
+        const D3D12TextureCache::TextureCaptureResult result =
+            texture_cache_->ScheduleActiveTextureCapture(binding, texture_readback.capture,
+                                                         remaining_readback_bytes);
+        if (result == D3D12TextureCache::TextureCaptureResult::kUnsupported ||
+            result == D3D12TextureCache::TextureCaptureResult::kFailed) {
+          return false;
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kCaptured) {
+          if (!reserve_readback(texture_readback.capture.buffer_size)) {
+            capture.textures.push_back(std::move(texture_readback));
+            return false;
+          }
+          capture.textures.push_back(std::move(texture_readback));
+          capture.textures.back().use.data_available = true;
+        } else {
+          capture.textures.push_back(std::move(texture_readback));
+        }
+      }
+      return true;
+    };
+    if (!append_texture_uses(0, vertex_shader->GetTextureBindingsAfterTranslation(),
+                             vertex_shader->GetSamplerBindingsAfterTranslation()) ||
+        (pixel_shader &&
+         !append_texture_uses(1, pixel_shader->GetTextureBindingsAfterTranslation(),
+                              pixel_shader->GetSamplerBindingsAfterTranslation()))) {
+      return fail();
+    }
+    if (pixel_shader_was_bound && !pixel_shader) {
+      capture.texture_bindings_complete = false;
+    }
+    (void)used_texture_mask;
+    frame.draws.push_back(std::move(capture));
+    moved_to_frame = true;
+    return true;
+  } catch (const std::bad_alloc&) {
+    return fail();
+  }
+}
+
+bool D3D12CommandProcessor::ScheduleLiveFrameCopy(uint64_t event_id) {
+  if (!live_frame_capture_ || !event_id) {
+    return false;
+  }
+  const xenos::xe_gpu_vertex_fetch_t fetch = register_file_->GetVertexFetch(0);
+  if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size ||
+      fetch.size > diagnostic::kDrawCaptureMaxGeometryBytes / sizeof(uint32_t) ||
+      live_frame_capture_->readback_bytes >
+          kLiveFrameMaxReadbackBytes - uint64_t(fetch.size) * sizeof(uint32_t)) {
+    return false;
+  }
+  const uint64_t byte_address = uint64_t(fetch.address) * sizeof(uint32_t);
+  const uint64_t byte_size = uint64_t(fetch.size) * sizeof(uint32_t);
+  if (byte_address > SharedMemory::kBufferSize ||
+      byte_size > SharedMemory::kBufferSize - byte_address || byte_size > UINT32_MAX) {
+    return false;
+  }
+  const void* source = memory_->TranslatePhysical(uint32_t(byte_address));
+  if (!source) {
+    return false;
+  }
+  try {
+    LiveFrameCopyReadback capture;
+    capture.event_id = event_id;
+    capture.fetch_constant = 0;
+    capture.base = uint32_t(byte_address);
+    capture.size = uint32_t(byte_size);
+    capture.cpu_bytes.resize(capture.size);
+    std::memcpy(capture.cpu_bytes.data(), source, capture.size);
+    live_frame_capture_->readback_bytes += capture.size;
+    live_frame_capture_->copies.push_back(std::move(capture));
+    return true;
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
+}
+
+bool D3D12CommandProcessor::ScheduleLiveFrameSwapSource(ID3D12Resource* source, DXGI_FORMAT format,
+                                                        uint32_t width, uint32_t height) {
+  if (!live_frame_capture_ || !source || live_frame_capture_->source.buffer) {
+    return false;
+  }
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      source_desc.DepthOrArraySize != 1 || source_desc.MipLevels == 0 ||
+      source_desc.Width > UINT32_MAX || source_desc.Height > UINT32_MAX) {
+    return false;
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&source_desc, 0, 1, 0, &footprint, &row_count, &row_size,
+                                &buffer_size);
+  if (!row_count || !row_size || row_size > UINT32_MAX || buffer_size > UINT32_MAX ||
+      buffer_size > kLiveFrameMaxReadbackBytes - live_frame_capture_->readback_bytes) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return false;
+  }
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  deferred_command_list_.D3DCopyTextureRegion(&destination, 0, 0, 0, &source_location, nullptr);
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+  live_frame_capture_->readback_bytes += buffer_size;
+  live_frame_capture_->source.buffer = std::move(capture_buffer);
+  live_frame_capture_->source.footprint = footprint;
+  live_frame_capture_->source.row_count = row_count;
+  live_frame_capture_->source.row_size = uint32_t(row_size);
+  live_frame_capture_->source.buffer_size = uint32_t(buffer_size);
+  live_frame_capture_->source_submission = submission_current_;
+  live_frame_capture_->source_format = uint32_t(format);
+  live_frame_capture_->source_width = width;
+  live_frame_capture_->source_height = height;
+  return true;
+}
+
+bool D3D12CommandProcessor::ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width,
+                                                        uint32_t height) {
+  if (!live_frame_capture_ || !output || live_frame_capture_->output.buffer) {
+    return false;
+  }
+  const D3D12_RESOURCE_DESC output_desc = output->GetDesc();
+  if (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      output_desc.DepthOrArraySize != 1 || output_desc.MipLevels == 0 ||
+      output_desc.Width > UINT32_MAX || output_desc.Height > UINT32_MAX) {
+    return false;
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&output_desc, 0, 1, 0, &footprint, &row_count, &row_size,
+                                &buffer_size);
+  if (!row_count || !row_size || row_size > UINT32_MAX || buffer_size > UINT32_MAX ||
+      buffer_size > kLiveFrameMaxReadbackBytes - live_frame_capture_->readback_bytes) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return false;
+  }
+  PushTransitionBarrier(output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = output;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  deferred_command_list_.D3DCopyTextureRegion(&destination, 0, 0, 0, &source_location, nullptr);
+  PushTransitionBarrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  SubmitBarriers();
+  live_frame_capture_->readback_bytes += buffer_size;
+  live_frame_capture_->output.buffer = std::move(capture_buffer);
+  live_frame_capture_->output.footprint = footprint;
+  live_frame_capture_->output.row_count = row_count;
+  live_frame_capture_->output.row_size = uint32_t(row_size);
+  live_frame_capture_->output.buffer_size = uint32_t(buffer_size);
+  live_frame_capture_->output_submission = submission_current_;
+  live_frame_capture_->output_format = uint32_t(output_desc.Format);
+  live_frame_capture_->output_width = width;
+  live_frame_capture_->output_height = height;
+  return true;
+}
+
+bool D3D12CommandProcessor::ReadLiveFrameBuffer(ID3D12Resource* buffer, uint32_t size,
+                                                std::vector<uint8_t>& bytes) const {
+  if (!buffer || !size) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, size};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  try {
+    bytes.assign(static_cast<const uint8_t*>(mapping), static_cast<const uint8_t*>(mapping) + size);
+  } catch (const std::bad_alloc&) {
+    const D3D12_RANGE write_range = {0, 0};
+    buffer->Unmap(0, &write_range);
+    return false;
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  buffer->Unmap(0, &write_range);
+  return true;
+}
+
+bool D3D12CommandProcessor::ReadLiveFrameSurface(const LiveFrameTextureReadbackSurface& surface,
+                                                 std::vector<uint8_t>& bytes) const {
+  if (!surface.buffer || !surface.row_count || !surface.row_size ||
+      uint64_t(surface.row_size) * surface.row_count > UINT32_MAX) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, surface.buffer_size};
+  void* mapping = nullptr;
+  if (FAILED(surface.buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  try {
+    bytes.resize(size_t(surface.row_size) * surface.row_count);
+    const uint8_t* mapped = static_cast<const uint8_t*>(mapping) + surface.footprint.Offset;
+    for (uint32_t row = 0; row < surface.row_count; ++row) {
+      std::memcpy(bytes.data() + size_t(row) * surface.row_size,
+                  mapped + size_t(row) * surface.footprint.Footprint.RowPitch, surface.row_size);
+    }
+  } catch (const std::bad_alloc&) {
+    const D3D12_RANGE write_range = {0, 0};
+    surface.buffer->Unmap(0, &write_range);
+    return false;
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  surface.buffer->Unmap(0, &write_range);
+  return true;
+}
+
+void D3D12CommandProcessor::FinalizeLiveFrameCapture(uint64_t completed_frame,
+                                                     uint64_t completed_submission) {
+  if (!live_frame_capture_) {
+    return;
+  }
+  if (!live_frame_capture_->source.buffer || !live_frame_capture_->output.buffer) {
+    FailLiveFrameCapture("owned_frame_swap_readback_missing");
+    return;
+  }
+
+  const diagnostic::DrawCaptureMailbox::Token mailbox_token = live_frame_capture_->mailbox_token;
+  std::shared_ptr<diagnostic::DrawCaptureFrameSnapshot> snapshot =
+      frame_capture_->TakeOwnedFrame(completed_frame, completed_submission);
+  if (!snapshot) {
+    FailLiveFrameCapture("owned_frame_journal_failed");
+    return;
+  }
+
+  auto find_event = [&snapshot](uint64_t event_id) {
+    return std::find_if(snapshot->events.begin(), snapshot->events.end(),
+                        [event_id](const diagnostic::DrawCaptureFrameEvent& event) {
+                          return event.id == event_id;
+                        });
+  };
+  auto fail = [this](const char* reason) { FailLiveFrameCapture(reason); };
+  try {
+    for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+      auto event = find_event(draw.event_id);
+      if (event == snapshot->events.end() ||
+          event->kind != diagnostic::DrawCaptureFrameEvent::Kind::kDraw) {
+        fail("owned_draw_event_missing");
+        return;
+      }
+      event->draw.texture_bindings_complete = draw.texture_bindings_complete;
+      for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+        diagnostic::DrawCaptureVertexFetch& fetch = event->draw.draw.vertex_fetches.emplace_back();
+        fetch.fetch_constant = readback.fetch_constant;
+        fetch.base = readback.base;
+        if (!ReadLiveFrameBuffer(readback.buffer.Get(), readback.size, fetch.bytes)) {
+          fail("owned_vertex_readback_failed");
+          return;
+        }
+        readback.buffer.Reset();
+      }
+      if (draw.index) {
+        event->draw.draw.index.present = true;
+        event->draw.draw.index.guest_base = draw.index->base;
+        event->draw.draw.guest_index_size = draw.index->size;
+        if (!ReadLiveFrameBuffer(draw.index->buffer.Get(), draw.index->size,
+                                 event->draw.draw.index.bytes)) {
+          fail("owned_index_readback_failed");
+          return;
+        }
+        draw.index->buffer.Reset();
+      }
+      for (LiveFrameTextureReadback& texture : draw.textures) {
+        if (texture.capture.buffer) {
+          const uint32_t texture_index = uint32_t(snapshot->textures.size());
+          diagnostic::DrawCaptureTexture& texture_snapshot =
+              snapshot->textures.emplace_back(std::move(texture.capture.texture));
+          LiveFrameTextureReadbackSurface texture_surface;
+          texture_surface.buffer = texture.capture.buffer;
+          texture_surface.footprint = texture.capture.footprint;
+          texture_surface.row_count = texture_snapshot.row_count;
+          texture_surface.row_size = texture_snapshot.row_size;
+          texture_surface.buffer_size = texture.capture.buffer_size;
+          if (!ReadLiveFrameSurface(texture_surface, texture_snapshot.bytes)) {
+            fail("owned_texture_readback_failed");
+            return;
+          }
+          texture.capture.buffer.Reset();
+          texture.use.texture_index = texture_index;
+        }
+        event->draw.texture_uses.push_back(texture.use);
+      }
+    }
+
+    for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+      auto event = find_event(copy.event_id);
+      if (event == snapshot->events.end() ||
+          event->kind != diagnostic::DrawCaptureFrameEvent::Kind::kCopy) {
+        fail("owned_copy_event_missing");
+        return;
+      }
+      diagnostic::DrawCaptureVertexFetch& fetch = event->draw.draw.vertex_fetches.emplace_back();
+      fetch.fetch_constant = copy.fetch_constant;
+      fetch.base = copy.base;
+      fetch.bytes = std::move(copy.cpu_bytes);
+    }
+
+    diagnostic::DrawCaptureFinalSwap& final_swap = snapshot->final_swap;
+    final_swap.frontbuffer_ptr = live_frame_capture_->frontbuffer_ptr;
+    final_swap.source_format = live_frame_capture_->source_format;
+    final_swap.source_width = live_frame_capture_->source_width;
+    final_swap.source_height = live_frame_capture_->source_height;
+    final_swap.source_row_pitch = live_frame_capture_->source.footprint.Footprint.RowPitch;
+    final_swap.source_row_size = live_frame_capture_->source.row_size;
+    final_swap.source_row_count = live_frame_capture_->source.row_count;
+    if (!ReadLiveFrameSurface(live_frame_capture_->source, final_swap.source_bytes)) {
+      fail("owned_swap_source_readback_failed");
+      return;
+    }
+    live_frame_capture_->source.buffer.Reset();
+
+    final_swap.output_format = live_frame_capture_->output_format;
+    final_swap.output_width = live_frame_capture_->output_width;
+    final_swap.output_height = live_frame_capture_->output_height;
+    final_swap.output_row_pitch = live_frame_capture_->output.footprint.Footprint.RowPitch;
+    final_swap.output_row_size = live_frame_capture_->output.row_size;
+    final_swap.output_row_count = live_frame_capture_->output.row_count;
+    if (!ReadLiveFrameSurface(live_frame_capture_->output, final_swap.output_bytes)) {
+      fail("owned_swap_output_readback_failed");
+      return;
+    }
+    live_frame_capture_->output.buffer.Reset();
+    final_swap.gamma = std::move(live_frame_capture_->gamma);
+  } catch (const std::bad_alloc&) {
+    fail("owned_frame_snapshot_allocation");
+    return;
+  }
+
+  if (!diagnostic::GetDrawCaptureMailbox()->PublishFrame(mailbox_token, std::move(snapshot))) {
+    diagnostic::GetDrawCaptureMailbox()->Fail(mailbox_token);
+    live_frame_capture_.reset();
+    REXGPU_WARN("D3D12 owned frame capture was cancelled before publication");
+    return;
+  }
+  live_frame_capture_.reset();
+  REXGPU_INFO("D3D12 owned frame capture published at frame {}, submission {}", completed_frame,
+              completed_submission);
+}
+
 void D3D12CommandProcessor::FinalizeDrawCapture() {
   if (!draw_capture_pending_) {
     return;
@@ -3367,18 +4116,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   D3D12Shader* active_pixel_shader_at_entry = static_cast<D3D12Shader*>(active_pixel_shader());
   FrameCapture::ShaderView vertex_shader_at_entry;
   FrameCapture::DrawScope draw_frame_capture;
-  if (frame_capture_->IsActive() && active_vertex_shader_at_entry) {
-    vertex_shader_at_entry.present = true;
-    vertex_shader_at_entry.hash = active_vertex_shader_at_entry->ucode_data_hash();
-    vertex_shader_at_entry.dwords = active_vertex_shader_at_entry->ucode_dwords();
-    vertex_shader_at_entry.dword_count = active_vertex_shader_at_entry->ucode_dword_count();
+  if (frame_capture_->IsActive()) {
+    if (active_vertex_shader_at_entry) {
+      vertex_shader_at_entry.present = true;
+      vertex_shader_at_entry.hash = active_vertex_shader_at_entry->ucode_data_hash();
+      vertex_shader_at_entry.dwords = active_vertex_shader_at_entry->ucode_dwords();
+      vertex_shader_at_entry.dword_count = active_vertex_shader_at_entry->ucode_dword_count();
+    }
   }
   FrameCapture::ShaderView pixel_shader_at_entry;
-  if (frame_capture_->IsActive() && active_pixel_shader_at_entry) {
-    pixel_shader_at_entry.present = true;
-    pixel_shader_at_entry.hash = active_pixel_shader_at_entry->ucode_data_hash();
-    pixel_shader_at_entry.dwords = active_pixel_shader_at_entry->ucode_dwords();
-    pixel_shader_at_entry.dword_count = active_pixel_shader_at_entry->ucode_dword_count();
+  if (frame_capture_->IsActive()) {
+    if (active_pixel_shader_at_entry) {
+      pixel_shader_at_entry.present = true;
+      pixel_shader_at_entry.hash = active_pixel_shader_at_entry->ucode_data_hash();
+      pixel_shader_at_entry.dwords = active_pixel_shader_at_entry->ucode_dwords();
+      pixel_shader_at_entry.dword_count = active_pixel_shader_at_entry->ucode_dword_count();
+    }
   }
   FrameCapture::IndexInfo original_index_info;
   if (frame_capture_->IsActive() && index_buffer_info) {
@@ -3396,8 +4149,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_shader_at_entry, pixel_shader_at_entry);
   }
 
-  auto finish_frame_capture_draw = [&draw_frame_capture](bool success) {
+  auto finish_frame_capture_draw = [this, &draw_frame_capture](bool success) {
     draw_frame_capture.SetResult(success);
+    if (!success && live_frame_capture_) {
+      FailLiveFrameCapture("owned_draw_early_failure");
+    }
     return success;
   };
 
@@ -3747,6 +4503,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   FrameCapture::HostDrawInfo frame_capture_host_info;
   if (!frame_capture_draw_marker.empty()) {
     frame_capture_host_info.used_texture_mask = used_texture_mask;
+    frame_capture_host_info.normalized_color_mask = normalized_color_mask;
     frame_capture_host_info.vertex_shader_hash = vertex_shader->ucode_data_hash();
     frame_capture_host_info.pixel_shader_hash =
         pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
@@ -3774,9 +4531,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     frame_capture_host_info.host_primitive_reset_enabled =
         primitive_processing_result.host_primitive_reset_enabled;
     frame_capture_host_info.native_topology = static_cast<uint32_t>(primitive_topology);
+    if (primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+      frame_capture_host_info.native_vertex_count =
+          primitive_processing_result.host_draw_vertex_count;
+    } else {
+      frame_capture_host_info.native_index_count =
+          primitive_processing_result.host_draw_vertex_count;
+    }
+    frame_capture_host_info.half_pixel_offset =
+        REXCVAR_GET(half_pixel_offset) &&
+        regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
   }
 
   bool draw_capture_selected_this_draw = false;
+  if (live_frame_capture_ && draw_frame_capture.event_id() &&
+      !ScheduleLiveFrameDraw(draw_frame_capture.event_id(), primitive_processing_result,
+                             index_buffer_info, vertex_shader, pixel_shader, used_texture_mask,
+                             memexport_used, active_pixel_shader_at_entry != nullptr)) {
+    FailLiveFrameCapture("owned_draw_capture_failed");
+    return finish_frame_capture_draw(false);
+  }
   if (draw_capture_armed_ &&
       (REXCVAR_GET(d3d12_capture_draw).empty() ||
        (draw_capture_armed_mailbox_token_ &&
@@ -4114,7 +4889,14 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   if (!BeginSubmission(true)) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
+    FailLiveFrameCapture("begin_submission_failure");
     frame_capture_copy.SetResult(false, "submission_failure");
+    return false;
+  }
+  if (live_frame_capture_ && frame_capture_copy.event_id() &&
+      !ScheduleLiveFrameCopy(frame_capture_copy.event_id())) {
+    FailLiveFrameCapture("owned_copy_capture_failed");
+    frame_capture_copy.SetResult(false, "owned_copy_capture_failed");
     return false;
   }
   const std::string frame_capture_copy_marker = frame_capture_copy.marker();
@@ -4356,6 +5138,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (device_removed_ || submission_fence_failed_) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+    FailLiveFrameCapture("fence_failure");
     return false;
   }
 
@@ -4374,6 +5157,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
           direct_queue->Signal(queue_operations_since_submission_fence_, fence_value);
       if (FAILED(signal_result)) {
         HandleFenceFailure("Out-of-submission queue operation fence Signal", signal_result, true);
+        FailLiveFrameCapture("fence_failure");
         return false;
       }
       HRESULT event_result = queue_operations_since_submission_fence_->SetEventOnCompletion(
@@ -4381,6 +5165,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       if (FAILED(event_result)) {
         HandleFenceFailure("Out-of-submission queue operation fence event arming", event_result,
                            false);
+        FailLiveFrameCapture("fence_failure");
         return false;
       }
       PROFILE_CMD_BUFFER_STALL();
@@ -4389,6 +5174,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         HRESULT wait_error =
             wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
         HandleFenceFailure("Out-of-submission queue operation fence wait", wait_error, false);
+        FailLiveFrameCapture("fence_failure");
         return false;
       }
       uint64_t queue_operations_completed =
@@ -4403,6 +5189,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                        fence_value);
           frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
         }
+        FailLiveFrameCapture("fence_failure");
         return false;
       }
       queue_operations_done_since_submission_signal_ = false;
@@ -4412,6 +5199,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   } else if (await_submission > submission_last_signaled_) {
     REXGPU_ERROR("Submission {} was not successfully signaled", await_submission);
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
+    FailLiveFrameCapture("submission_failure");
     return false;
   }
 
@@ -4419,6 +5207,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   uint64_t submission_completed = submission_fence_->GetCompletedValue();
   if (!diagnostic::IsFenceCompletionValueValid(submission_completed)) {
     HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
+    FailLiveFrameCapture("fence_failure");
     return false;
   }
   if (submission_completed < await_submission) {
@@ -4426,6 +5215,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_);
     if (FAILED(event_result)) {
       HandleFenceFailure("Submission fence event arming", event_result, false);
+      FailLiveFrameCapture("fence_failure");
       return false;
     }
     PROFILE_CMD_BUFFER_STALL();
@@ -4433,6 +5223,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (wait_result != WAIT_OBJECT_0) {
       HRESULT wait_error = wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
       HandleFenceFailure("Submission fence wait", wait_error, false);
+      FailLiveFrameCapture("fence_failure");
       return false;
     }
     submission_completed = submission_fence_->GetCompletedValue();
@@ -4443,6 +5234,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         REXGPU_ERROR("Submission fence wait completed below {}", await_submission);
         frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
       }
+      FailLiveFrameCapture("fence_failure");
       return false;
     }
   }
@@ -4505,8 +5297,9 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
                                                bool tracking_is_unrecoverable) {
   REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
-  diagnostic::GetDrawCaptureMailbox()->FailCurrent();
+  FailPendingDrawCaptureMailbox();
   frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+  FailLiveFrameCapture("fence_failure");
   submission_fence_failed_ |= tracking_is_unrecoverable;
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -4709,6 +5502,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   if (device_removed_ || submission_fence_failed_) {
     frame_capture_->Abort(provider.GetDevice(), "submission_failure");
+    FailLiveFrameCapture("submission_failure");
     return false;
   }
 
@@ -4721,6 +5515,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       // Try to submit later. Completely dropping the submission is not
       // permitted because resources would be left in an undefined state.
       frame_capture_->Abort(provider.GetDevice(), "submission_allocator_failure");
+      FailLiveFrameCapture("submission_allocator_failure");
       return false;
     }
     command_allocator_writable_first_ = new CommandAllocator;
@@ -4793,6 +5588,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       // must remain submitted even though completion can no longer be tracked.
       HandleFenceFailure("Submission fence Signal", signal_result, true);
       frame_capture_->Abort(provider.GetDevice(), "submission_signal_failure");
+      FailLiveFrameCapture("submission_signal_failure");
       return false;
     }
     submission_last_signaled_ = submitted_submission;
