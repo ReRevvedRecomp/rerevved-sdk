@@ -34,6 +34,12 @@ add_executable(unit_tests
     codegen/output_stamp_test.cpp
 )
 
+if(WIN32 AND REXGLUE_USE_D3D12)
+    target_sources(unit_tests PRIVATE
+        ui/d3d12_presenter_test.cpp
+    )
+endif()
+
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp

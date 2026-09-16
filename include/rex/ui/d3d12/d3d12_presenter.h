@@ -12,8 +12,14 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -22,6 +28,84 @@
 #include <rex/ui/surface.h>
 
 namespace rex::ui::d3d12 {
+
+namespace detail {
+
+// The D3D12 presenter accepts a tightly packed 4-byte pixel row. Keep this
+// validation generic so the queue contract can be tested without a D3D12
+// device.
+template <typename Frame>
+bool IsCpuGuestOutputFrameValid(const Frame& frame, uint32_t max_dimension,
+                                size_t max_payload_bytes) {
+  if (frame.width == 0 || frame.height == 0 || frame.width > max_dimension ||
+      frame.height > max_dimension) {
+    return false;
+  }
+  const uint64_t tight_row_pitch = uint64_t(frame.width) * 4;
+  const uint64_t payload_bytes = tight_row_pitch * uint64_t(frame.height);
+  return frame.row_pitch == tight_row_pitch && payload_bytes <= max_payload_bytes &&
+         frame.pixels.size() == static_cast<size_t>(payload_bytes);
+}
+
+// A small, mutex-protected FIFO used by the D3D12 presenter. Push and Pop are
+// linearized against Clear, and Push returns 0 when the bounded mailbox is
+// full. Tokens are unique and nonzero for all entries still retained by the
+// queue.
+template <typename Frame, size_t kMaxPendingFrames>
+class CpuGuestOutputFrameQueue final {
+ public:
+  static_assert(kMaxPendingFrames != 0);
+
+  struct Entry {
+    uint64_t token;
+    Frame frame;
+  };
+
+  uint64_t Push(Frame frame) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (entries_.size() >= kMaxPendingFrames) {
+      return 0;
+    }
+
+    uint64_t token;
+    do {
+      token = next_token_++;
+    } while (token == 0 || TokenInUse(token));
+    entries_.push_back(Entry{token, std::move(frame)});
+    return token;
+  }
+
+  std::optional<Entry> Pop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (entries_.empty()) {
+      return std::nullopt;
+    }
+    Entry entry = std::move(entries_.front());
+    entries_.pop_front();
+    return entry;
+  }
+
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.clear();
+  }
+
+ private:
+  bool TokenInUse(uint64_t token) const {
+    for (const Entry& entry : entries_) {
+      if (entry.token == token) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  mutable std::mutex mutex_;
+  std::deque<Entry> entries_;
+  uint64_t next_token_ = 1;
+};
+
+}  // namespace detail
 
 class D3D12UIDrawContext final : public UIDrawContext {
  public:
@@ -82,6 +166,28 @@ class D3D12Presenter final : public Presenter {
   ~D3D12Presenter();
 
   const D3D12Provider& provider() const { return provider_; }
+
+  // Native title output is a row-major DXGI_FORMAT_R10G10B10A2_UNORM image.
+  // Each pixel occupies four bytes in the platform-native packed layout.
+  // Frames are copied into a three-entry FIFO, so the caller may release or
+  // reuse its vector after this call. Queue and Clear are thread-safe and
+  // linearize with each other; callers must stop queueing before destruction.
+  // A frame is accepted only when row_pitch == width * 4 and pixels contains
+  // exactly height rows. Dimensions are limited to 8192 and the payload to
+  // 256 MiB. Returns a nonzero token when queued, or 0 when invalid or full.
+  struct CpuGuestOutputFrame {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t row_pitch = 0;
+    std::vector<uint8_t> pixels;
+  };
+
+  static constexpr size_t kMaxCpuGuestOutputFrames = 3;
+  static constexpr uint32_t kMaxCpuGuestOutputDimension = 8192;
+  static constexpr size_t kMaxCpuGuestOutputPayloadBytes = size_t(256) * 1024 * 1024;
+
+  uint64_t QueueCpuGuestOutputFrame(CpuGuestOutputFrame frame);
+  void ClearCpuGuestOutputFrames();
 
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
@@ -320,6 +426,30 @@ class D3D12Presenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
 #endif
+
+  struct CpuGuestOutputUpload {
+    uint64_t token = 0;
+    UINT64 submission = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> command_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+  };
+
+  bool UploadCpuGuestOutputFrame(const CpuGuestOutputFrame& frame, uint64_t token,
+                                 ID3D12Resource* guest_output_resource);
+  void ReclaimCpuGuestOutputUploads();
+
+  detail::CpuGuestOutputFrameQueue<CpuGuestOutputFrame, kMaxCpuGuestOutputFrames>
+      cpu_guest_output_frame_queue_;
+  std::deque<CpuGuestOutputUpload> cpu_guest_output_uploads_;
+  // Published before the base presenter exposes a mailbox entry as ready and
+  // read while the consumer lock is held, matching the mailbox ownership
+  // ordering. A zero token denotes the original output refresh.
+  std::array<uint64_t, kGuestOutputMailboxSize> cpu_guest_output_mailbox_tokens_{};
+  // Paint-thread-only lineage for the last token that reached a successful
+  // swapchain Present. A zero value denotes a successfully presented original
+  // output, and is distinct from a refresh that was never presented.
+  uint64_t cpu_guest_output_last_successful_present_token_ = 0;
 };
 
 }  // namespace rex::ui::d3d12
