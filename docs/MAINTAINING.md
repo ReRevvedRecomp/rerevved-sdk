@@ -25,6 +25,8 @@ that exact commit for `win-amd64`, `mac-amd64`, `mac-arm64`, `linux-amd64`, and
 `linux-arm64`. The Windows build runs the test suite before uploading an SDK
 archive. Artifact names identify the SDK version and platform deterministically.
 
+The retained release and nightly workflows publish only in
+`rexglue/rexglue-sdk`; this fork uses the artifact workflow above.
 The fork does not publish from upstream-style `v*` tags. If project prereleases
 are enabled after the artifact workflow has been validated, their tags use the
 `rerevved-sdk-v*` namespace. Creating a tag or release requires explicit owner

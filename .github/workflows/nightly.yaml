@@ -14,6 +14,7 @@ env:
 
 jobs:
   check:
+    if: github.repository == 'rexglue/rexglue-sdk'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.compare.outputs.should_build }}

@@ -27,6 +27,7 @@ on:
 
 jobs:
   build:
+    if: inputs.publish_mode != 'release' || github.repository == 'rexglue/rexglue-sdk'
     runs-on: ${{ fromJSON('{"win-amd64":"windows-latest","mac-amd64":"macos-26-intel","mac-arm64":"macos-26","linux-amd64":"ubuntu-latest","linux-arm64":"ubuntu-24.04-arm"}')[inputs.platform] }}
     # linux-amd64 builds inside 22.04 so the glibc floor stays at 2.35, which is
     # what every downstream binary inherits. 24.04 puts it at 2.38, above Debian
