@@ -19,7 +19,7 @@ namespace rex::graphics::d3d12 {
 // and bounded-journal contract can be tested without a graphics device.
 struct FrameCapturePolicy {
   static constexpr size_t kMaxEvents = 4096;
-  static constexpr size_t kMaxBytes = size_t(64) * 1024 * 1024;
+  static constexpr size_t kMaxBytes = size_t(512) * 1024 * 1024;
 
   static bool CanAppend(size_t event_count, size_t bytes_used, size_t additional_bytes) noexcept {
     return event_count < kMaxEvents && bytes_used <= kMaxBytes &&

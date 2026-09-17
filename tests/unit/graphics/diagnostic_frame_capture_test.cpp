@@ -26,6 +26,14 @@ TEST_CASE("frame capture policy requires both completed guest boundaries",
   CHECK(FrameCapturePolicy::IsComplete(true, true, true, true, true));
 }
 
+TEST_CASE("frame journal accommodates registers through its event limit",
+          "[graphics][diagnostic_frame_capture]") {
+  const size_t registers_bytes = RegisterFile::kRegisterCount * sizeof(uint32_t);
+  const size_t preceding_registers = (FrameCapturePolicy::kMaxEvents - 1) * registers_bytes;
+  CHECK(FrameCapturePolicy::CanAppend(FrameCapturePolicy::kMaxEvents - 1, preceding_registers,
+                                      registers_bytes));
+}
+
 TEST_CASE("owned frame journal preserves ordered state and guest shaders",
           "[graphics][diagnostic_frame_capture]") {
   std::vector<uint32_t> registers(RegisterFile::kRegisterCount, 0xA5A5A5A5);

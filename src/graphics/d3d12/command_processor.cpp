@@ -3252,6 +3252,14 @@ bool D3D12CommandProcessor::ScheduleLiveFrameDraw(
     return false;
   }
   LiveFrameCapture& frame = *live_frame_capture_;
+  try {
+    // Keep one slot available before any readback is recorded. The failure path
+    // moves the partially built draw into the live frame so all submitted
+    // readback resources remain owned until cancellation can retain them.
+    frame.draws.reserve(frame.draws.size() + 1);
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
   LiveFrameDraw capture;
   capture.event_id = event_id;
   capture.texture_bindings_complete = !pixel_shader_was_bound || pixel_shader != nullptr;
@@ -3371,6 +3379,11 @@ bool D3D12CommandProcessor::ScheduleLiveFrameDraw(
       SubmitBarriers();
     }
 
+    const auto& vertex_texture_bindings = vertex_shader->GetTextureBindingsAfterTranslation();
+    const size_t pixel_texture_binding_count =
+        pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0;
+    capture.textures.reserve(vertex_texture_bindings.size() + pixel_texture_binding_count);
+
     auto append_texture_uses = [&](uint32_t stage,
                                    const std::vector<D3D12Shader::TextureBinding>& texture_bindings,
                                    const std::vector<D3D12Shader::SamplerBinding>& samplers) {
@@ -3394,7 +3407,11 @@ bool D3D12CommandProcessor::ScheduleLiveFrameDraw(
             break;
           }
         }
-        LiveFrameTextureReadback texture_readback;
+        // ScheduleActiveTextureCapture records its copy before returning. Put
+        // the destination owner in the frame first so every failure path keeps
+        // that resource alive until the submission carrying the copy completes.
+        capture.textures.emplace_back();
+        LiveFrameTextureReadback& texture_readback = capture.textures.back();
         texture_readback.use = use;
         const uint64_t remaining_readback_bytes =
             frame.readback_bytes <= kLiveFrameMaxReadbackBytes
@@ -3409,18 +3426,14 @@ bool D3D12CommandProcessor::ScheduleLiveFrameDraw(
         }
         if (result == D3D12TextureCache::TextureCaptureResult::kCaptured) {
           if (!reserve_readback(texture_readback.capture.buffer_size)) {
-            capture.textures.push_back(std::move(texture_readback));
             return false;
           }
-          capture.textures.push_back(std::move(texture_readback));
-          capture.textures.back().use.data_available = true;
-        } else {
-          capture.textures.push_back(std::move(texture_readback));
+          texture_readback.use.data_available = true;
         }
       }
       return true;
     };
-    if (!append_texture_uses(0, vertex_shader->GetTextureBindingsAfterTranslation(),
+    if (!append_texture_uses(0, vertex_texture_bindings,
                              vertex_shader->GetSamplerBindingsAfterTranslation()) ||
         (pixel_shader &&
          !append_texture_uses(1, pixel_shader->GetTextureBindingsAfterTranslation(),
@@ -4550,7 +4563,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              index_buffer_info, vertex_shader, pixel_shader, used_texture_mask,
                              memexport_used, active_pixel_shader_at_entry != nullptr)) {
     FailLiveFrameCapture("owned_draw_capture_failed");
-    return finish_frame_capture_draw(false);
   }
   if (draw_capture_armed_ &&
       (REXCVAR_GET(d3d12_capture_draw).empty() ||
