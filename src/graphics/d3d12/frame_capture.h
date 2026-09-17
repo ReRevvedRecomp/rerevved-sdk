@@ -86,9 +86,21 @@ class FrameCapture {
 
     std::string marker() const;
     uint64_t event_id() const { return event_id_; }
+    bool host_issued() const { return host_issued_; }
+    bool copy() const { return copy_; }
+    diagnostic::DrawCaptureAvailability acquisition() const { return acquisition_; }
     void MarkHostIssued(const HostDrawInfo& host_info);
     void MarkCopy(bool success);
     void SetResult(bool success) { success_ = success; }
+    void SetResult(bool success, diagnostic::DrawCaptureReason reason) {
+      success_ = success;
+      execution_reason_ = reason;
+    }
+    void SetCaptureResult(diagnostic::DrawCaptureAvailability availability,
+                          diagnostic::DrawCaptureReason reason) {
+      acquisition_ = availability;
+      acquisition_reason_ = reason;
+    }
 
    private:
     friend class FrameCapture;
@@ -101,6 +113,10 @@ class FrameCapture {
     bool copy_ = false;
     bool success_ = false;
     HostDrawInfo host_info_;
+    diagnostic::DrawCaptureReason execution_reason_ = diagnostic::DrawCaptureReason::kNone;
+    diagnostic::DrawCaptureAvailability acquisition_ =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason_ = diagnostic::DrawCaptureReason::kNone;
   };
 
   class CopyScope {
@@ -115,6 +131,11 @@ class FrameCapture {
     std::string marker() const;
     uint64_t event_id() const { return event_id_; }
     void SetResult(bool success, std::string_view mode);
+    void SetCaptureResult(diagnostic::DrawCaptureAvailability availability,
+                          diagnostic::DrawCaptureReason reason) {
+      acquisition_ = availability;
+      acquisition_reason_ = reason;
+    }
 
    private:
     friend class FrameCapture;
@@ -126,6 +147,9 @@ class FrameCapture {
     bool result_set_ = false;
     bool success_ = false;
     std::string mode_;
+    diagnostic::DrawCaptureAvailability acquisition_ =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason_ = diagnostic::DrawCaptureReason::kNone;
   };
 
   FrameCapture() = default;
@@ -201,6 +225,12 @@ class FrameCapture {
     std::string outcome;
     bool success = false;
     bool host_issued = false;
+    diagnostic::DrawCaptureExecutionStatus execution_status =
+        diagnostic::DrawCaptureExecutionStatus::kUnfinished;
+    diagnostic::DrawCaptureReason execution_reason = diagnostic::DrawCaptureReason::kNone;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
     HostDrawInfo host_info;
     std::string copy_mode;
 
@@ -220,8 +250,12 @@ class FrameCapture {
   bool CopyRegisters(Event& event, const uint32_t* registers, size_t register_count);
   bool AddShader(uint32_t type, const ShaderView& shader, std::string& file_out);
   void FinishDraw(uint64_t event_id, bool host_issued, bool copy, bool success,
-                  const HostDrawInfo& host_info) noexcept;
-  void FinishCopy(uint64_t event_id, bool result_set, bool success, std::string_view mode) noexcept;
+                  const HostDrawInfo& host_info, diagnostic::DrawCaptureReason execution_reason,
+                  diagnostic::DrawCaptureAvailability acquisition,
+                  diagnostic::DrawCaptureReason acquisition_reason) noexcept;
+  void FinishCopy(uint64_t event_id, bool result_set, bool success, std::string_view mode,
+                  diagnostic::DrawCaptureAvailability acquisition,
+                  diagnostic::DrawCaptureReason acquisition_reason) noexcept;
 
   void MarkFailure(std::string_view reason);
   bool PrepareOutput(const std::filesystem::path& path);

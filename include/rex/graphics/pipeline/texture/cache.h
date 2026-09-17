@@ -215,6 +215,13 @@ class TextureCache {
 
     uint64_t GetHostMemoryUsage() const { return host_memory_usage_; }
 
+    // The instance distinguishes cache recreation for the same guest key. The
+    // generation changes when watched guest data invalidates the instance.
+    uint64_t instance_id() const { return instance_id_; }
+    uint64_t content_generation() const {
+      return content_generation_.load(std::memory_order_acquire);
+    }
+
     uint64_t last_usage_submission_index() const { return last_usage_submission_index_; }
     uint64_t last_usage_time() const { return last_usage_time_; }
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
@@ -266,6 +273,8 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    uint64_t instance_id_ = 0;
+    std::atomic<uint64_t> content_generation_{1};
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.

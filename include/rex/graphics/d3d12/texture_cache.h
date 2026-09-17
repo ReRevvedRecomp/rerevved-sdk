@@ -98,25 +98,59 @@ class D3D12TextureCache final : public TextureCache {
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
 
-  // Schedules a fence-owned copy of the currently selected 2D texture binding
-  // at the point of use. The source resource is transitioned back to its
-  // tracked state before returning; the caller owns the readback until its
-  // submission fence completes.
+  // Signedness belongs to the shader binding. This identity names the source
+  // resource so signed and unsigned views share bytes when they share the
+  // same cache instance and content generation.
+  struct TextureCaptureIdentity {
+    uint64_t texture_instance_id = 0;
+    uint64_t content_generation = 0;
+
+    friend bool operator==(const TextureCaptureIdentity&, const TextureCaptureIdentity&) = default;
+
+    struct Hasher {
+      size_t operator()(const TextureCaptureIdentity& identity) const noexcept {
+        size_t hash = std::hash<uint64_t>{}(identity.texture_instance_id);
+        hash ^= std::hash<uint64_t>{}(identity.content_generation) + size_t(0x9E3779B9) +
+                (hash << 6) + (hash >> 2);
+        return hash;
+      }
+    };
+  };
+
+  struct TextureCaptureSubresource {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    uint32_t mip_level = 0;
+    uint32_t array_slice = 0;
+    uint32_t row_count = 0;
+    uint32_t row_size = 0;
+  };
+
+  // Schedules fence-owned copies of every host mip and array/cube slice of the
+  // selected texture binding. The source lease and readback remain owned by
+  // the caller until the submission fence has completed or been retained for
+  // cancellation retry.
   struct TextureCaptureReadback {
     diagnostic::DrawCaptureTexture texture;
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> source_resource;
+    std::vector<TextureCaptureSubresource> subresources;
     uint32_t buffer_size = 0;
+    TextureCaptureIdentity identity;
   };
   enum class TextureCaptureResult : uint32_t {
     kCaptured,
     kUnresolved,
     kUnsupported,
+    kResolutionScale,
+    kReadbackBudget,
     kFailed,
   };
   TextureCaptureResult ScheduleActiveTextureCapture(
       const D3D12Shader::TextureBinding& host_shader_binding, TextureCaptureReadback& capture_out,
       uint64_t max_readback_bytes);
+  TextureCaptureResult GetActiveTextureCaptureIdentity(
+      const D3D12Shader::TextureBinding& host_shader_binding,
+      TextureCaptureIdentity& identity_out) const;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

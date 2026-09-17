@@ -80,6 +80,82 @@ const char* EventKindName(FrameCapture::EventKind kind) {
   return "unknown";
 }
 
+const char* ExecutionStatusName(diagnostic::DrawCaptureExecutionStatus status) {
+  switch (status) {
+    case diagnostic::DrawCaptureExecutionStatus::kUnfinished:
+      return "unfinished";
+    case diagnostic::DrawCaptureExecutionStatus::kIssued:
+      return "issued";
+    case diagnostic::DrawCaptureExecutionStatus::kNoEffect:
+      return "no_effect";
+    case diagnostic::DrawCaptureExecutionStatus::kFailed:
+      return "failed";
+  }
+  return "unknown";
+}
+
+const char* AvailabilityName(diagnostic::DrawCaptureAvailability availability) {
+  switch (availability) {
+    case diagnostic::DrawCaptureAvailability::kUnavailable:
+      return "unavailable";
+    case diagnostic::DrawCaptureAvailability::kPartial:
+      return "partial";
+    case diagnostic::DrawCaptureAvailability::kComplete:
+      return "complete";
+  }
+  return "unknown";
+}
+
+const char* ReasonName(diagnostic::DrawCaptureReason reason) {
+  switch (reason) {
+    case diagnostic::DrawCaptureReason::kNone:
+      return "none";
+    case diagnostic::DrawCaptureReason::kNoVertexShader:
+      return "no_vertex_shader";
+    case diagnostic::DrawCaptureReason::kRenderTargetPath:
+      return "render_target_path";
+    case diagnostic::DrawCaptureReason::kResolutionScale:
+      return "resolution_scale";
+    case diagnostic::DrawCaptureReason::kMemexport:
+      return "memexport";
+    case diagnostic::DrawCaptureReason::kIndexTranslation:
+      return "index_translation";
+    case diagnostic::DrawCaptureReason::kVertexFetch:
+      return "vertex_fetch";
+    case diagnostic::DrawCaptureReason::kIndexSource:
+      return "index_source";
+    case diagnostic::DrawCaptureReason::kReadbackBudget:
+      return "readback_budget";
+    case diagnostic::DrawCaptureReason::kReadbackAllocation:
+      return "readback_allocation";
+    case diagnostic::DrawCaptureReason::kTextureUnresolved:
+      return "texture_unresolved";
+    case diagnostic::DrawCaptureReason::kTextureDimension:
+      return "texture_dimension";
+    case diagnostic::DrawCaptureReason::kTextureFormat:
+      return "texture_format";
+    case diagnostic::DrawCaptureReason::kTextureSource:
+      return "texture_source";
+    case diagnostic::DrawCaptureReason::kReadback:
+      return "readback";
+    case diagnostic::DrawCaptureReason::kSubmission:
+      return "submission";
+    case diagnostic::DrawCaptureReason::kFence:
+      return "fence";
+    case diagnostic::DrawCaptureReason::kJournal:
+      return "journal";
+    case diagnostic::DrawCaptureReason::kSwap:
+      return "swap";
+    case diagnostic::DrawCaptureReason::kNoEffect:
+      return "no_effect";
+    case diagnostic::DrawCaptureReason::kExecutionFailure:
+      return "execution_failure";
+    case diagnostic::DrawCaptureReason::kSignMaskUnused:
+      return "sign_mask_unused";
+  }
+  return "unknown";
+}
+
 }  // namespace
 
 FrameCapture::DrawScope::~DrawScope() {
@@ -92,7 +168,10 @@ FrameCapture::DrawScope::DrawScope(DrawScope&& other) noexcept
       host_issued_(other.host_issued_),
       copy_(other.copy_),
       success_(other.success_),
-      host_info_(other.host_info_) {
+      host_info_(other.host_info_),
+      execution_reason_(other.execution_reason_),
+      acquisition_(other.acquisition_),
+      acquisition_reason_(other.acquisition_reason_) {
   other.owner_ = nullptr;
   other.event_id_ = 0;
 }
@@ -106,6 +185,9 @@ FrameCapture::DrawScope& FrameCapture::DrawScope::operator=(DrawScope&& other) n
     copy_ = other.copy_;
     success_ = other.success_;
     host_info_ = other.host_info_;
+    execution_reason_ = other.execution_reason_;
+    acquisition_ = other.acquisition_;
+    acquisition_reason_ = other.acquisition_reason_;
     other.owner_ = nullptr;
     other.event_id_ = 0;
   }
@@ -147,7 +229,8 @@ void FrameCapture::DrawScope::Finish() noexcept {
   if (!owner_ || !event_id_) {
     return;
   }
-  owner_->FinishDraw(event_id_, host_issued_, copy_, success_, host_info_);
+  owner_->FinishDraw(event_id_, host_issued_, copy_, success_, host_info_, execution_reason_,
+                     acquisition_, acquisition_reason_);
   owner_ = nullptr;
   event_id_ = 0;
 }
@@ -161,7 +244,9 @@ FrameCapture::CopyScope::CopyScope(CopyScope&& other) noexcept
       event_id_(other.event_id_),
       result_set_(other.result_set_),
       success_(other.success_),
-      mode_(std::move(other.mode_)) {
+      mode_(std::move(other.mode_)),
+      acquisition_(other.acquisition_),
+      acquisition_reason_(other.acquisition_reason_) {
   other.owner_ = nullptr;
   other.event_id_ = 0;
 }
@@ -174,6 +259,8 @@ FrameCapture::CopyScope& FrameCapture::CopyScope::operator=(CopyScope&& other) n
     result_set_ = other.result_set_;
     success_ = other.success_;
     mode_ = std::move(other.mode_);
+    acquisition_ = other.acquisition_;
+    acquisition_reason_ = other.acquisition_reason_;
     other.owner_ = nullptr;
     other.event_id_ = 0;
   }
@@ -202,7 +289,7 @@ void FrameCapture::CopyScope::Finish() noexcept {
   if (!owner_ || !event_id_) {
     return;
   }
-  owner_->FinishCopy(event_id_, result_set_, success_, mode_);
+  owner_->FinishCopy(event_id_, result_set_, success_, mode_, acquisition_, acquisition_reason_);
   owner_ = nullptr;
   event_id_ = 0;
 }
@@ -381,6 +468,7 @@ bool FrameCapture::AppendOwnedStartSwap(uint64_t frame, uint64_t submission,
   }
   it->outcome = "completed";
   it->success = true;
+  it->execution_status = diagnostic::DrawCaptureExecutionStatus::kIssued;
   pending_swap_event_id_ = 0;
   return true;
 }
@@ -432,6 +520,10 @@ bool FrameCapture::BuildOwnedFrameSnapshot(uint64_t end_frame, uint64_t end_subm
     output.submission = event.submission;
     output.success = event.success;
     output.host_issued = event.host_issued;
+    output.execution_status = event.execution_status;
+    output.execution_reason = event.execution_reason;
+    output.acquisition = event.acquisition;
+    output.acquisition_reason = event.acquisition_reason;
     output.draw.draw.registers = event.registers;
     output.draw.draw.frame = event.frame;
     output.draw.draw.submission = event.submission;
@@ -444,6 +536,8 @@ bool FrameCapture::BuildOwnedFrameSnapshot(uint64_t end_frame, uint64_t end_subm
         output.draw.guest_vertex_shader_hash = event.vertex_shader_hash;
         output.draw.guest_pixel_shader_hash = event.pixel_shader_hash;
         output.draw.texture_bindings_complete = event.host_issued;
+        output.draw.acquisition = event.acquisition;
+        output.draw.acquisition_reason = event.acquisition_reason;
         draw.vertex_shader_hash = event.vertex_shader_hash;
         draw.pixel_shader_hash = event.pixel_shader_hash;
         draw.primitive_type = event.primitive_type;
@@ -503,6 +597,15 @@ bool FrameCapture::BuildOwnedFrameSnapshot(uint64_t end_frame, uint64_t end_subm
         output.frontbuffer_height = event.frontbuffer_height;
         break;
     }
+    const uint32_t output_severity = static_cast<uint32_t>(output.acquisition);
+    const uint32_t snapshot_severity = static_cast<uint32_t>(snapshot.acquisition);
+    if (output_severity < snapshot_severity ||
+        (output_severity == snapshot_severity &&
+         snapshot.acquisition_reason == diagnostic::DrawCaptureReason::kNone &&
+         output.acquisition_reason != diagnostic::DrawCaptureReason::kNone)) {
+      snapshot.acquisition = output.acquisition;
+      snapshot.acquisition_reason = output.acquisition_reason;
+    }
     snapshot.events.push_back(std::move(output));
   }
   return true;
@@ -524,6 +627,7 @@ std::shared_ptr<diagnostic::DrawCaptureFrameSnapshot> FrameCapture::TakeOwnedFra
     }
     it->outcome = "completed";
     it->success = true;
+    it->execution_status = diagnostic::DrawCaptureExecutionStatus::kIssued;
     pending_swap_event_id_ = 0;
   }
   try {
@@ -594,7 +698,10 @@ bool FrameCapture::AddShader(uint32_t type, const ShaderView& shader, std::strin
 }
 
 void FrameCapture::FinishDraw(uint64_t event_id, bool host_issued, bool copy, bool success,
-                              const HostDrawInfo& host_info) noexcept {
+                              const HostDrawInfo& host_info,
+                              diagnostic::DrawCaptureReason execution_reason,
+                              diagnostic::DrawCaptureAvailability acquisition,
+                              diagnostic::DrawCaptureReason acquisition_reason) noexcept {
   try {
     const auto it = std::find_if(events_.begin(), events_.end(),
                                  [event_id](const Event& event) { return event.id == event_id; });
@@ -604,6 +711,13 @@ void FrameCapture::FinishDraw(uint64_t event_id, bool host_issued, bool copy, bo
     }
     it->host_issued = host_issued;
     it->success = success;
+    it->execution_reason = execution_reason;
+    it->acquisition = acquisition;
+    it->acquisition_reason = acquisition_reason;
+    it->execution_status = !success ? diagnostic::DrawCaptureExecutionStatus::kFailed
+                           : host_issued || copy
+                               ? diagnostic::DrawCaptureExecutionStatus::kIssued
+                               : diagnostic::DrawCaptureExecutionStatus::kNoEffect;
     if (copy) {
       it->outcome = "copy";
     } else if (host_issued) {
@@ -618,7 +732,9 @@ void FrameCapture::FinishDraw(uint64_t event_id, bool host_issued, bool copy, bo
 }
 
 void FrameCapture::FinishCopy(uint64_t event_id, bool result_set, bool success,
-                              std::string_view mode) noexcept {
+                              std::string_view mode,
+                              diagnostic::DrawCaptureAvailability acquisition,
+                              diagnostic::DrawCaptureReason acquisition_reason) noexcept {
   try {
     const auto it = std::find_if(events_.begin(), events_.end(),
                                  [event_id](const Event& event) { return event.id == event_id; });
@@ -627,6 +743,12 @@ void FrameCapture::FinishCopy(uint64_t event_id, bool result_set, bool success,
       return;
     }
     it->success = result_set && success;
+    it->execution_status = success ? diagnostic::DrawCaptureExecutionStatus::kIssued
+                                   : diagnostic::DrawCaptureExecutionStatus::kFailed;
+    it->execution_reason = success ? diagnostic::DrawCaptureReason::kNone
+                                   : diagnostic::DrawCaptureReason::kExecutionFailure;
+    it->acquisition = acquisition;
+    it->acquisition_reason = acquisition_reason;
     it->outcome = result_set ? "completed" : "early_return";
     it->copy_mode.assign(mode);
   } catch (...) {
@@ -906,6 +1028,7 @@ void FrameCapture::OnCompletedSwap(void* device, const std::filesystem::path& re
     } else {
       it->outcome = "completed";
       it->success = true;
+      it->execution_status = diagnostic::DrawCaptureExecutionStatus::kIssued;
     }
     pending_swap_event_id_ = 0;
   }
@@ -1023,7 +1146,9 @@ bool FrameCapture::WriteJournal(std::vector<std::string>& files_out) {
   }
 
   std::string journal;
-  journal += "{\n  \"schema_version\":1,\n";
+  journal +=
+      "{\n  \"schema_version\":" + std::to_string(diagnostic::kDrawCaptureFrameSchemaVersion) +
+      ",\n";
   journal += "  \"complete\":";
   journal += failure_reason_.empty() && pending_swap_event_id_ == 0 ? "true" : "false";
   journal += ",\n  \"frame\":" + std::to_string(start_frame_) +
@@ -1083,7 +1208,16 @@ bool FrameCapture::WriteJournal(std::vector<std::string>& files_out) {
       journal += "\"kind\":";
       AppendJsonString(journal, event.outcome.empty() ? "journal_incomplete" : event.outcome);
       journal += ",\"success\":" + std::string(event.success ? "true" : "false") +
-                 ",\"host_issued\":" + std::string(event.host_issued ? "true" : "false") + "}";
+                 ",\"host_issued\":" + std::string(event.host_issued ? "true" : "false") +
+                 ",\"execution_status\":";
+      AppendJsonString(journal, ExecutionStatusName(event.execution_status));
+      journal += ",\"execution_reason\":";
+      AppendJsonString(journal, ReasonName(event.execution_reason));
+      journal += ",\"acquisition\":";
+      AppendJsonString(journal, AvailabilityName(event.acquisition));
+      journal += ",\"acquisition_reason\":";
+      AppendJsonString(journal, ReasonName(event.acquisition_reason));
+      journal += "}";
       if (event.host_issued) {
         const HostDrawInfo& host = event.host_info;
         journal += ",\"host\":{";
@@ -1112,7 +1246,16 @@ bool FrameCapture::WriteJournal(std::vector<std::string>& files_out) {
       journal += ",\"outcome\":{";
       journal += "\"kind\":";
       AppendJsonString(journal, event.outcome.empty() ? "journal_incomplete" : event.outcome);
-      journal += ",\"success\":" + std::string(event.success ? "true" : "false") + ",\"mode\":";
+      journal += ",\"success\":" + std::string(event.success ? "true" : "false") +
+                 ",\"execution_status\":";
+      AppendJsonString(journal, ExecutionStatusName(event.execution_status));
+      journal += ",\"execution_reason\":";
+      AppendJsonString(journal, ReasonName(event.execution_reason));
+      journal += ",\"acquisition\":";
+      AppendJsonString(journal, AvailabilityName(event.acquisition));
+      journal += ",\"acquisition_reason\":";
+      AppendJsonString(journal, ReasonName(event.acquisition_reason));
+      journal += ",\"mode\":";
       AppendJsonString(journal, event.copy_mode);
       journal += "}";
     } else {
@@ -1124,7 +1267,16 @@ bool FrameCapture::WriteJournal(std::vector<std::string>& files_out) {
       journal += ",\"outcome\":{";
       journal += "\"kind\":";
       AppendJsonString(journal, event.outcome.empty() ? "journal_incomplete" : event.outcome);
-      journal += ",\"success\":" + std::string(event.success ? "true" : "false") + "}";
+      journal += ",\"success\":" + std::string(event.success ? "true" : "false") +
+                 ",\"execution_status\":";
+      AppendJsonString(journal, ExecutionStatusName(event.execution_status));
+      journal += ",\"execution_reason\":";
+      AppendJsonString(journal, ReasonName(event.execution_reason));
+      journal += ",\"acquisition\":";
+      AppendJsonString(journal, AvailabilityName(event.acquisition));
+      journal += ",\"acquisition_reason\":";
+      AppendJsonString(journal, ReasonName(event.acquisition_reason));
+      journal += "}";
     }
     journal += "}";
   }

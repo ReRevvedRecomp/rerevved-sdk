@@ -146,6 +146,8 @@ namespace rex::graphics {
 
 namespace {
 
+std::atomic<uint64_t> next_texture_instance_id{1};
+
 struct TextureLoadDumpFilter {
   uint32_t address;
   uint32_t width;
@@ -943,7 +945,9 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
       last_usage_time_(texture_cache.current_submission_time_),
       used_previous_(track_usage ? texture_cache.texture_used_last_ : nullptr),
       used_next_(nullptr),
-      in_usage_list_(track_usage) {
+      in_usage_list_(track_usage),
+      force_load_3d_tiling_(false),
+      instance_id_(next_texture_instance_id.fetch_add(1, std::memory_order_relaxed)) {
   if (track_usage) {
     if (texture_cache.texture_used_last_) {
       texture_cache.texture_used_last_->used_next_ = this;
@@ -1058,6 +1062,7 @@ void TextureCache::Texture::MarkAsUsed() {
 
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+  content_generation_.fetch_add(1, std::memory_order_acq_rel);
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;

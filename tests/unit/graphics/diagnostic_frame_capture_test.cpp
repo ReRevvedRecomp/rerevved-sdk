@@ -2,9 +2,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#if defined(_WIN32)
+#include <rex/graphics/d3d12/texture_cache.h>
+#endif
 
 namespace rex::graphics::d3d12 {
 
@@ -81,6 +85,164 @@ TEST_CASE("owned frame journal preserves ordered state and guest shaders",
   CHECK(snapshot->events[2].copy_mode == "resolve");
   CHECK(snapshot->events[3].kind == diagnostic::DrawCaptureFrameEvent::Kind::kSwap);
   CHECK(capture.IsIdle());
+}
+
+TEST_CASE("owned frame keeps execution and acquisition status separate",
+          "[graphics][diagnostic_frame_capture]") {
+  std::vector<uint32_t> registers(RegisterFile::kRegisterCount, 0);
+  FrameCapture capture;
+  REQUIRE(capture.BeginOwnedFrame(1, 2, 0x1000, 1280, 720, registers.data(), registers.size()));
+  {
+    auto draw =
+        capture.BeginDraw(1, 3, 4, 3, false, {}, registers.data(), registers.size(), {}, {});
+    REQUIRE(draw.event_id());
+    draw.SetResult(true);
+    draw.SetCaptureResult(diagnostic::DrawCaptureAvailability::kPartial,
+                          diagnostic::DrawCaptureReason::kTextureUnresolved);
+  }
+  REQUIRE_FALSE(
+      capture.RecordSwapEnd(1, 4, 0x2000, 1280, 720, registers.data(), registers.size()).empty());
+  const auto snapshot = capture.TakeOwnedFrame(1, 4);
+  REQUIRE(snapshot);
+  REQUIRE(snapshot->events.size() == 3);
+  const auto& event = snapshot->events[1];
+  CHECK(event.success);
+  CHECK(event.execution_status == diagnostic::DrawCaptureExecutionStatus::kNoEffect);
+  CHECK(event.acquisition == diagnostic::DrawCaptureAvailability::kPartial);
+  CHECK(event.acquisition_reason == diagnostic::DrawCaptureReason::kTextureUnresolved);
+  CHECK(snapshot->acquisition == diagnostic::DrawCaptureAvailability::kPartial);
+}
+
+TEST_CASE("failed draw-copy execution is not classified as issued",
+          "[graphics][diagnostic_frame_capture]") {
+  std::vector<uint32_t> registers(RegisterFile::kRegisterCount, 0);
+  FrameCapture capture;
+  REQUIRE(capture.BeginOwnedFrame(1, 2, 0x1000, 1280, 720, registers.data(), registers.size()));
+  {
+    auto draw =
+        capture.BeginDraw(1, 3, 8, 3, false, {}, registers.data(), registers.size(), {}, {});
+    draw.MarkCopy(false);
+    draw.SetResult(false, diagnostic::DrawCaptureReason::kExecutionFailure);
+  }
+  REQUIRE_FALSE(
+      capture.RecordSwapEnd(1, 4, 0x2000, 1280, 720, registers.data(), registers.size()).empty());
+  const auto snapshot = capture.TakeOwnedFrame(1, 4);
+  REQUIRE(snapshot);
+  REQUIRE(snapshot->events.size() == 3);
+  CHECK_FALSE(snapshot->events[1].success);
+  CHECK(snapshot->events[1].execution_status == diagnostic::DrawCaptureExecutionStatus::kFailed);
+}
+
+TEST_CASE("owned frame acquisition keeps the worst status and reason",
+          "[graphics][diagnostic_frame_capture]") {
+  std::vector<uint32_t> registers(RegisterFile::kRegisterCount, 0);
+  FrameCapture capture;
+  REQUIRE(capture.BeginOwnedFrame(1, 2, 0x1000, 1280, 720, registers.data(), registers.size()));
+  {
+    auto draw =
+        capture.BeginDraw(1, 3, 4, 3, false, {}, registers.data(), registers.size(), {}, {});
+    REQUIRE(draw.event_id());
+    draw.SetResult(true);
+    draw.SetCaptureResult(diagnostic::DrawCaptureAvailability::kPartial,
+                          diagnostic::DrawCaptureReason::kTextureUnresolved);
+  }
+  {
+    auto draw =
+        capture.BeginDraw(1, 4, 4, 3, false, {}, registers.data(), registers.size(), {}, {});
+    REQUIRE(draw.event_id());
+    draw.SetResult(true);
+    draw.SetCaptureResult(diagnostic::DrawCaptureAvailability::kUnavailable,
+                          diagnostic::DrawCaptureReason::kReadbackBudget);
+  }
+  {
+    auto draw =
+        capture.BeginDraw(1, 5, 4, 3, false, {}, registers.data(), registers.size(), {}, {});
+    REQUIRE(draw.event_id());
+    draw.SetResult(true);
+    draw.SetCaptureResult(diagnostic::DrawCaptureAvailability::kPartial,
+                          diagnostic::DrawCaptureReason::kTextureDimension);
+  }
+  REQUIRE_FALSE(
+      capture.RecordSwapEnd(1, 6, 0x2000, 1280, 720, registers.data(), registers.size()).empty());
+  const auto snapshot = capture.TakeOwnedFrame(1, 6);
+  REQUIRE(snapshot);
+  CHECK(snapshot->acquisition == diagnostic::DrawCaptureAvailability::kUnavailable);
+  CHECK(snapshot->acquisition_reason == diagnostic::DrawCaptureReason::kReadbackBudget);
+}
+
+#if defined(_WIN32)
+TEST_CASE("texture capture identity separates generations and instances",
+          "[graphics][diagnostic_frame_capture]") {
+  using Identity = D3D12TextureCache::TextureCaptureIdentity;
+  const Identity current{11, 4};
+  const Identity same{11, 4};
+  // Signedness is carried by DrawCaptureTextureUse, not this source key.
+  const Identity signed_view{11, 4};
+  const Identity mutated{11, 5};
+  const Identity recreated{12, 4};
+  CHECK(current == same);
+  CHECK(current == signed_view);
+  CHECK_FALSE(current == mutated);
+  CHECK_FALSE(current == recreated);
+  std::unordered_map<Identity, uint32_t, Identity::Hasher> captures;
+  captures.emplace(current, 7);
+  CHECK(captures.at(same) == 7);
+  CHECK(captures.find(mutated) == captures.end());
+  CHECK(captures.find(recreated) == captures.end());
+}
+#endif
+
+TEST_CASE("texture capture subresources carry per-mip slice byte metadata",
+          "[graphics][diagnostic_frame_capture]") {
+  diagnostic::DrawCaptureTexture texture;
+  texture.host_width = 8;
+  texture.host_height = 4;
+  texture.host_depth_or_array_size = 2;
+  texture.host_mip_levels = 2;
+  texture.subresources = {
+      {.mip_level = 0,
+       .array_slice = 0,
+       .host_width = 8,
+       .host_height = 4,
+       .row_pitch = 256,
+       .row_size = 32,
+       .row_count = 4,
+       .bytes = std::vector<uint8_t>(128)},
+      {.mip_level = 1,
+       .array_slice = 0,
+       .host_width = 4,
+       .host_height = 2,
+       .row_pitch = 256,
+       .row_size = 16,
+       .row_count = 2,
+       .bytes = std::vector<uint8_t>(32)},
+      {.mip_level = 0,
+       .array_slice = 1,
+       .host_width = 8,
+       .host_height = 4,
+       .row_pitch = 256,
+       .row_size = 32,
+       .row_count = 4,
+       .bytes = std::vector<uint8_t>(128)},
+      {.mip_level = 1,
+       .array_slice = 1,
+       .host_width = 4,
+       .host_height = 2,
+       .row_pitch = 256,
+       .row_size = 16,
+       .row_count = 2,
+       .bytes = std::vector<uint8_t>(32)},
+  };
+  CHECK(texture.subresources.size() == texture.host_depth_or_array_size * texture.host_mip_levels);
+  CHECK(texture.subresources[1].bytes.size() ==
+        texture.subresources[1].row_size * texture.subresources[1].row_count);
+  CHECK(texture.subresources[2].array_slice == 1);
+
+  diagnostic::DrawCaptureTextureUse inactive_companion;
+  inactive_companion.required = false;
+  inactive_companion.unavailable_reason = diagnostic::DrawCaptureReason::kSignMaskUnused;
+  CHECK_FALSE(inactive_companion.required);
+  CHECK(inactive_companion.unavailable_reason == diagnostic::DrawCaptureReason::kSignMaskUnused);
 }
 
 }  // namespace rex::graphics::d3d12

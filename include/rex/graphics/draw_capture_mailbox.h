@@ -23,6 +23,49 @@ class D3D12CommandProcessor;
 
 namespace rex::graphics::diagnostic {
 
+inline constexpr uint32_t kDrawCaptureFrameSchemaVersion = 2;
+
+enum class DrawCaptureExecutionStatus : uint32_t {
+  kUnfinished = 0,
+  kIssued = 1,
+  kNoEffect = 2,
+  kFailed = 3,
+};
+
+enum class DrawCaptureAvailability : uint32_t {
+  kUnavailable = 0,
+  kPartial = 1,
+  kComplete = 2,
+};
+
+// Reasons describe the first known acquisition limitation. They are kept
+// separate from execution because the original Xenos command still runs when
+// an auxiliary native input cannot be copied.
+enum class DrawCaptureReason : uint32_t {
+  kNone = 0,
+  kNoVertexShader,
+  kRenderTargetPath,
+  kResolutionScale,
+  kMemexport,
+  kIndexTranslation,
+  kVertexFetch,
+  kIndexSource,
+  kReadbackBudget,
+  kReadbackAllocation,
+  kTextureUnresolved,
+  kTextureDimension,
+  kTextureFormat,
+  kTextureSource,
+  kReadback,
+  kSubmission,
+  kFence,
+  kJournal,
+  kSwap,
+  kNoEffect,
+  kExecutionFailure,
+  kSignMaskUnused,
+};
+
 // Returns the runtime-owned mailbox shared by the graphics producer and title
 // coordinator. The storage is in the rexcore implementation, rather than in
 // this header, so consumers do not create competing slots.
@@ -41,6 +84,8 @@ struct DrawCaptureVertexFetch {
   uint32_t fetch_constant = 0;
   uint32_t base = 0;
   std::vector<uint8_t> bytes;
+  DrawCaptureAvailability availability = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
 };
 
 struct DrawCaptureIndex {
@@ -52,6 +97,8 @@ struct DrawCaptureIndex {
   uint32_t dma_count = 0;
   uint32_t dma_length = 0;
   std::vector<uint8_t> bytes;
+  DrawCaptureAvailability availability = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
 };
 
 // This is an owned CPU snapshot. It contains no D3D12 resources, guest
@@ -116,10 +163,28 @@ struct DrawCaptureTextureUse {
   uint8_t swizzled_signs = 0;
   bool is_signed = false;
   bool data_available = false;
+  // Shader translation may retain a signed or unsigned companion binding even
+  // when the active fetch constant's sign mask cannot use that companion.
+  bool required = true;
+  DrawCaptureAvailability availability = DrawCaptureAvailability::kUnavailable;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
 };
 
-// This is an owned host-resource mip-0 payload.  The guest key is retained so
-// a title can match unresolved static bindings without reading guest memory.
+struct DrawCaptureTextureSubresource {
+  uint32_t mip_level = 0;
+  uint32_t array_slice = 0;
+  uint32_t host_width = 0;
+  uint32_t host_height = 0;
+  uint32_t row_pitch = 0;
+  uint32_t row_size = 0;
+  uint32_t row_count = 0;
+  // bytes is packed row_size * row_count data; row_pitch retains the source
+  // footprint stride for consumers that need the D3D12 layout.
+  std::vector<uint8_t> bytes;
+};
+
+// This is an owned host-resource payload. The legacy fields describe mip 0,
+// slice 0; subresources contains every captured mip and array/cube slice.
 struct DrawCaptureTexture {
   uint32_t guest_base_page = 0;
   uint32_t guest_mip_page = 0;
@@ -142,6 +207,13 @@ struct DrawCaptureTexture {
   uint32_t row_size = 0;
   uint32_t row_count = 0;
   std::vector<uint8_t> bytes;
+
+  uint32_t host_mip_levels = 1;
+  uint64_t texture_instance_id = 0;
+  uint64_t content_generation = 0;
+  DrawCaptureAvailability availability = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
+  std::vector<DrawCaptureTextureSubresource> subresources;
 };
 
 // DrawCaptureSnapshot remains the established one-draw DTO.  Frame draws use
@@ -154,6 +226,9 @@ struct DrawCaptureFrameDraw {
   uint64_t guest_pixel_shader_hash = 0;
   bool texture_bindings_complete = true;
   std::vector<DrawCaptureTextureUse> texture_uses;
+
+  DrawCaptureAvailability acquisition = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason acquisition_reason = DrawCaptureReason::kNone;
 };
 
 struct DrawCaptureFrameEvent {
@@ -170,6 +245,11 @@ struct DrawCaptureFrameEvent {
   uint64_t frontbuffer_ptr = 0;
   uint32_t frontbuffer_width = 0;
   uint32_t frontbuffer_height = 0;
+
+  DrawCaptureExecutionStatus execution_status = DrawCaptureExecutionStatus::kUnfinished;
+  DrawCaptureReason execution_reason = DrawCaptureReason::kNone;
+  DrawCaptureAvailability acquisition = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason acquisition_reason = DrawCaptureReason::kNone;
 };
 
 struct DrawCaptureGamma {
@@ -201,6 +281,11 @@ struct DrawCaptureFinalSwap {
   uint32_t output_row_count = 0;
   std::vector<uint8_t> output_bytes;
   DrawCaptureGamma gamma;
+
+  DrawCaptureAvailability source_availability = DrawCaptureAvailability::kUnavailable;
+  DrawCaptureReason source_unavailable_reason = DrawCaptureReason::kNone;
+  DrawCaptureAvailability output_availability = DrawCaptureAvailability::kUnavailable;
+  DrawCaptureReason output_unavailable_reason = DrawCaptureReason::kNone;
 };
 
 // All vectors in this DTO own their storage and are safe to retain after the
@@ -213,6 +298,10 @@ struct DrawCaptureFrameSnapshot {
   std::vector<DrawCaptureFrameEvent> events;
   std::vector<DrawCaptureTexture> textures;
   DrawCaptureFinalSwap final_swap;
+
+  uint32_t schema_version = kDrawCaptureFrameSchemaVersion;
+  DrawCaptureAvailability acquisition = DrawCaptureAvailability::kComplete;
+  DrawCaptureReason acquisition_reason = DrawCaptureReason::kNone;
 };
 
 class DrawCaptureMailbox {

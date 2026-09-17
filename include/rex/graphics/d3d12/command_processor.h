@@ -262,16 +262,45 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   struct LiveFrameTextureReadback {
     diagnostic::DrawCaptureTextureUse use;
+    uint32_t capture_index = UINT32_MAX;
+  };
+  struct LiveFrameTextureCapture {
     D3D12TextureCache::TextureCaptureReadback capture;
+    uint32_t snapshot_index = UINT32_MAX;
   };
   struct LiveFrameDraw {
     uint64_t event_id = 0;
     bool texture_bindings_complete = true;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+    diagnostic::DrawCaptureAvailability index_acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason index_acquisition_reason = diagnostic::DrawCaptureReason::kNone;
     std::vector<LiveFrameVertexReadback> vertex_fetches;
     std::optional<LiveFrameIndexReadback> index;
     std::vector<LiveFrameTextureReadback> textures;
   };
+  struct LiveFrameDrawScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
+  struct LiveFrameCopyScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
+  struct LiveFrameSurfaceScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
   struct LiveFrameTextureReadbackSurface {
+    Microsoft::WRL::ComPtr<ID3D12Resource> source_resource;
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
     uint32_t row_count = 0;
@@ -281,6 +310,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   struct LiveFrameCapture {
     diagnostic::DrawCaptureMailbox::Token mailbox_token;
     std::vector<LiveFrameDraw> draws;
+    std::vector<LiveFrameTextureCapture> texture_captures;
+    std::unordered_map<D3D12TextureCache::TextureCaptureIdentity, uint32_t,
+                       D3D12TextureCache::TextureCaptureIdentity::Hasher>
+        texture_capture_indices;
     std::vector<LiveFrameCopyReadback> copies;
     LiveFrameTextureReadbackSurface source;
     LiveFrameTextureReadbackSurface output;
@@ -294,17 +327,26 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t output_format = 0;
     uint32_t output_width = 0;
     uint32_t output_height = 0;
+    diagnostic::DrawCaptureAvailability source_acquisition =
+        diagnostic::DrawCaptureAvailability::kUnavailable;
+    diagnostic::DrawCaptureReason source_acquisition_reason = diagnostic::DrawCaptureReason::kSwap;
+    diagnostic::DrawCaptureAvailability output_acquisition =
+        diagnostic::DrawCaptureAvailability::kUnavailable;
+    diagnostic::DrawCaptureReason output_acquisition_reason = diagnostic::DrawCaptureReason::kSwap;
     diagnostic::DrawCaptureGamma gamma;
   };
 
-  bool ScheduleLiveFrameDraw(uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
-                             const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader,
-                             D3D12Shader* pixel_shader, uint32_t used_texture_mask,
-                             bool memexport_used, bool pixel_shader_was_bound);
-  bool ScheduleLiveFrameCopy(uint64_t event_id);
-  bool ScheduleLiveFrameSwapSource(ID3D12Resource* source, DXGI_FORMAT format, uint32_t width,
-                                   uint32_t height);
-  bool ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width, uint32_t height);
+  LiveFrameDrawScheduleResult ScheduleLiveFrameDraw(
+      uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
+      const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader,
+      D3D12Shader* pixel_shader, uint32_t used_texture_mask, bool memexport_used,
+      bool pixel_shader_was_bound);
+  LiveFrameCopyScheduleResult ScheduleLiveFrameCopy(uint64_t event_id);
+  LiveFrameSurfaceScheduleResult ScheduleLiveFrameSwapSource(ID3D12Resource* source,
+                                                             DXGI_FORMAT format, uint32_t width,
+                                                             uint32_t height);
+  LiveFrameSurfaceScheduleResult ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width,
+                                                             uint32_t height);
   bool BeginLiveFrameCapture(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
                              uint32_t frontbuffer_width, uint32_t frontbuffer_height);
   bool ReadLiveFrameSurface(const LiveFrameTextureReadbackSurface& surface,

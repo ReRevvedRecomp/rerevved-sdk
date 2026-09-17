@@ -126,10 +126,16 @@ TEST_CASE("draw capture mailbox hands off an owned frame") {
 
   const std::shared_ptr<const DrawCaptureFrameSnapshot> snapshot = mailbox.TryTakeFrame(token);
   REQUIRE(snapshot);
+  CHECK(snapshot->schema_version == kDrawCaptureFrameSchemaVersion);
   CHECK(snapshot->start_frame == 10);
   CHECK(snapshot->events.size() == 1);
   CHECK_FALSE(mailbox.IsPending(token));
   CHECK_FALSE(mailbox.GetFrameRequestToken());
+  const DrawCaptureMailbox::Token next_token = mailbox.StartFrame("next-frame");
+  REQUIRE(next_token);
+  REQUIRE(mailbox.ClaimFrame(next_token, "next-frame") == next_token);
+  REQUIRE(mailbox.PublishFrame(next_token, MakeFrameSnapshot()));
+  REQUIRE(mailbox.TryTakeFrame(next_token));
 }
 
 TEST_CASE("draw capture mailbox rejects stale owned frame completion") {
