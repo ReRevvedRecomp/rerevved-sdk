@@ -272,6 +272,36 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   MakeRangeValid(start, length, true);
 }
 
+bool SharedMemory::IsRangeWrittenByGpu(uint32_t start, uint32_t length) {
+  if (!length) {
+    return false;
+  }
+  if (start >= kBufferSize || length > kBufferSize - start) {
+    return true;
+  }
+  const uint32_t first_page = start >> page_size_log2_;
+  const uint32_t last_page = (start + length - 1) >> page_size_log2_;
+  const uint32_t first_block = first_page >> 6;
+  const uint32_t last_block = last_page >> 6;
+  auto global_lock = global_critical_region_.Acquire();
+  if (last_block >= system_page_flags_valid_and_gpu_written_.size()) {
+    return true;
+  }
+  for (uint32_t block = first_block; block <= last_block; ++block) {
+    uint64_t mask = UINT64_MAX;
+    if (block == first_block) {
+      mask <<= first_page & 63;
+    }
+    if (block == last_block && (last_page & 63) != 63) {
+      mask &= (uint64_t(1) << ((last_page & 63) + 1)) - 1;
+    }
+    if (system_page_flags_valid_and_gpu_written_[block] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                     uint32_t length_allocations) {
   assert_always(

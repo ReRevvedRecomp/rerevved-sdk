@@ -100,6 +100,11 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Whether any page still contains GPU-owned data. CPU invalidation clears
+  // this ownership, so a reused address does not retain an old resolve label.
+  // Invalid or uninitialized ranges are conservatively GPU-owned.
+  bool IsRangeWrittenByGpu(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

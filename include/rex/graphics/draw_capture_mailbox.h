@@ -9,12 +9,15 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rex::graphics::d3d12 {
@@ -86,6 +89,12 @@ struct DrawCaptureVertexFetch {
   std::vector<uint8_t> bytes;
   DrawCaptureAvailability availability = DrawCaptureAvailability::kComplete;
   DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
+  // Repeated draws may own one immutable copy of the same point-of-use data.
+  std::shared_ptr<const std::vector<uint8_t>> shared_bytes;
+
+  std::span<const uint8_t> Payload() const {
+    return shared_bytes ? std::span<const uint8_t>(*shared_bytes) : std::span<const uint8_t>(bytes);
+  }
 };
 
 struct DrawCaptureIndex {
@@ -304,6 +313,158 @@ struct DrawCaptureFrameSnapshot {
   DrawCaptureReason acquisition_reason = DrawCaptureReason::kNone;
 };
 
+// The live input observer is deliberately a separate view API. Unlike the
+// established frame DTOs above, these values are valid only while the
+// synchronous callback is running and contain no host GPU resources or
+// readback payloads.
+struct DrawCaptureGuestMemoryReader {
+  using CopyFunction = bool (*)(void* context, uint32_t physical_address,
+                                std::span<uint8_t> destination) noexcept;
+
+  void* context = nullptr;
+  CopyFunction copy = nullptr;
+
+  bool Copy(uint32_t physical_address, std::span<uint8_t> destination) const noexcept {
+    return copy && copy(context, physical_address, destination);
+  }
+};
+
+struct DrawCaptureFrameInputShaderView {
+  bool present = false;
+  uint64_t hash = 0;
+  std::span<const uint32_t> words;
+};
+
+struct DrawCaptureFrameInputVertexFetchView {
+  uint32_t fetch_constant = 0;
+  uint32_t physical_address = 0;
+  uint32_t size = 0;
+  DrawCaptureGuestMemoryReader memory;
+};
+
+struct DrawCaptureFrameInputIndexView {
+  bool present = false;
+  uint32_t format = 0;
+  uint32_t endianness = 0;
+  uint32_t count = 0;
+  uint32_t physical_address = 0;
+  uint32_t size = 0;
+  DrawCaptureGuestMemoryReader memory;
+};
+
+struct DrawCaptureFrameInputTextureView {
+  uint32_t fetch_constant = 0;
+  std::span<const uint32_t> fetch_words;
+  uint32_t format = 0;
+  uint32_t endianness = 0;
+  uint32_t dimension = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t depth = 0;
+  uint32_t pitch = 0;
+  uint32_t mip_min_level = 0;
+  uint32_t mip_max_level = 0;
+  bool tiled = false;
+  bool packed_mips = false;
+  uint32_t base_address = 0;
+  uint32_t base_size = 0;
+  uint32_t mip_address = 0;
+  uint32_t mip_size = 0;
+  DrawCaptureGuestMemoryReader memory;
+  // These are the CPU-side binding values used by the existing native replay
+  // converter. They describe guest fetch interpretation and sampler state;
+  // they do not identify or retain a host texture resource.
+  uint32_t stage = 0;
+  uint32_t shader_binding_index = 0;
+  uint32_t sampler_value = 0;
+  // D3D12 component mapping with the always-set validation bit, derived from
+  // the active guest fetch's host format swizzle.
+  uint32_t component_mapping = 0;
+  // Packed post-fetch TextureSign values after the guest destination swizzle.
+  uint8_t swizzled_signs = 0;
+  bool is_signed = false;
+  bool required = true;
+  // False means the producer could identify this binding but cannot provide
+  // the host-side descriptor or CPU source needed to replay it.
+  bool available = true;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
+  // Current shared-memory ownership, including previous-frame GPU writes.
+  // A CPU rewrite clears the page ownership even if the address was resolved
+  // earlier. This does not supply the GPU data itself.
+  bool gpu_written = false;
+};
+
+struct DrawCaptureFrameInputDrawView {
+  uint64_t id = 0;
+  uint64_t frame = 0;
+  uint64_t submission = 0;
+  std::span<const uint32_t> registers;
+  DrawCaptureFrameInputShaderView vertex_shader;
+  DrawCaptureFrameInputShaderView pixel_shader;
+  uint32_t primitive_type = 0;
+  uint32_t requested_index_count = 0;
+  bool major_mode_explicit = false;
+  bool indexed = false;
+  DrawCaptureFrameInputIndexView index;
+  std::span<const DrawCaptureFrameInputVertexFetchView> vertex_fetches;
+  std::span<const DrawCaptureFrameInputTextureView> textures;
+  bool original_host_issued = false;
+  bool cpu_data_complete = true;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
+  DrawCaptureExecutionStatus execution_status = DrawCaptureExecutionStatus::kUnfinished;
+  DrawCaptureReason execution_reason = DrawCaptureReason::kNone;
+};
+
+struct DrawCaptureFrameInputCopyView {
+  uint64_t id = 0;
+  uint64_t frame = 0;
+  uint64_t submission = 0;
+  std::span<const uint32_t> registers;
+  std::string_view copy_mode = "resolve";
+  DrawCaptureFrameInputVertexFetchView source_geometry;
+  // When present, this is the resolved EDRAM source rectangle in pixels. The
+  // values are owned by this call and remain valid for the callback only.
+  uint32_t source_x = 0;
+  uint32_t source_y = 0;
+  uint32_t source_width = 0;
+  uint32_t source_height = 0;
+  bool source_rect_present = false;
+  // The original resolve result and the exact guest range it wrote. A
+  // successful copy with zero length is a valid clear-only result.
+  bool original_succeeded = false;
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
+};
+
+struct DrawCaptureFrameInputSwapView {
+  uint64_t id = 0;
+  uint64_t frame = 0;
+  uint64_t submission = 0;
+  uint64_t frontbuffer_ptr = 0;
+  uint32_t frontbuffer_width = 0;
+  uint32_t frontbuffer_height = 0;
+  std::span<const uint32_t> registers;
+  bool use_pwl_gamma_ramp = false;
+  bool use_fxaa = false;
+  bool is_8bpc = false;
+  std::span<const uint32_t> gamma_256;
+  std::span<const uint32_t> gamma_pwl_rgb;
+  bool original_succeeded = false;
+};
+
+class DrawCaptureFrameInputObserver {
+ public:
+  virtual ~DrawCaptureFrameInputObserver() = default;
+
+  // The first swap is delivered as the boundary that opens the stream. A
+  // callback may perform bounded synchronous setup here.
+  virtual bool OnFrameBegin(const DrawCaptureFrameInputSwapView& boundary) = 0;
+  virtual bool OnDraw(const DrawCaptureFrameInputDrawView& draw) = 0;
+  virtual bool OnCopy(const DrawCaptureFrameInputCopyView& copy) = 0;
+  virtual bool OnSwap(const DrawCaptureFrameInputSwapView& swap) = 0;
+  virtual bool OnFrameEnd(uint64_t frame, uint64_t submission, bool original_succeeded) = 0;
+};
+
 class DrawCaptureMailbox {
  public:
   struct Token {
@@ -311,6 +472,13 @@ class DrawCaptureMailbox {
 
     explicit operator bool() const noexcept { return value != 0; }
     friend bool operator==(Token, Token) = default;
+  };
+
+  struct ObserverToken {
+    uint64_t value = 0;
+
+    explicit operator bool() const noexcept { return value != 0; }
+    friend bool operator==(ObserverToken, ObserverToken) = default;
   };
 
   // Consumer operations. A mailbox has one active request and one completed
@@ -339,6 +507,23 @@ class DrawCaptureMailbox {
   bool PublishFrame(Token token, std::shared_ptr<const DrawCaptureFrameSnapshot> snapshot);
   bool Fail(Token token);
 
+  // Core-owned live input observer. Registration is single-consumer and
+  // quiescent: UnregisterFrameInputObserver waits for an in-flight callback
+  // before returning. Producers must treat callback results as advisory; the
+  // guest command's result and ring progress are never changed by a callback.
+  // Dispatch is single-producer and nonreentrant. A concurrent or recursive
+  // dispatch is rejected without entering the observer a second time.
+  ObserverToken RegisterFrameInputObserver(std::shared_ptr<DrawCaptureFrameInputObserver> observer);
+  bool UnregisterFrameInputObserver(ObserverToken token);
+  bool HasFrameInputObserver() const noexcept;
+  ObserverToken GetFrameInputObserverToken() const noexcept;
+  bool DispatchFrameInputBegin(ObserverToken token, const DrawCaptureFrameInputSwapView& boundary);
+  bool DispatchFrameInputDraw(ObserverToken token, const DrawCaptureFrameInputDrawView& draw);
+  bool DispatchFrameInputCopy(ObserverToken token, const DrawCaptureFrameInputCopyView& copy);
+  bool DispatchFrameInputSwap(ObserverToken token, const DrawCaptureFrameInputSwapView& swap);
+  bool DispatchFrameInputEnd(ObserverToken token, uint64_t frame, uint64_t submission,
+                             bool original_succeeded);
+
  private:
   friend class ::rex::graphics::d3d12::D3D12CommandProcessor;
 
@@ -354,6 +539,14 @@ class DrawCaptureMailbox {
   bool claimed_ = false;
   std::shared_ptr<const DrawCaptureSnapshot> ready_;
   std::shared_ptr<const DrawCaptureFrameSnapshot> ready_frame_;
+
+  struct ObserverState;
+  template <typename Callback>
+  bool DispatchFrameInputObserver(ObserverToken token, Callback&& callback);
+  std::shared_ptr<ObserverState> observer_state_;
+  std::atomic<uint64_t> observer_fast_token_{0};
+  uint64_t next_observer_token_ = 1;
+  mutable std::mutex observer_mutex_;
 };
 
 }  // namespace rex::graphics::diagnostic

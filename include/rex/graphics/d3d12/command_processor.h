@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -511,9 +512,27 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
-  bool IssueCopy_ReadbackResolvePath();
+  bool IssueCopy_ReadbackResolvePath(uint32_t& written_address_out, uint32_t& written_length_out);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+
+  void RefreshFrameInputObserver();
+  void DispatchFrameInputDraw(
+      xenos::PrimitiveType primitive_type, uint32_t index_count,
+      const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+      D3D12Shader* vertex_shader, D3D12Shader* pixel_shader, bool original_host_issued = true,
+      diagnostic::DrawCaptureExecutionStatus execution_status =
+          diagnostic::DrawCaptureExecutionStatus::kIssued,
+      diagnostic::DrawCaptureReason execution_reason = diagnostic::DrawCaptureReason::kNone);
+  void DispatchFrameInputCopy(std::string_view copy_mode, bool original_succeeded,
+                              uint32_t written_address, uint32_t written_length);
+  void DispatchFrameInputSwap(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                              uint32_t frontbuffer_width, uint32_t frontbuffer_height);
+  void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded);
+  void RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address, uint32_t length) noexcept;
+  bool IsFrameInputGuestMemoryDirty(uint32_t physical_address, uint32_t length) const noexcept;
+  static bool CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
+                                        std::span<uint8_t> destination) noexcept;
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
@@ -781,6 +800,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool live_frame_capture_armed_ = false;
   diagnostic::DrawCaptureMailbox::Token live_frame_capture_armed_mailbox_token_;
   std::optional<LiveFrameCapture> live_frame_capture_;
+
+  // This is a stream token, independent of the legacy capture request token.
+  // Event IDs are only meaningful within the active observer registration.
+  diagnostic::DrawCaptureMailbox::ObserverToken frame_input_observer_token_;
+  uint64_t frame_input_next_event_id_ = 1;
+  bool frame_input_frame_open_ = false;
+  // GPU writes that may make later CPU input views stale. Generated texture
+  // bindings can still bypass the reader when their copy destination matches.
+  std::vector<std::pair<uint32_t, uint32_t>> frame_input_guest_memory_dirty_ranges_;
+  bool frame_input_guest_memory_dirty_all_ = false;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

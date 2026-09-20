@@ -1,8 +1,29 @@
 #include <rex/graphics/draw_capture_mailbox.h>
 
+#include <cassert>
+#include <condition_variable>
+#include <exception>
 #include <utility>
 
 namespace rex::graphics::diagnostic {
+
+struct DrawCaptureMailbox::ObserverState {
+  ObserverToken token;
+  std::shared_ptr<DrawCaptureFrameInputObserver> observer;
+  bool active = true;
+  bool unregistering = false;
+  uint32_t in_flight = 0;
+  std::condition_variable quiesced;
+};
+
+namespace {
+
+// A callback cannot synchronously unregister itself: doing so would wait for
+// its own completion. It may request unregister, which disables the fast path;
+// the dispatch epilogue then releases the final state reference.
+thread_local void* callback_state = nullptr;
+
+}  // namespace
 
 std::shared_ptr<DrawCaptureMailbox> GetDrawCaptureMailbox() {
   static const std::shared_ptr<DrawCaptureMailbox> mailbox = std::make_shared<DrawCaptureMailbox>();
@@ -164,6 +185,137 @@ bool DrawCaptureMailbox::Fail(Token token) {
   }
   ResetLocked();
   return true;
+}
+
+DrawCaptureMailbox::ObserverToken DrawCaptureMailbox::RegisterFrameInputObserver(
+    std::shared_ptr<DrawCaptureFrameInputObserver> observer) {
+  if (!observer) {
+    return {};
+  }
+  std::lock_guard lock(observer_mutex_);
+  if (observer_state_ && (observer_state_->active || observer_state_->in_flight)) {
+    return {};
+  }
+  if (!next_observer_token_) {
+    return {};
+  }
+  auto state = std::make_shared<ObserverState>();
+  state->token = ObserverToken{next_observer_token_++};
+  state->observer = std::move(observer);
+  observer_state_ = state;
+  observer_fast_token_.store(state->token.value, std::memory_order_release);
+  return state->token;
+}
+
+bool DrawCaptureMailbox::UnregisterFrameInputObserver(ObserverToken token) {
+  if (!token) {
+    return false;
+  }
+  std::unique_lock lock(observer_mutex_);
+  const std::shared_ptr<ObserverState> state = observer_state_;
+  if (!state || state->token != token) {
+    return false;
+  }
+  state->active = false;
+  state->unregistering = true;
+  observer_fast_token_.store(0, std::memory_order_release);
+  if (callback_state == state.get()) {
+    // The caller is inside this observer. Waiting here would deadlock; the
+    // dispatch epilogue will complete the requested unregister.
+    return false;
+  }
+  state->quiesced.wait(lock, [&state] { return state->in_flight == 0; });
+  if (observer_state_ == state) {
+    observer_state_.reset();
+  }
+  return true;
+}
+
+bool DrawCaptureMailbox::HasFrameInputObserver() const noexcept {
+  return observer_fast_token_.load(std::memory_order_acquire) != 0;
+}
+
+DrawCaptureMailbox::ObserverToken DrawCaptureMailbox::GetFrameInputObserverToken() const noexcept {
+  return ObserverToken{observer_fast_token_.load(std::memory_order_acquire)};
+}
+
+template <typename Callback>
+bool DrawCaptureMailbox::DispatchFrameInputObserver(ObserverToken token, Callback&& callback) {
+  if (!token || observer_fast_token_.load(std::memory_order_acquire) != token.value) {
+    return false;
+  }
+
+  std::shared_ptr<ObserverState> state;
+  {
+    std::lock_guard lock(observer_mutex_);
+    state = observer_state_;
+    if (!state || state->token != token || !state->active || state->in_flight != 0) {
+      return false;
+    }
+    ++state->in_flight;
+  }
+
+  bool result = false;
+  void* previous_callback_state = callback_state;
+  callback_state = state.get();
+  try {
+    result = callback(*state->observer);
+  } catch (...) {
+    // A title observer is diagnostic/input plumbing. It must never escape
+    // into PM4 execution or change the guest command's result.
+    result = false;
+  }
+  callback_state = previous_callback_state;
+
+  {
+    std::lock_guard lock(observer_mutex_);
+    if (!result) {
+      state->active = false;
+      observer_fast_token_.store(0, std::memory_order_release);
+    }
+    assert(state->in_flight != 0);
+    --state->in_flight;
+    if (!state->in_flight) {
+      state->quiesced.notify_all();
+      if (state->unregistering && observer_state_ == state) {
+        observer_state_.reset();
+      }
+    }
+  }
+  return result;
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputBegin(ObserverToken token,
+                                                 const DrawCaptureFrameInputSwapView& boundary) {
+  return DispatchFrameInputObserver(token, [&boundary](DrawCaptureFrameInputObserver& observer) {
+    return observer.OnFrameBegin(boundary);
+  });
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputDraw(ObserverToken token,
+                                                const DrawCaptureFrameInputDrawView& draw) {
+  return DispatchFrameInputObserver(
+      token, [&draw](DrawCaptureFrameInputObserver& observer) { return observer.OnDraw(draw); });
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputCopy(ObserverToken token,
+                                                const DrawCaptureFrameInputCopyView& copy) {
+  return DispatchFrameInputObserver(
+      token, [&copy](DrawCaptureFrameInputObserver& observer) { return observer.OnCopy(copy); });
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputSwap(ObserverToken token,
+                                                const DrawCaptureFrameInputSwapView& swap) {
+  return DispatchFrameInputObserver(
+      token, [&swap](DrawCaptureFrameInputObserver& observer) { return observer.OnSwap(swap); });
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputEnd(ObserverToken token, uint64_t frame,
+                                               uint64_t submission, bool original_succeeded) {
+  return DispatchFrameInputObserver(
+      token, [frame, submission, original_succeeded](DrawCaptureFrameInputObserver& observer) {
+        return observer.OnFrameEnd(frame, submission, original_succeeded);
+      });
 }
 
 bool DrawCaptureMailbox::HasActiveRequest() const {

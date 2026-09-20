@@ -11,3 +11,8 @@ TEST_CASE("sha256 hello world", "[sha256]") {
   CHECK(rex::crypto::sha256("hello world") ==
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
 }
+
+TEST_CASE("sha256 large multi-block input", "[sha256]") {
+  CHECK(rex::crypto::sha256(std::string(1000000, 'a')) ==
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
