@@ -989,6 +989,43 @@ TextureCache::Texture::~Texture() {
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
 }
 
+diagnostic::DrawCaptureGuestMemoryVersion TextureCache::GetActiveTextureGuestMemoryVersion(
+    uint32_t fetch_constant_index, bool is_signed) const {
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    return {};
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || binding->key.scaled_resolve) {
+    return {};
+  }
+  const Texture* texture = is_signed && IsSignedVersionSeparateForFormat(binding->key)
+                               ? binding->texture_signed
+                               : binding->texture;
+  return texture ? texture->GetGuestMemoryVersion() : diagnostic::DrawCaptureGuestMemoryVersion{};
+}
+
+diagnostic::DrawCaptureGuestMemoryVersion TextureCache::Texture::GetGuestMemoryVersion() const {
+  if (key().scaled_resolve || force_load_3d_tiling()) {
+    return {};
+  }
+  diagnostic::DrawCaptureGuestMemoryVersion version;
+  version.identity = instance_id();
+  version.generation = content_generation();
+  version.base_address = key().base_page << 12;
+  version.base_size = GetGuestBaseSize();
+  version.mip_address = key().mip_page << 12;
+  version.mip_size = GetGuestMipsSize();
+  version.context = this;
+  version.check = [](const void* context, uint64_t generation) noexcept {
+    const auto& texture = *static_cast<const Texture*>(context);
+    // An invalidated watch is not rearmed until upload. Repeated writes in
+    // that interval need not increment the generation, so also check its mask.
+    return texture.content_generation() == generation && !texture.outdated_mask() &&
+           texture.content_generation() == generation;
+  };
+  return version;
+}
+
 void TextureCache::Texture::MakeUpToDateAndWatch(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool base,
     bool mips) {
@@ -1031,6 +1068,11 @@ void TextureCache::Texture::RestoreOutdatedAfterLoadFailure(
     restored_mask |= kOutdatedBitMips;
   }
   outdated_mask_.fetch_or(restored_mask, std::memory_order_release);
+  // Removing a watch allows writes with no callback. Retire tokens before a
+  // retry rearms this instance. Publish the dirty mask before the new version.
+  if (restored_mask) {
+    content_generation_.fetch_add(1, std::memory_order_acq_rel);
+  }
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -1062,7 +1104,6 @@ void TextureCache::Texture::MarkAsUsed() {
 
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
-  content_generation_.fetch_add(1, std::memory_order_acq_rel);
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -1074,6 +1115,8 @@ void TextureCache::Texture::WatchCallback(
     base_watch_handle_ = nullptr;
     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
   }
+  // A reader observing this generation must also observe the dirty mask.
+  content_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,

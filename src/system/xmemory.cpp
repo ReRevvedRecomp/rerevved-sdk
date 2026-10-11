@@ -1936,7 +1936,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
 
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
+  auto global_lock = global_critical_region_.Acquire();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1949,6 +1949,18 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     return false;
   }
 
+  // Recommit may overwrite physical bytes or replace a watched alias's host
+  // protection. Retire old versions while the allocation lock is still held.
+  uint32_t parent_alignment = std::max(alignment, parent_heap_->page_size());
+  if (parent_base_address & (parent_alignment - 1)) {
+    parent_alignment = parent_heap_->page_size();
+  }
+  const uint32_t parent_size = rex::align(size, parent_alignment);
+  for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
+    invalidation_callback->first(invalidation_callback->second, parent_base_address, parent_size,
+                                 true);
+  }
+
   // Given the address we've reserved in the parent heap, pin that here.
   // Shouldn't be possible for it to be allocated already.
   uint32_t address = heap_base_ + parent_base_address - GetPhysicalAddress(heap_base_);
@@ -1956,6 +1968,15 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
     // TODO(benvanik): don't leak parent memory.
     return false;
+  }
+
+  // AllocFixed restored guest protection. A later watch must protect these
+  // pages again rather than trusting notification bits from the old mapping.
+  const uint32_t first = (address - heap_base_ + host_address_offset()) / system_page_size_;
+  const uint32_t last =
+      (address - heap_base_ + host_address_offset() + size - 1) / system_page_size_;
+  for (uint32_t i = first; i <= last; ++i) {
+    system_page_flags_[i >> 6].notify_on_invalidation &= ~(uint64_t(1) << (i & 63));
   }
 
   return true;

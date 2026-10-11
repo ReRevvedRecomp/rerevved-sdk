@@ -2,7 +2,10 @@
 
 add_executable(unit_tests
     graphics/draw_capture_mailbox_test.cpp
+    graphics/frame_input_costs_test.cpp
+    graphics/frame_input_buffer_versions_test.cpp
     graphics/shared_memory_test.cpp
+    graphics/texture_memory_version_test.cpp
     test_memory.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
@@ -39,11 +42,15 @@ if(WIN32 AND REXGLUE_USE_D3D12)
     target_sources(unit_tests PRIVATE
         ui/d3d12_presenter_test.cpp
     )
+    target_link_libraries(unit_tests PRIVATE d3d12)
 endif()
 
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp

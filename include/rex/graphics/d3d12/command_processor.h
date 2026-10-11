@@ -46,6 +46,10 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+namespace rex::graphics {
+class FrameInputBufferVersions;
+}
+
 namespace rex::graphics::d3d12 {
 
 class D3D12Shader;
@@ -531,6 +535,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded);
   void RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address, uint32_t length) noexcept;
   bool IsFrameInputGuestMemoryDirty(uint32_t physical_address, uint32_t length) const noexcept;
+  diagnostic::DrawCaptureGuestMemoryVersion GetFrameInputBufferVersion(uint32_t address,
+                                                                       uint32_t size) noexcept;
   static bool CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
                                         std::span<uint8_t> destination) noexcept;
 
@@ -806,6 +812,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   diagnostic::DrawCaptureMailbox::ObserverToken frame_input_observer_token_;
   uint64_t frame_input_next_event_id_ = 1;
   bool frame_input_frame_open_ = false;
+  std::unique_ptr<FrameInputBufferVersions> frame_input_buffer_versions_;
   // GPU writes that may make later CPU input views stale. Generated texture
   // bindings can still bypass the reader when their copy destination matches.
   std::vector<std::pair<uint32_t, uint32_t>> frame_input_guest_memory_dirty_ranges_;

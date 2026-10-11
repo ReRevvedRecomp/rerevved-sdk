@@ -11,7 +11,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -19,17 +23,75 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
 #include <rex/ui/presenter.h>
+#include <rex/ui/frame_stats.h>
 #include <rex/ui/surface.h>
 
 namespace rex::ui::d3d12 {
 
 namespace detail {
+
+struct GpuGuestOutputTestAccess;
+
+class GuestOutputFrameStats final {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  void Record(uint64_t token, HRESULT result, Clock::time_point now) {
+    if (result != S_OK) {
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    if (!token) {
+      stats_ = {};
+      intervals_ = 0;
+      return;
+    }
+    // Mailbox repaint or an older mailbox entry is not another guest frame.
+    if (token <= highest_token_) {
+      return;
+    }
+    highest_token_ = token;
+    last_frame_ = now;
+    if (!stats_.frame_count++) {
+      window_start_ = now;
+      return;
+    }
+    ++intervals_;
+    const auto elapsed = now - window_start_;
+    if (elapsed >= std::chrono::seconds(1)) {
+      const double seconds = std::chrono::duration<double>(elapsed).count();
+      stats_.fps = double(intervals_) / seconds;
+      stats_.frame_time_ms = seconds * 1000.0 / double(intervals_);
+      window_start_ = now;
+      intervals_ = 0;
+    }
+  }
+
+  FrameStats Snapshot(Clock::time_point now) const {
+    std::lock_guard lock(mutex_);
+    FrameStats result = stats_;
+    if (result.frame_count && now - last_frame_ >= std::chrono::seconds(1)) {
+      result.fps = 0;
+      result.frame_time_ms = 0;
+    }
+    return result;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  FrameStats stats_;
+  uint64_t highest_token_ = 0;
+  uint64_t intervals_ = 0;
+  Clock::time_point window_start_;
+  Clock::time_point last_frame_;
+};
 
 // The D3D12 presenter accepts a tightly packed 4-byte pixel row. Keep this
 // validation generic so the queue contract can be tested without a D3D12
@@ -62,6 +124,11 @@ class CpuGuestOutputFrameQueue final {
   };
 
   uint64_t Push(Frame frame) {
+    return Push(std::move(frame), [](Frame&, uint64_t) { return true; });
+  }
+
+  template <typename Admission>
+  uint64_t Push(Frame frame, Admission admission) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (entries_.size() >= kMaxPendingFrames) {
       return 0;
@@ -71,23 +138,39 @@ class CpuGuestOutputFrameQueue final {
     do {
       token = next_token_++;
     } while (token == 0 || TokenInUse(token));
+    if (!admission(frame, token)) {
+      return 0;
+    }
     entries_.push_back(Entry{token, std::move(frame)});
     return token;
   }
 
   std::optional<Entry> Pop() {
+    return Pop([](Frame&) {});
+  }
+
+  template <typename Claim>
+  std::optional<Entry> Pop(Claim claim) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (entries_.empty()) {
       return std::nullopt;
     }
     Entry entry = std::move(entries_.front());
     entries_.pop_front();
+    claim(entry.frame);
     return entry;
   }
 
   void Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
+  }
+
+  template <typename Predicate, typename BeforeClear>
+  void ClearIf(Predicate predicate, BeforeClear before_clear) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    before_clear();
+    std::erase_if(entries_, [&](Entry& entry) { return predicate(entry.frame); });
   }
 
  private:
@@ -106,6 +189,44 @@ class CpuGuestOutputFrameQueue final {
 };
 
 }  // namespace detail
+
+class GpuGuestOutputStream final {
+ private:
+  friend class D3D12Presenter;
+  explicit GpuGuestOutputStream(const std::shared_ptr<void>& owner) : owner_(owner) {}
+  std::weak_ptr<void> owner_;
+  // Accessed under the presenter's ingress lock, including close versus claim.
+  bool accepting_ = true;
+};
+
+class GpuGuestOutputTicket final {
+ public:
+  enum class Status { kPending, kClaimed, kSubmitted, kCompleted, kCanceled, kFailed };
+  ~GpuGuestOutputTicket();
+  uint64_t token() const { return token_.load(std::memory_order_acquire); }
+  Status status() const;
+  // True only after a verified copy or cancellation before consumer use.
+  // Timeouts and failed signals never make an exported texture reusable.
+  bool AwaitRetirement(uint32_t timeout_ms);
+  uint64_t copy_fence_value() const;
+
+ private:
+  friend class D3D12Presenter;
+  friend struct detail::GpuGuestOutputTestAccess;
+  GpuGuestOutputTicket() = default;
+  void Claim();
+  void Cancel();
+  void Fail();
+  void Submit(ID3D12Device* device, ID3D12Fence* fence, uint64_t value);
+  mutable std::mutex mutex_;
+  std::condition_variable changed_;
+  std::atomic<uint64_t> token_{0};
+  mutable Status status_ = Status::kPending;
+  Microsoft::WRL::ComPtr<ID3D12Device> device_;
+  Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
+  uint64_t fence_value_ = 0;
+  HANDLE completion_event_ = nullptr;
+};
 
 class D3D12UIDrawContext final : public UIDrawContext {
  public:
@@ -189,6 +310,30 @@ class D3D12Presenter final : public Presenter {
   uint64_t QueueCpuGuestOutputFrame(CpuGuestOutputFrame frame);
   void ClearCpuGuestOutputFrames();
 
+  // Offers a distinct COPY_SOURCE texture on this provider's device, with a
+  // producer fence already completed at ready_value. The caller preserves its
+  // contents until the ticket retires. CPU and GPU offers share the same FIFO.
+  struct GpuGuestOutputFrame {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    Microsoft::WRL::ComPtr<ID3D12Fence> ready_fence;
+    uint64_t ready_value = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  std::shared_ptr<GpuGuestOutputStream> CreateGpuGuestOutputStream();
+  std::shared_ptr<GpuGuestOutputTicket> QueueGpuGuestOutputFrame(
+      const std::shared_ptr<GpuGuestOutputStream>& stream, GpuGuestOutputFrame frame);
+  // Closes admission and cancels unclaimed offers. Claimed copies keep their
+  // owners and retire through their own successfully signaled copy fence.
+  void CloseGpuGuestOutputStream(const std::shared_ptr<GpuGuestOutputStream>& stream);
+
+  // Thread-safe statistics for distinct CPU/GPU override tokens accepted by
+  // swapchain Present with S_OK, excluding repaint, failed and occluded calls.
+  // Rates update over windows of at least one second and become zero after a
+  // second without a new token. Original output resets the interval. These
+  // statistics describe Present calls, not physical scanout or GPU retirement.
+  FrameStats GetGuestOutputFrameStats() const;
+
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
@@ -211,6 +356,7 @@ class D3D12Presenter final : public Presenter {
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 
  private:
+  friend struct detail::GpuGuestOutputTestAccess;
   struct GuestOutputPaintRectangleConstants {
     union {
       struct {
@@ -439,17 +585,42 @@ class D3D12Presenter final : public Presenter {
                                  ID3D12Resource* guest_output_resource);
   void ReclaimCpuGuestOutputUploads();
 
-  detail::CpuGuestOutputFrameQueue<CpuGuestOutputFrame, kMaxCpuGuestOutputFrames>
-      cpu_guest_output_frame_queue_;
+  struct PendingGuestOutputFrame {
+    std::variant<CpuGuestOutputFrame, GpuGuestOutputFrame> frame;
+    std::shared_ptr<GpuGuestOutputStream> stream;
+    std::shared_ptr<GpuGuestOutputTicket> ticket;
+  };
+  struct GpuGuestOutputCopy {
+    PendingGuestOutputFrame pending;
+    Microsoft::WRL::ComPtr<ID3D12Resource> destination;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+  };
+  bool CopyGpuGuestOutputFrame(PendingGuestOutputFrame frame, ID3D12Resource* destination);
+  bool FinishGpuGuestOutputCopy(uint64_t value, HRESULT signal_result);
+  void ReclaimGpuGuestOutputCopies();
+  bool AwaitGuestOutputTransferSlot(bool gpu_offer = false);
+  void ClearGuestOutputFrames(bool failed = false);
+  void DrainGpuGuestOutputCopies();
+  detail::CpuGuestOutputFrameQueue<PendingGuestOutputFrame, kMaxCpuGuestOutputFrames>
+      guest_output_frame_queue_;
+  std::shared_ptr<void> gpu_guest_output_owner_ = std::make_shared<int>(0);
+  bool gpu_guest_output_failed_ = false;
+  Microsoft::WRL::ComPtr<ID3D12Fence> gpu_guest_output_copy_fence_;
+  Microsoft::WRL::ComPtr<ID3D12CommandQueue> gpu_guest_output_copy_queue_;
+  uint64_t gpu_guest_output_copy_value_ = 0;
+  std::deque<GpuGuestOutputCopy> gpu_guest_output_copies_;
   std::deque<CpuGuestOutputUpload> cpu_guest_output_uploads_;
   // Published before the base presenter exposes a mailbox entry as ready and
   // read while the consumer lock is held, matching the mailbox ownership
   // ordering. A zero token denotes the original output refresh.
-  std::array<uint64_t, kGuestOutputMailboxSize> cpu_guest_output_mailbox_tokens_{};
+  std::array<uint64_t, kGuestOutputMailboxSize> guest_output_mailbox_tokens_{};
+  std::array<bool, kGuestOutputMailboxSize> guest_output_mailbox_gpu_{};
   // Paint-thread-only lineage for the last token that reached a successful
   // swapchain Present. A zero value denotes a successfully presented original
   // output, and is distinct from a refresh that was never presented.
-  uint64_t cpu_guest_output_last_successful_present_token_ = 0;
+  uint64_t guest_output_last_successful_present_token_ = 0;
+  detail::GuestOutputFrameStats guest_output_frame_stats_;
 };
 
 }  // namespace rex::ui::d3d12

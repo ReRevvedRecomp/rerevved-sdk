@@ -27,6 +27,8 @@
 #include <rex/graphics/d3d12/command_processor.h>
 
 #include "frame_capture.h"
+#include "frame_input_costs.h"
+#include "../frame_input_buffer_versions.h"
 
 #include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/d3d12/graphics_system.h>
@@ -73,11 +75,106 @@ REXCVAR_DEFINE_STRING(d3d12_capture_draw, "", "GPU/D3D12",
 REXCVAR_DEFINE_STRING(d3d12_capture_frame, "", "GPU/D3D12",
                       "Output directory for one complete Xenos frame RenderDoc capture")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+bool& FLAGS_d3d12_frame_input_costs_storage_() {
+  static bool storage = false;
+  return storage;
+}
+static auto frame_input_costs_registrar = rex::cvar::FlagRegistrar(
+    {.name = "d3d12_frame_input_costs",
+     .type = rex::cvar::FlagType::Boolean,
+     .category = "GPU/D3D12",
+     .description = "Log bounded frame-input preparation, callback and guest-read costs",
+     .setter =
+         [](std::string_view value) {
+           FLAGS_d3d12_frame_input_costs_storage_() = rex::string::from_string<bool>(value, false);
+           return true;
+         },
+     .getter = [] { return FLAGS_d3d12_frame_input_costs_storage_() ? "true" : "false"; },
+     .command_callback = [](std::string_view) {},
+     .lifecycle = rex::cvar::Lifecycle::kInitOnly,
+     .constraints = {},
+     .default_value = "false",
+     .is_debug_only = false},
+    rex::cvar::Audience::kAdvanced, rex::cvar::Persistence::kSessionOnly);
 namespace rex::graphics::d3d12 {
 
 namespace {
 
 constexpr uint64_t kLiveFrameMaxReadbackBytes = UINT64_C(512) * 1024 * 1024;
+
+thread_local FrameInputCosts frame_input_costs;
+
+void LogFrameInputCosts(const std::optional<FrameInputCosts::Report>& report) noexcept {
+  if (!report) {
+    return;
+  }
+  using Stage = FrameInputCosts::Stage;
+  using Texture = FrameInputCosts::Texture;
+  const char* reason = "window";
+  switch (report->reason) {
+    case FrameInputCosts::Reason::kWindow:
+      break;
+    case FrameInputCosts::Reason::kDetached:
+      reason = "detached";
+      break;
+    case FrameInputCosts::Reason::kReplaced:
+      reason = "replaced";
+      break;
+    case FrameInputCosts::Reason::kFailed:
+      reason = "failed";
+      break;
+    case FrameInputCosts::Reason::kShutdown:
+      reason = "shutdown";
+      break;
+  }
+  const auto milliseconds = [&](Stage stage) {
+    return double(report->timing(stage).nanoseconds) / 1000000.0;
+  };
+  try {
+    // Shader/texture preparation is nested in SDK time. Guest reads are nested
+    // in observer time, including native work performed during OnSwap.
+    REXGPU_INFO(
+        "Frame input costs: stream={} observer={} reason={} frames={} first_frame={} last_frame={} "
+        "first_submission={} last_submission={} draws={} copies={} begins={} swaps={} ends={} "
+        "draw_sdk_ms={:.3f} shader_ms={:.3f} texture_views_ms={:.3f} draw_callback_ms={:.3f} "
+        "copy_sdk_ms={:.3f} copy_callback_ms={:.3f} begin_callback_ms={:.3f} "
+        "swap_callback_ms={:.3f} end_callback_ms={:.3f} guest_read_ms={:.3f} reads={} "
+        "requested_bytes={} copied_bytes={} read_failures={} callback_failures={} "
+        "texture_unavailable={} texture_not_required={} texture_gpu={} texture_current={} "
+        "texture_stale={} texture_missing={}",
+        report->stream, report->observer, reason, report->completed_frames, report->first_frame,
+        report->last_frame, report->first_submission, report->last_submission,
+        report->timing(Stage::kDrawTotal).calls, report->timing(Stage::kCopyTotal).calls,
+        report->timing(Stage::kBeginCallback).calls, report->timing(Stage::kSwapCallback).calls,
+        report->timing(Stage::kEndCallback).calls,
+        milliseconds(Stage::kDrawTotal) - milliseconds(Stage::kDrawCallback),
+        milliseconds(Stage::kDrawShader), milliseconds(Stage::kDrawTextures),
+        milliseconds(Stage::kDrawCallback),
+        milliseconds(Stage::kCopyTotal) - milliseconds(Stage::kCopyCallback),
+        milliseconds(Stage::kCopyCallback), milliseconds(Stage::kBeginCallback),
+        milliseconds(Stage::kSwapCallback), milliseconds(Stage::kEndCallback),
+        milliseconds(Stage::kGuestRead), report->read_requests, report->requested_bytes,
+        report->copied_bytes, report->read_requests - report->read_successes,
+        report->callback_failures, report->texture(Texture::kUnavailable),
+        report->texture(Texture::kNotRequired), report->texture(Texture::kGpuWritten),
+        report->texture(Texture::kCurrent), report->texture(Texture::kStale),
+        report->texture(Texture::kMissing));
+  } catch (...) {
+    // Logging is auxiliary and must not change PM4 execution or callback results.
+  }
+}
+
+template <typename Callback>
+bool ObserveFrameInputCallback(FrameInputCosts* costs, FrameInputCosts::Stage stage,
+                               Callback&& callback) {
+  FrameInputCostScope scope(costs, stage);
+  const bool succeeded = callback();
+  if (costs && !succeeded) {
+    costs->CallbackFailed();
+  }
+  return succeeded;
+}
 
 bool CreateDiagnosticCaptureParent(const std::filesystem::path& path, const char* name) {
   const std::filesystem::path parent = path.parent_path();
@@ -2089,6 +2186,12 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  // Retire CPU watches even if draining the GPU queue fails below.
+  frame_input_buffer_versions_.reset();
+  if (frame_input_costs.ForOwner(this)) {
+    LogFrameInputCosts(frame_input_costs.Flush(FrameInputCosts::Reason::kShutdown));
+    (void)frame_input_costs.Bind(false, nullptr, 0);
+  }
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   FailPendingDrawCaptureMailbox();
   FailLiveFrameCapture("shutdown_before_completed_swap");
@@ -4424,6 +4527,11 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 bool D3D12CommandProcessor::CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
                                                       std::span<uint8_t> destination) noexcept {
   auto* command_processor = static_cast<D3D12CommandProcessor*>(context);
+  auto* costs = frame_input_costs.ForOwner(command_processor);
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kGuestRead);
+  if (costs) {
+    costs->ReadRequest(destination.size());
+  }
   if (!command_processor || !command_processor->memory_ ||
       destination.size() > std::numeric_limits<uint32_t>::max()) {
     return false;
@@ -4449,6 +4557,9 @@ bool D3D12CommandProcessor::CopyFrameInputGuestMemory(void* context, uint32_t ph
       return false;
     }
     std::memcpy(destination.data(), source, destination.size());
+  }
+  if (costs) {
+    costs->ReadSucceeded(destination.size());
   }
   return true;
 }
@@ -4506,9 +4617,28 @@ bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_addre
   return !shared_memory_ || shared_memory_->IsRangeWrittenByGpu(address, length);
 }
 
+diagnostic::DrawCaptureGuestMemoryVersion D3D12CommandProcessor::GetFrameInputBufferVersion(
+    uint32_t address, uint32_t size) noexcept {
+  try {
+    if (!memory_ || !shared_memory_ || IsFrameInputGuestMemoryDirty(address, size)) {
+      return {};
+    }
+    if (!frame_input_buffer_versions_) {
+      frame_input_buffer_versions_ =
+          std::make_unique<FrameInputBufferVersions>(*memory_, *shared_memory_);
+    }
+    return frame_input_buffer_versions_->Get(address, size);
+  } catch (...) {
+    // Optional watch metadata must never suppress an otherwise valid draw.
+    return {};
+  }
+}
+
 void D3D12CommandProcessor::RefreshFrameInputObserver() {
   const auto mailbox = diagnostic::GetDrawCaptureMailbox();
   if (!mailbox->HasFrameInputObserver()) {
+    frame_input_buffer_versions_.reset();
+    LogFrameInputCosts(frame_input_costs.Bind(false, nullptr, 0));
     frame_input_observer_token_ = {};
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
@@ -4516,7 +4646,10 @@ void D3D12CommandProcessor::RefreshFrameInputObserver() {
     return;
   }
   const auto token = mailbox->GetFrameInputObserverToken();
+  LogFrameInputCosts(
+      frame_input_costs.Bind(REXCVAR_GET(d3d12_frame_input_costs), this, token.value));
   if (token != frame_input_observer_token_) {
+    frame_input_buffer_versions_.reset();
     frame_input_observer_token_ = token;
     frame_input_next_event_id_ = 1;
     frame_input_frame_open_ = false;
@@ -4549,6 +4682,11 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
     return;
   }
 
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame_current_, submission_current_);
+  }
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kDrawTotal);
   const RegisterFile& regs = *register_file_;
   diagnostic::DrawCaptureFrameInputDrawView draw;
   draw.id = frame_input_next_event_id_++;
@@ -4599,11 +4737,13 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
                           : static_cast<uint32_t>(index_buffer_info->length);
   }
   if (execution_status != diagnostic::DrawCaptureExecutionStatus::kIssued) {
-    (void)mailbox->DispatchFrameInputDraw(token, draw);
+    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
+                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
     return;
   }
 
   try {
+    FrameInputCostScope shader_cost_scope(costs, FrameInputCosts::Stage::kDrawShader);
     if (vertex_shader) {
       pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
     }
@@ -4615,6 +4755,7 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       // host pixel shaders. A used binding is explicitly unavailable below.
       pipeline_cache_->AnalyzeShaderUcode(*guest_pixel_shader);
     }
+    shader_cost_scope.Finish();
 
     const diagnostic::DrawCaptureGuestMemoryReader memory_reader{
         this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
@@ -4645,6 +4786,8 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
           } else if (IsFrameInputGuestMemoryDirty(view.physical_address, view.size)) {
             vertex_fetches_valid = false;
             vertex_fetch_dirty = true;
+          } else {
+            view.memory_version = GetFrameInputBufferVersion(view.physical_address, view.size);
           }
           vertex_fetches.push_back(view);
         }
@@ -4653,6 +4796,7 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
 
     std::vector<std::array<uint32_t, 6>> texture_words;
     std::vector<diagnostic::DrawCaptureFrameInputTextureView> textures;
+    FrameInputCostScope texture_cost_scope(costs, FrameInputCosts::Stage::kDrawTextures);
     const size_t vertex_texture_binding_count =
         vertex_shader ? vertex_shader->GetTextureBindingsAfterTranslation().size() : 0;
     const size_t pixel_texture_binding_count =
@@ -4750,6 +4894,10 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       view.gpu_written = IsFrameInputGuestMemoryDirty(view.base_address, view.base_size) ||
                          IsFrameInputGuestMemoryDirty(view.mip_address, view.mip_size);
       view.memory = memory_reader;
+      if (view.required && !view.gpu_written) {
+        view.memory_version =
+            texture_cache_->GetActiveTextureGuestMemoryVersion(fetch_constant, is_signed);
+      }
       textures.push_back(view);
       return true;
     };
@@ -4781,6 +4929,26 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       }
       texture_bindings_complete = guest_bindings.empty() && guest_pixel_shader->is_ucode_analyzed();
     }
+    texture_cost_scope.Finish();
+    if (costs) {
+      // Sample while the token's context is valid. A current token here does
+      // not guarantee collector reuse, exact title ranges or GPU completion.
+      for (const auto& view : textures) {
+        using Texture = FrameInputCosts::Texture;
+        Texture state = Texture::kMissing;
+        if (!view.available) {
+          state = Texture::kUnavailable;
+        } else if (!view.required) {
+          state = Texture::kNotRequired;
+        } else if (view.gpu_written) {
+          state = Texture::kGpuWritten;
+        } else if (view.memory_version.identity && view.memory_version.generation &&
+                   view.memory_version.check) {
+          state = view.memory_version.IsCurrent() ? Texture::kCurrent : Texture::kStale;
+        }
+        costs->AddTexture(state);
+      }
+    }
 
     bool index_valid = true;
     bool index_dirty = false;
@@ -4793,6 +4961,13 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
                     !IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
       index_dirty = !index_valid && draw.index.size != 0 &&
                     IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
+      const uint32_t element_size = draw.index.format == 0 ? 2 : draw.index.format == 1 ? 4 : 0;
+      const uint64_t consumed_size = uint64_t(index_count) * element_size;
+      if (index_valid && element_size && index_count && index_count <= draw.index.count &&
+          consumed_size <= draw.index.size) {
+        draw.index.memory_version = GetFrameInputBufferVersion(
+            draw.index.physical_address, static_cast<uint32_t>(consumed_size));
+      }
     }
     draw.vertex_fetches = vertex_fetches;
     draw.textures = textures;
@@ -4814,7 +4989,8 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       draw.cpu_data_complete = false;
       draw.unavailable_reason = diagnostic::DrawCaptureReason::kMemexport;
     }
-    (void)mailbox->DispatchFrameInputDraw(token, draw);
+    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
+                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
   } catch (...) {
     // Diagnostic view preparation is auxiliary to the original command. A
     // failed allocation or unsupported descriptor must reach the observer as
@@ -4825,7 +5001,8 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
     draw.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
     draw.execution_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
     draw.execution_status = diagnostic::DrawCaptureExecutionStatus::kFailed;
-    (void)mailbox->DispatchFrameInputDraw(token, draw);
+    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
+                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
   }
 }
 
@@ -4849,6 +5026,11 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
     return;
   }
   diagnostic::DrawCaptureFrameInputCopyView copy;
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame_current_, submission_current_);
+  }
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kCopyTotal);
   copy.id = frame_input_next_event_id_++;
   copy.frame = frame_current_;
   copy.submission = submission_current_;
@@ -4880,6 +5062,10 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
         physical_heap->QueryRangeAccess(source_address,
                                         source_address + copy.source_geometry.size - 1) !=
             rex::memory::PageAccess::kNoAccess;
+    if (source_range_readable) {
+      copy.source_geometry.memory_version =
+          GetFrameInputBufferVersion(source_address, copy.source_geometry.size);
+    }
     // ResolveInfo performs the same CPU-only vertex/scissor normalization as
     // the original resolve path. Copy only its value rectangle into the view;
     // never expose its temporary state or any host resource.
@@ -4910,13 +5096,19 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
     copy.source_geometry = {};
     copy.source_rect_present = false;
   }
-  (void)mailbox->DispatchFrameInputCopy(token, copy);
+  (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kCopyCallback,
+                                  [&] { return mailbox->DispatchFrameInputCopy(token, copy); });
 }
 
 void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t submission,
                                                    uint64_t frontbuffer_ptr,
                                                    uint32_t frontbuffer_width,
                                                    uint32_t frontbuffer_height) {
+  // Previous draw/copy views have returned. Swap views borrow no buffer token;
+  // reclaim per-frame metadata before assembling the next boundary.
+  if (frame_input_buffer_versions_) {
+    frame_input_buffer_versions_->Reset();
+  }
   try {
     RefreshFrameInputObserver();
   } catch (...) {
@@ -4937,6 +5129,10 @@ void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t subm
   }
 
   std::array<uint32_t, 256> gamma_256{};
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame, submission);
+  }
   std::array<uint32_t, 128 * 3> gamma_pwl_rgb{};
   for (size_t i = 0; i < gamma_256.size(); ++i) {
     gamma_256[i] = gamma_ramp_256_entry_table()[i].value;
@@ -4968,7 +5164,8 @@ void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t subm
   swap.original_succeeded = false;
 
   if (!frame_input_frame_open_) {
-    if (!mailbox->DispatchFrameInputBegin(token, swap)) {
+    if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kBeginCallback,
+                                   [&] { return mailbox->DispatchFrameInputBegin(token, swap); })) {
       frame_input_frame_open_ = false;
       frame_input_guest_memory_dirty_ranges_.clear();
       frame_input_guest_memory_dirty_all_ = false;
@@ -4976,7 +5173,8 @@ void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t subm
     }
     frame_input_frame_open_ = true;
   }
-  if (!mailbox->DispatchFrameInputSwap(token, swap)) {
+  if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kSwapCallback,
+                                 [&] { return mailbox->DispatchFrameInputSwap(token, swap); })) {
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
@@ -5014,8 +5212,18 @@ void D3D12CommandProcessor::DispatchFrameInputEnd(uint64_t frame, uint64_t submi
     frame_input_guest_memory_dirty_all_ = false;
     return;
   }
-  if (!mailbox->DispatchFrameInputEnd(token, frame, submission, original_succeeded) ||
-      !original_succeeded) {
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame, submission);
+  }
+  const bool delivered = ObserveFrameInputCallback(
+      costs, FrameInputCosts::Stage::kEndCallback,
+      [&] { return mailbox->DispatchFrameInputEnd(token, frame, submission, original_succeeded); });
+  if (costs) {
+    LogFrameInputCosts(costs->EndFrame(delivered && original_succeeded));
+  }
+  if (!delivered || !original_succeeded) {
+    frame_input_buffer_versions_.reset();
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;

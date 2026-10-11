@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/draw_capture_mailbox.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -131,6 +132,9 @@ class TextureCache {
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
 
+  diagnostic::DrawCaptureGuestMemoryVersion GetActiveTextureGuestMemoryVersion(
+      uint32_t fetch_constant_index, bool is_signed) const;
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
@@ -227,6 +231,7 @@ class TextureCache {
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
+    diagnostic::DrawCaptureGuestMemoryVersion GetGuestMemoryVersion() const;
 
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;

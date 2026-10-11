@@ -335,11 +335,33 @@ struct DrawCaptureFrameInputShaderView {
   std::span<const uint32_t> words;
 };
 
+// A guest-memory watch version, not a host texture or GPU completion token.
+// Only identity and generation may be retained. The context/check function is
+// valid solely during the synchronous observer callback. Check before and after
+// copying, and on reuse; a missing or invalid token requires reading the bytes.
+struct DrawCaptureGuestMemoryVersion {
+  using CheckFunction = bool (*)(const void* context, uint64_t generation) noexcept;
+  uint64_t identity = 0;
+  uint64_t generation = 0;
+  uint32_t base_address = 0;
+  uint32_t base_size = 0;
+  uint32_t mip_address = 0;
+  uint32_t mip_size = 0;
+  const void* context = nullptr;
+  CheckFunction check = nullptr;
+
+  bool IsCurrent() const noexcept {
+    return identity && generation && check && check(context, generation);
+  }
+};
+
 struct DrawCaptureFrameInputVertexFetchView {
   uint32_t fetch_constant = 0;
   uint32_t physical_address = 0;
   uint32_t size = 0;
   DrawCaptureGuestMemoryReader memory;
+  // Exact CPU-readable fetch range; unavailable for GPU-owned memory.
+  DrawCaptureGuestMemoryVersion memory_version;
 };
 
 struct DrawCaptureFrameInputIndexView {
@@ -350,6 +372,8 @@ struct DrawCaptureFrameInputIndexView {
   uint32_t physical_address = 0;
   uint32_t size = 0;
   DrawCaptureGuestMemoryReader memory;
+  // Covers the submitted index prefix, not unused DMA capacity.
+  DrawCaptureGuestMemoryVersion memory_version;
 };
 
 struct DrawCaptureFrameInputTextureView {
@@ -392,6 +416,9 @@ struct DrawCaptureFrameInputTextureView {
   // A CPU rewrite clears the page ownership even if the address was resolved
   // earlier. This does not supply the GPU data itself.
   bool gpu_written = false;
+  // Covers exactly the named ranges while IsCurrent succeeds. It does not
+  // replace the current CPU/GPU ownership check above or promise an atomic frame.
+  DrawCaptureGuestMemoryVersion memory_version;
 };
 
 struct DrawCaptureFrameInputDrawView {

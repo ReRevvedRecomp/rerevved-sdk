@@ -11,17 +11,12 @@
  */
 #pragma once
 #include <rex/ui/imgui_dialog.h>
+#include <rex/ui/frame_stats.h>
 #include <array>
 #include <cstdint>
 #include <functional>
 
 namespace rex::ui {
-
-struct FrameStats {
-  double frame_time_ms = 0;
-  double fps = 0;
-  uint64_t frame_count = 0;
-};
 
 class DebugOverlayDialog : public ImGuiDialog {
  public:
