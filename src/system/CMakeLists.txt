@@ -24,6 +24,12 @@ set(REXSYSTEM_SOURCES
     guest_path.cpp
     game_data_selector.cpp
 
+    # Shared CPU-side Xenos command decoding and register ownership. These
+    # sources belong to the runtime so CPU consumers need no GPU plugin.
+    ${REXGLUE_ROOT}/src/graphics/command_processor.cpp
+    ${REXGLUE_ROOT}/src/graphics/register_file.cpp
+    ${REXGLUE_ROOT}/src/graphics/registers.cpp
+
     # Utilities
     util/object_table.cpp
     util/native_list.cpp

@@ -39,6 +39,32 @@ namespace rex::graphics {
 class GraphicsSystem;
 class Shader;
 
+// Borrowed CPU-side owners and the legacy interrupt bridge used by the common
+// command decoder. The owner pointers must outlive the command processor.
+// register_file is required for decoding register-backed packets, memory is
+// required for memory packets, and kernel_state is required before Initialize
+// starts the worker thread. The graphics pointer is an opaque backend owner.
+// The bridge is invoked synchronously; false rejects the packet after its
+// mask has been consumed, and earlier callbacks are not undone.
+using LegacyInterruptDispatch = bool (*)(void* owner, uint32_t source, uint32_t cpu);
+
+// Optional front-end admission used by CPU-only consumers. The callback runs
+// after peeking at the packet header but before the header is consumed, packet
+// predication is evaluated, or any packet effects are applied. Returning false
+// stops the worker with the read index left at the packet start.
+using PacketAdmission = bool (*)(void* owner, const memory::RingBuffer* reader, uint32_t packet,
+                                 uint32_t count);
+
+struct CommandProcessorCpuContext {
+  memory::Memory* memory = nullptr;
+  system::KernelState* kernel_state = nullptr;
+  RegisterFile* register_file = nullptr;
+  void* interrupt_owner = nullptr;
+  LegacyInterruptDispatch dispatch_interrupt = nullptr;
+  void* packet_admission_owner = nullptr;
+  PacketAdmission admit_packet = nullptr;
+};
+
 enum class ReadbackResolveMode {
   kDisabled,
   kFast,
@@ -81,11 +107,11 @@ class CommandProcessor {
     kFxaaExtreme,
   };
 
-  CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
+  CommandProcessor(GraphicsSystem* graphics_system, CommandProcessorCpuContext cpu_context);
   virtual ~CommandProcessor();
 
-  uint32_t counter() const { return counter_; }
-  void increment_counter() { counter_++; }
+  uint32_t counter() const { return counter_.load(std::memory_order_acquire); }
+  void increment_counter() { counter_.fetch_add(1, std::memory_order_release); }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -119,6 +145,21 @@ class CommandProcessor {
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 
   void UpdateWritePointer(uint32_t value);
+
+  // Reports whether the worker accepted a write-pointer publication. A
+  // configured packet-admission callback also rejects publications outside
+  // the initialized ring and never restarts a failed worker. An in-flight
+  // sampled range completes before an invalid publication becomes terminal.
+  bool PublishWritePointer(uint32_t value);
+
+  bool worker_running() const {
+    return worker_started_.load(std::memory_order_acquire) &&
+           worker_running_.load(std::memory_order_acquire);
+  }
+  bool worker_failed() const { return worker_failed_.load(std::memory_order_acquire); }
+  uint32_t read_ptr_index() const { return read_ptr_index_.load(std::memory_order_acquire); }
+  // Increments after guest readback and terminal status publication.
+  uint64_t progress_sequence() const { return progress_sequence_.load(std::memory_order_acquire); }
 
   void ExecutePacket(uint32_t ptr, uint32_t count);
 
@@ -169,7 +210,7 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
-  uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
+  uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index, bool* range_succeeded);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
@@ -232,12 +273,23 @@ class CommandProcessor {
 
   uint64_t current_xenos_fence_trace_token() const { return current_xenos_fence_trace_token_; }
 
+  // Advisory CPU boundary after the complete swap packet is decoded, before
+  // original issue. Implementations must contain optional preparation failures.
+  virtual void OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) {}
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* register_file_ = nullptr;
+  void* interrupt_owner_ = nullptr;
+  LegacyInterruptDispatch dispatch_interrupt_ = nullptr;
+  void* packet_admission_owner_ = nullptr;
+  PacketAdmission admit_packet_ = nullptr;
 
   std::atomic<bool> worker_running_;
+  std::atomic<bool> worker_started_{false};
+  std::atomic<bool> worker_failed_{false};
+  std::atomic<bool> worker_stop_requested_{false};
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
@@ -245,12 +297,13 @@ class CommandProcessor {
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
 
-  uint32_t counter_ = 0;
+  std::atomic<uint32_t> counter_{0};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
 
-  uint32_t read_ptr_index_ = 0;
+  // Keep the uint32_t stream representation in Save/Restore.
+  std::atomic<uint32_t> read_ptr_index_{0};
   uint32_t read_ptr_update_freq_ = 0;
   uint32_t read_ptr_writeback_ptr_ = 0;
 
@@ -258,6 +311,7 @@ class CommandProcessor {
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+  std::atomic<uint64_t> progress_sequence_{0};
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

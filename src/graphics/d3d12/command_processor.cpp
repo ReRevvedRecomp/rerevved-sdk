@@ -27,8 +27,10 @@
 #include <rex/graphics/d3d12/command_processor.h>
 
 #include "frame_capture.h"
+#include "frame_input_copy_plan.h"
 #include "frame_input_costs.h"
 #include "../frame_input_buffer_versions.h"
+#include "../frame_input_swap_view.h"
 
 #include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/d3d12/graphics_system.h>
@@ -300,7 +302,14 @@ namespace shaders {
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
-    : CommandProcessor(graphics_system, kernel_state),
+    : CommandProcessor(graphics_system,
+                       {graphics_system->memory(), kernel_state, graphics_system->register_file(),
+                        graphics_system,
+                        [](void* owner, uint32_t source, uint32_t cpu) {
+                          static_cast<D3D12GraphicsSystem*>(owner)->DispatchInterruptCallback(
+                              source, cpu);
+                          return true;
+                        }}),
       deferred_command_list_(*this),
       frame_capture_(std::make_unique<FrameCapture>()) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
@@ -2330,6 +2339,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   frame_input_observer_token_ = {};
   frame_input_next_event_id_ = 1;
   frame_input_frame_open_ = false;
+  frame_input_prepared_draws_ = false;
   frame_input_guest_memory_dirty_ranges_.clear();
   frame_input_guest_memory_dirty_all_ = false;
 
@@ -2479,16 +2489,78 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+void D3D12CommandProcessor::OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width,
+                                          uint32_t height) {
+  frame_input_pending_swap_ = {};
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+    const auto token = mailbox->GetFrameInputObserverToken();
+    if (!mailbox->HasFrameInputPreparedSwapObserver(token)) {
+      return;
+    }
+    // Pin the selected observer even if optional setup fails. Original issue
+    // must not deliver this terminal to a replacement or fall back to legacy.
+    frame_input_pending_swap_ = {token, 0, frame_current_, submission_current_, true};
+    RefreshFrameInputObserver();
+    frame_input_pending_swap_.id = frame_input_next_event_id_++;
+    DispatchFrameInputSwap(frame_input_pending_swap_.frame, frame_input_pending_swap_.submission,
+                           frontbuffer_ptr, width, height, &frame_input_pending_swap_, true);
+  } catch (...) {
+    // A missed prepared terminal cannot leave input spanning that boundary.
+    // Cleanup stays optional; original issue and packet progress continue.
+    if (frame_input_pending_swap_.prepared) {
+      if (!frame_input_pending_swap_.id) {
+        frame_input_pending_swap_.id = frame_input_next_event_id_++;
+      }
+      if (mailbox && frame_input_frame_open_) {
+        // Empty state spans expose unavailable final state for failure
+        // attribution. This prospective view cannot form a complete graph.
+        diagnostic::DrawCaptureFrameInputSwapView unavailable;
+        unavailable.id = frame_input_pending_swap_.id;
+        unavailable.frame = frame_input_pending_swap_.frame;
+        unavailable.submission = frame_input_pending_swap_.submission;
+        unavailable.frontbuffer_ptr = frontbuffer_ptr;
+        unavailable.frontbuffer_width = width;
+        unavailable.frontbuffer_height = height;
+        try {
+          mailbox->DispatchFrameInputPreparedSwap(frame_input_pending_swap_.token, unavailable);
+        } catch (...) {}
+      }
+      try {
+        if (mailbox) {
+          mailbox->UnregisterFrameInputObserver(frame_input_pending_swap_.token);
+        }
+      } catch (...) {}
+    }
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    try {
+      if (frame_input_buffer_versions_) {
+        frame_input_buffer_versions_->Reset();
+      }
+    } catch (...) {}
+  }
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
-  const uint64_t frame_input_swap_frame = frame_current_;
-  const uint64_t frame_input_swap_submission = submission_current_;
-  auto fail_frame_input_observer = [this, frame_input_swap_frame, frame_input_swap_submission]() {
-    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false);
+  // Original issue owns this local identity on every exit, including early
+  // failures before a post-swap view exists.
+  const auto swap_identity = std::exchange(frame_input_pending_swap_, {});
+  const auto* prepared_identity = swap_identity.prepared ? &swap_identity : nullptr;
+  const uint64_t frame_input_swap_frame = prepared_identity ? swap_identity.frame : frame_current_;
+  const uint64_t frame_input_swap_submission =
+      prepared_identity ? swap_identity.submission : submission_current_;
+  auto fail_frame_input_observer = [this, frame_input_swap_frame, frame_input_swap_submission,
+                                    prepared_identity]() {
+    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false,
+                          prepared_identity);
   };
 
   if (!graphics_system_) {
@@ -2703,7 +2775,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // before the presenter refresh consumes the guest output. Submission status
   // is deliberately reported later by DispatchFrameInputEnd.
   DispatchFrameInputSwap(frame_input_swap_frame, frame_input_swap_submission, frontbuffer_ptr,
-                         frontbuffer_width, frontbuffer_height);
+                         frontbuffer_width, frontbuffer_height, prepared_identity);
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (source_width_scaled != frontbuffer_width_unscaled ||
                              source_height_scaled != frontbuffer_height_unscaled);
@@ -3041,7 +3113,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // before RefreshGuestOutput; this callback reports the eventual result.
   const bool outer_submission_succeeded = EndSubmission(true);
   if (!outer_submission_succeeded || swap_submission_failed) {
-    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false);
+    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false,
+                          prepared_identity);
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
     FailPendingDrawCaptureMailbox();
     FailLiveFrameCapture("submission_failure");
@@ -3065,7 +3138,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   // Complete the callback-delivered frame only after the original submission
   // has succeeded. No host texture or swap readback is created for this path.
-  DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, true);
+  DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, true,
+                        prepared_identity);
 
   bool swap_boundary_fence_succeeded = true;
   std::filesystem::path frame_capture_path;
@@ -4596,6 +4670,23 @@ void D3D12CommandProcessor::RecordFrameInputGuestMemoryDirtyRange(uint32_t physi
   }
 }
 
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryReadable(uint32_t physical_address,
+                                                            uint32_t length) const noexcept {
+  physical_address &= 0x1FFFFFFFu;
+  if (!memory_ || physical_address > SharedMemory::kBufferSize ||
+      uint64_t(length) > uint64_t(SharedMemory::kBufferSize) - physical_address) {
+    return false;
+  }
+  if (!length) {
+    return true;
+  }
+  auto* heap = memory_->GetPhysicalHeap();
+  return !IsFrameInputGuestMemoryDirty(physical_address, length) && heap &&
+         heap->QueryRangeAccess(physical_address, physical_address + length - 1) !=
+             rex::memory::PageAccess::kNoAccess &&
+         memory_->TranslatePhysical(physical_address) != nullptr;
+}
+
 bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_address,
                                                          uint32_t length) const noexcept {
   constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
@@ -4641,11 +4732,13 @@ void D3D12CommandProcessor::RefreshFrameInputObserver() {
     LogFrameInputCosts(frame_input_costs.Bind(false, nullptr, 0));
     frame_input_observer_token_ = {};
     frame_input_frame_open_ = false;
+    frame_input_prepared_draws_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
     return;
   }
   const auto token = mailbox->GetFrameInputObserverToken();
+  frame_input_prepared_draws_ = mailbox->HasFrameInputPreparedDrawObserver(token);
   LogFrameInputCosts(
       frame_input_costs.Bind(REXCVAR_GET(d3d12_frame_input_costs), this, token.value));
   if (token != frame_input_observer_token_) {
@@ -4663,7 +4756,7 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
     const IndexBufferInfo* index_buffer_info, bool major_mode_explicit, D3D12Shader* vertex_shader,
     D3D12Shader* pixel_shader, bool original_host_issued,
     diagnostic::DrawCaptureExecutionStatus execution_status,
-    diagnostic::DrawCaptureReason execution_reason) {
+    diagnostic::DrawCaptureReason execution_reason, bool prepared) {
   try {
     RefreshFrameInputObserver();
   } catch (...) {
@@ -4678,7 +4771,8 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
   } catch (...) {
     return;
   }
-  if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver()) {
+  if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver() ||
+      (prepared && !mailbox->HasFrameInputPreparedDrawObserver(token))) {
     return;
   }
 
@@ -4689,7 +4783,10 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
   FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kDrawTotal);
   const RegisterFile& regs = *register_file_;
   diagnostic::DrawCaptureFrameInputDrawView draw;
-  draw.id = frame_input_next_event_id_++;
+  draw.id = frame_input_next_event_id_;
+  if (!prepared) {
+    ++frame_input_next_event_id_;
+  }
   draw.frame = frame_current_;
   draw.submission = submission_current_;
   draw.registers = std::span<const uint32_t>(regs.values, RegisterFile::kRegisterCount);
@@ -4736,9 +4833,14 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
                           ? 0
                           : static_cast<uint32_t>(index_buffer_info->length);
   }
-  if (execution_status != diagnostic::DrawCaptureExecutionStatus::kIssued) {
-    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
-                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
+  auto dispatch_draw = [&] {
+    return ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback, [&] {
+      return prepared ? mailbox->DispatchFrameInputPreparedDraw(token, draw)
+                      : mailbox->DispatchFrameInputDraw(token, draw);
+    });
+  };
+  if (!prepared && execution_status != diagnostic::DrawCaptureExecutionStatus::kIssued) {
+    (void)dispatch_draw();
     return;
   }
 
@@ -4756,6 +4858,14 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       pipeline_cache_->AnalyzeShaderUcode(*guest_pixel_shader);
     }
     shader_cost_scope.Finish();
+
+    if (prepared && (!guest_vertex_shader || !guest_vertex_shader->is_ucode_analyzed() ||
+                     !guest_pixel_shader || !guest_pixel_shader->is_ucode_analyzed())) {
+      draw.cpu_data_complete = false;
+      draw.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+      (void)dispatch_draw();
+      return;
+    }
 
     const diagnostic::DrawCaptureGuestMemoryReader memory_reader{
         this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
@@ -4786,6 +4896,9 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
           } else if (IsFrameInputGuestMemoryDirty(view.physical_address, view.size)) {
             vertex_fetches_valid = false;
             vertex_fetch_dirty = true;
+          } else if (prepared &&
+                     !IsFrameInputGuestMemoryReadable(view.physical_address, view.size)) {
+            vertex_fetches_valid = false;
           } else {
             view.memory_version = GetFrameInputBufferVersion(view.physical_address, view.size);
           }
@@ -4797,17 +4910,24 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
     std::vector<std::array<uint32_t, 6>> texture_words;
     std::vector<diagnostic::DrawCaptureFrameInputTextureView> textures;
     FrameInputCostScope texture_cost_scope(costs, FrameInputCosts::Stage::kDrawTextures);
+    // Translation may still be asynchronous during preparation. Only original
+    // delivery reads its published bindings; prepared demand uses raw analysis.
     const size_t vertex_texture_binding_count =
-        vertex_shader ? vertex_shader->GetTextureBindingsAfterTranslation().size() : 0;
+        !prepared && vertex_shader ? vertex_shader->GetTextureBindingsAfterTranslation().size() : 0;
     const size_t pixel_texture_binding_count =
-        pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0;
+        !prepared && pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0;
     const size_t missing_pixel_texture_binding_count =
         (guest_pixel_shader && !pixel_shader) ? guest_pixel_shader->texture_bindings().size() : 0;
     const size_t texture_binding_count = vertex_texture_binding_count +
                                          pixel_texture_binding_count +
                                          missing_pixel_texture_binding_count;
+    const size_t prepared_binding_capacity =
+        prepared ? 2 * (guest_vertex_shader->texture_bindings().size() +
+                        guest_pixel_shader->texture_bindings().size())
+                 : 0;
     texture_words.reserve(
-        std::max<size_t>(xenos::kTextureFetchConstantCount, texture_binding_count));
+        std::max<size_t>(xenos::kTextureFetchConstantCount,
+                         std::max(texture_binding_count, prepared_binding_capacity)));
     textures.reserve(texture_words.capacity());
     bool texture_bindings_complete = true;
 
@@ -4847,6 +4967,44 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
         view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
         textures.push_back(view);
         return false;
+      }
+      if (prepared) {
+        if (!texture_cache_->PrepareFrameInputTexture(fetch, view)) {
+          textures.push_back(view);
+          return false;
+        }
+        view.component_mapping |=
+            D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        bool sampler_found = false;
+        for (const auto& sampler : samplers) {
+          if (sampler.fetch_constant != fetch_constant) {
+            continue;
+          }
+          const uint32_t value = texture_cache_->GetSamplerParameters(sampler).value;
+          if (sampler_found && view.sampler_value != value) {
+            view.available = false;
+            view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+            textures.push_back(view);
+            return false;
+          }
+          sampler_found = true;
+          view.sampler_value = value;
+        }
+        view.memory = memory_reader;
+        view.gpu_written = IsFrameInputGuestMemoryDirty(view.base_address, view.base_size) ||
+                           IsFrameInputGuestMemoryDirty(view.mip_address, view.mip_size);
+        if (!sampler_found ||
+            (view.required &&
+             (view.gpu_written ||
+              !IsFrameInputGuestMemoryReadable(view.base_address, view.base_size) ||
+              !IsFrameInputGuestMemoryReadable(view.mip_address, view.mip_size)))) {
+          view.available = false;
+          view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+        }
+        // Missing watches use the established guarded reader fallback. No
+        // active-upload token can describe this unprepared CPU metadata.
+        textures.push_back(view);
+        return view.available || !view.required;
       }
       if ((fetch.dimension == xenos::DataDimension::k1D && fetch.stacked) ||
           (fetch.dimension == xenos::DataDimension::k3D && fetch.stacked) ||
@@ -4906,6 +5064,31 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       if (!shader) {
         return;
       }
+      if (prepared) {
+        std::vector<Shader::PreparedTextureBinding> bindings;
+        std::vector<Shader::PreparedSamplerBinding> overrides;
+        if (!Shader::PrepareTextureBindings(shader->texture_bindings(), stage != 0, bindings,
+                                            overrides)) {
+          texture_bindings_complete = false;
+          return;
+        }
+        std::vector<D3D12Shader::SamplerBinding> samplers;
+        samplers.reserve(overrides.size());
+        for (const auto& binding : overrides) {
+          samplers.push_back({0, binding.fetch_constant, binding.sampler.mag_filter,
+                              binding.sampler.min_filter, binding.sampler.mip_filter,
+                              binding.sampler.aniso_filter});
+        }
+        for (size_t i = 0; i < bindings.size(); ++i) {
+          const auto& binding = bindings[i];
+          if (!append_texture_view(stage, static_cast<uint32_t>(i), binding.fetch_constant,
+                                   binding.is_signed, samplers, true,
+                                   diagnostic::DrawCaptureReason::kNone)) {
+            texture_bindings_complete = false;
+          }
+        }
+        return;
+      }
       const auto& bindings = shader->GetTextureBindingsAfterTranslation();
       const auto& samplers = shader->GetSamplerBindingsAfterTranslation();
       for (size_t binding_index = 0; binding_index < bindings.size(); ++binding_index) {
@@ -4927,7 +5110,11 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
         append_texture_view(1, static_cast<uint32_t>(binding_index), binding.fetch_constant, false,
                             {}, false, diagnostic::DrawCaptureReason::kTextureSource);
       }
-      texture_bindings_complete = guest_bindings.empty() && guest_pixel_shader->is_ucode_analyzed();
+      const bool omitted_pixel_bindings_complete =
+          guest_bindings.empty() && guest_pixel_shader->is_ucode_analyzed();
+      texture_bindings_complete = prepared
+                                      ? texture_bindings_complete && omitted_pixel_bindings_complete
+                                      : omitted_pixel_bindings_complete;
     }
     texture_cost_scope.Finish();
     if (costs) {
@@ -4961,6 +5148,10 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
                     !IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
       index_dirty = !index_valid && draw.index.size != 0 &&
                     IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
+      if (prepared && index_valid &&
+          !IsFrameInputGuestMemoryReadable(draw.index.physical_address, draw.index.size)) {
+        index_valid = false;
+      }
       const uint32_t element_size = draw.index.format == 0 ? 2 : draw.index.format == 1 ? 4 : 0;
       const uint64_t consumed_size = uint64_t(index_count) * element_size;
       if (index_valid && element_size && index_count && index_count <= draw.index.count &&
@@ -4989,27 +5180,24 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
       draw.cpu_data_complete = false;
       draw.unavailable_reason = diagnostic::DrawCaptureReason::kMemexport;
     }
-    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
-                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
+    (void)dispatch_draw();
   } catch (...) {
     // Diagnostic view preparation is auxiliary to the original command. A
     // failed allocation or unsupported descriptor must reach the observer as
-    // an incomplete event without escaping into PM4 execution.
+    // an incomplete event without changing the actual original result or
+    // escaping into PM4 execution.
     draw.vertex_fetches = {};
     draw.textures = {};
     draw.cpu_data_complete = false;
     draw.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
-    draw.execution_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
-    draw.execution_status = diagnostic::DrawCaptureExecutionStatus::kFailed;
-    (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback,
-                                    [&] { return mailbox->DispatchFrameInputDraw(token, draw); });
+    (void)dispatch_draw();
   }
 }
 
 void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
                                                    bool original_succeeded,
                                                    uint32_t written_address,
-                                                   uint32_t written_length) {
+                                                   uint32_t written_length, bool prepared) {
   try {
     RefreshFrameInputObserver();
   } catch (...) {
@@ -5025,69 +5213,39 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
   if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver()) {
     return;
   }
+  if (prepared && !mailbox->HasFrameInputPreparedCopyObserver(token)) {
+    return;
+  }
   diagnostic::DrawCaptureFrameInputCopyView copy;
   auto* costs = frame_input_costs.ForOwner(this);
   if (costs) {
     costs->Touch(frame_current_, submission_current_);
   }
   FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kCopyTotal);
-  copy.id = frame_input_next_event_id_++;
+  copy.id = frame_input_next_event_id_;
+  if (!prepared) {
+    ++frame_input_next_event_id_;
+  }
   copy.frame = frame_current_;
   copy.submission = submission_current_;
   copy.copy_mode = copy_mode;
   copy.original_succeeded = original_succeeded;
   copy.written_address = written_address;
   copy.written_length = written_length;
+  FrameInputCopyGeometry geometry;
   try {
-    const RegisterFile& regs = *register_file_;
-    const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-    copy.registers = std::span<const uint32_t>(regs.values, RegisterFile::kRegisterCount);
-    copy.source_geometry.fetch_constant = 0;
-    copy.source_geometry.physical_address = fetch.address * sizeof(uint32_t);
-    copy.source_geometry.size =
-        fetch.size > UINT32_MAX / sizeof(uint32_t) ? 0 : fetch.size * sizeof(uint32_t);
     copy.source_geometry.memory = {this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
-    // ResolveInfo reads the CPU-written resolve vertices. Require the complete
-    // range to be readable and free of GPU writes before entering it.
-    constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
-    const uint32_t source_address = copy.source_geometry.physical_address & kPhysicalAddressMask;
-    auto* physical_heap = memory_->GetPhysicalHeap();
-    const bool source_range_readable =
-        copy.source_geometry.size != 0 && source_address <= SharedMemory::kBufferSize &&
-        uint64_t(copy.source_geometry.size) <=
-            uint64_t(SharedMemory::kBufferSize) - source_address &&
-        !IsFrameInputGuestMemoryDirty(source_address, copy.source_geometry.size) &&
-        memory_->TranslatePhysical(copy.source_geometry.physical_address) != nullptr &&
-        physical_heap != nullptr &&
-        physical_heap->QueryRangeAccess(source_address,
-                                        source_address + copy.source_geometry.size - 1) !=
-            rex::memory::PageAccess::kNoAccess;
-    if (source_range_readable) {
-      copy.source_geometry.memory_version =
-          GetFrameInputBufferVersion(source_address, copy.source_geometry.size);
-    }
-    // ResolveInfo performs the same CPU-only vertex/scissor normalization as
-    // the original resolve path. Copy only its value rectangle into the view;
-    // never expose its temporary state or any host resource.
-    if (fetch.type == xenos::FetchConstantType::kVertex && fetch.size == 3 * 2 &&
-        source_range_readable) {
-      const auto copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
-      if (copy_control.copy_command == xenos::CopyCommand::kRaw ||
-          copy_control.copy_command == xenos::CopyCommand::kConvert) {
-        draw_util::ResolveInfo resolve_info;
-        const bool fixed_16_truncated_to_minus_1_to_1 =
-            render_target_cache_->IsFixed16TruncatedToMinus1To1();
-        if (draw_util::GetResolveInfo(
-                *register_file_, *memory_, texture_cache_->draw_resolution_scale_x(),
-                texture_cache_->draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
-                fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
-          copy.source_x = resolve_info.coordinate_info.edram_offset_x_div_8 * 8;
-          copy.source_y = resolve_info.coordinate_info.edram_offset_y_div_8 * 8;
-          copy.source_width = resolve_info.coordinate_info.width_div_8 * 8;
-          copy.source_height = resolve_info.height_div_8 * 8;
-          copy.source_rect_present = copy.source_width != 0 && copy.source_height != 0;
-        }
-      }
+    PrepareFrameInputCopyPlan(
+        copy, *register_file_, *memory_, texture_cache_->draw_resolution_scale_x(),
+        texture_cache_->draw_resolution_scale_y(),
+        render_target_cache_->IsFixed16TruncatedToMinus1To1(), geometry, prepared);
+    if (prepared && geometry.present) {
+      copy.source_geometry.memory = {&geometry, &FrameInputCopyGeometry::Read};
+    } else if (!prepared && copy.source_geometry.size &&
+               IsFrameInputGuestMemoryReadable(copy.source_geometry.physical_address,
+                                               copy.source_geometry.size)) {
+      copy.source_geometry.memory_version = GetFrameInputBufferVersion(
+          copy.source_geometry.physical_address & 0x1FFFFFFFu, copy.source_geometry.size);
     }
   } catch (...) {
     // Diagnostic view preparation is auxiliary to the original copy. Preserve
@@ -5095,75 +5253,68 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
     copy.registers = {};
     copy.source_geometry = {};
     copy.source_rect_present = false;
+    copy.cpu_data_complete = false;
+    copy.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
+    copy.planned_address = copy.planned_length = 0;
   }
-  (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kCopyCallback,
-                                  [&] { return mailbox->DispatchFrameInputCopy(token, copy); });
+  (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kCopyCallback, [&] {
+    return prepared ? mailbox->DispatchFrameInputPreparedCopy(token, copy)
+                    : mailbox->DispatchFrameInputCopy(token, copy);
+  });
 }
 
-void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t submission,
-                                                   uint64_t frontbuffer_ptr,
-                                                   uint32_t frontbuffer_width,
-                                                   uint32_t frontbuffer_height) {
+void D3D12CommandProcessor::DispatchFrameInputSwap(
+    uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr, uint32_t frontbuffer_width,
+    uint32_t frontbuffer_height, const FrameInputSwapIdentity* identity, bool prepared) {
   // Previous draw/copy views have returned. Swap views borrow no buffer token;
   // reclaim per-frame metadata before assembling the next boundary.
-  if (frame_input_buffer_versions_) {
+  if ((!identity || prepared) && frame_input_buffer_versions_) {
     frame_input_buffer_versions_->Reset();
   }
   try {
-    RefreshFrameInputObserver();
+    if (!identity) {
+      RefreshFrameInputObserver();
+    }
   } catch (...) {
     return;
   }
-  auto token = frame_input_observer_token_;
+  const auto token = identity ? identity->token : frame_input_observer_token_;
   std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
   try {
     mailbox = diagnostic::GetDrawCaptureMailbox();
   } catch (...) {
+    if (prepared) {
+      // The decoded owner retains the selected mailbox and fails that stream
+      // closed, including cleanup, without letting failure escape IssueSwap.
+      throw;
+    }
     return;
   }
-  if (!token || !mailbox->HasFrameInputObserver()) {
+  if (!token || token != frame_input_observer_token_ ||
+      token != mailbox->GetFrameInputObserverToken()) {
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
     return;
   }
+  // A prepared observer attached after decode starts at the next decoded
+  // boundary; a legacy post-swap cannot open its prepared stream retroactively.
+  if (!identity && mailbox->HasFrameInputPreparedSwapObserver(token)) {
+    return;
+  }
 
-  std::array<uint32_t, 256> gamma_256{};
   auto* costs = frame_input_costs.ForOwner(this);
   if (costs) {
     costs->Touch(frame, submission);
   }
-  std::array<uint32_t, 128 * 3> gamma_pwl_rgb{};
-  for (size_t i = 0; i < gamma_256.size(); ++i) {
-    gamma_256[i] = gamma_ramp_256_entry_table()[i].value;
-  }
-  for (size_t i = 0; i < gamma_pwl_rgb.size(); ++i) {
-    gamma_pwl_rgb[i] = gamma_ramp_pwl_rgb()[i].value;
-  }
-  const xenos::TextureFormat frontbuffer_format = register_file_->GetTextureFetch(0).format;
-  const bool use_pwl_gamma_ramp =
-      frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
-      frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
-  const SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
-  diagnostic::DrawCaptureFrameInputSwapView swap;
-  swap.id = frame_input_next_event_id_++;
-  swap.frame = frame;
-  swap.submission = submission;
-  swap.frontbuffer_ptr = frontbuffer_ptr;
-  swap.frontbuffer_width = frontbuffer_width;
-  swap.frontbuffer_height = frontbuffer_height;
-  swap.registers = std::span<const uint32_t>(register_file_->values, RegisterFile::kRegisterCount);
-  swap.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
-  swap.use_fxaa =
-      swap_post_effect == SwapPostEffect::kFxaa || swap_post_effect == SwapPostEffect::kFxaaExtreme;
-  swap.is_8bpc = !swap.use_pwl_gamma_ramp && !swap.use_fxaa;
-  swap.gamma_256 = gamma_256;
-  swap.gamma_pwl_rgb = gamma_pwl_rgb;
+  FrameInputSwapView storage;
+  const auto swap = storage.Build(
+      *register_file_, gamma_ramp_256_entry_table(), gamma_ramp_pwl_rgb(),
+      GetActualSwapPostEffect(), identity ? identity->id : frame_input_next_event_id_++, frame,
+      submission, frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // The original result is not known until the surrounding submission ends;
   // OnFrameEnd carries that result after the presenter refresh.
-  swap.original_succeeded = false;
-
-  if (!frame_input_frame_open_) {
+  if ((!identity || prepared) && !frame_input_frame_open_) {
     if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kBeginCallback,
                                    [&] { return mailbox->DispatchFrameInputBegin(token, swap); })) {
       frame_input_frame_open_ = false;
@@ -5173,8 +5324,13 @@ void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t subm
     }
     frame_input_frame_open_ = true;
   }
-  if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kSwapCallback,
-                                 [&] { return mailbox->DispatchFrameInputSwap(token, swap); })) {
+  if (!frame_input_frame_open_) {
+    return;
+  }
+  if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kSwapCallback, [&] {
+        return prepared ? mailbox->DispatchFrameInputPreparedSwap(token, swap)
+                        : mailbox->DispatchFrameInputSwap(token, swap);
+      })) {
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
@@ -5182,21 +5338,26 @@ void D3D12CommandProcessor::DispatchFrameInputSwap(uint64_t frame, uint64_t subm
   }
   // The swap closes the interval guard. Shared-memory page ownership still
   // protects GPU writes carried into the next frame until the CPU rewrites them.
-  frame_input_guest_memory_dirty_ranges_.clear();
-  frame_input_guest_memory_dirty_all_ = false;
+  if (!identity || prepared) {
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+  }
 }
 
 void D3D12CommandProcessor::DispatchFrameInputEnd(uint64_t frame, uint64_t submission,
-                                                  bool original_succeeded) {
+                                                  bool original_succeeded,
+                                                  const FrameInputSwapIdentity* identity) {
   try {
-    RefreshFrameInputObserver();
+    if (!identity) {
+      RefreshFrameInputObserver();
+    }
   } catch (...) {
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
     return;
   }
-  const auto token = frame_input_observer_token_;
+  const auto token = identity ? identity->token : frame_input_observer_token_;
   std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
   try {
     mailbox = diagnostic::GetDrawCaptureMailbox();
@@ -5206,7 +5367,8 @@ void D3D12CommandProcessor::DispatchFrameInputEnd(uint64_t frame, uint64_t submi
     frame_input_guest_memory_dirty_all_ = false;
     return;
   }
-  if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver()) {
+  if (!token || !frame_input_frame_open_ || token != frame_input_observer_token_ ||
+      token != mailbox->GetFrameInputObserverToken()) {
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
@@ -5222,15 +5384,14 @@ void D3D12CommandProcessor::DispatchFrameInputEnd(uint64_t frame, uint64_t submi
   if (costs) {
     LogFrameInputCosts(costs->EndFrame(delivered && original_succeeded));
   }
-  if (!delivered || !original_succeeded) {
+  if (!delivered || (!identity && !original_succeeded)) {
     frame_input_buffer_versions_.reset();
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
   }
-  // A successful swap boundary opens the following frame. Keep delivery enabled
-  // until the observer token changes, including between this swap and the next;
-  // a failed original swap closes the stream above.
+  // Prepared admission keeps successor CPU input independent of the original
+  // result. Rejection still closes either mode; legacy original failure closes.
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -5375,6 +5536,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  if (frame_input_prepared_draws_) {
+    DispatchFrameInputDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit,
+                           vertex_shader, pixel_shader, false,
+                           diagnostic::DrawCaptureExecutionStatus::kUnfinished,
+                           diagnostic::DrawCaptureReason::kNone, true);
+  }
 
   if (!BeginSubmission(true)) {
     frame_capture_->Abort(device, "begin_submission_failure");
@@ -6081,6 +6249,7 @@ bool D3D12CommandProcessor::IssueCopy() {
       GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   const char* copy_mode =
       readback_mode == ReadbackResolveMode::kDisabled ? "resolve" : "resolve_readback";
+  DispatchFrameInputCopy(copy_mode, false, 0, 0, true);
   if (!BeginSubmission(true)) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     FailLiveFrameCapture("begin_submission_failure");

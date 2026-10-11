@@ -461,10 +461,18 @@ struct DrawCaptureFrameInputCopyView {
   bool original_succeeded = false;
   uint32_t written_address = 0;
   uint32_t written_length = 0;
+  // CPU admission and prospective output only. These fields never establish a
+  // guest write or GPU completion; prepared callbacks retain zero written_*.
+  bool cpu_data_complete = false;
+  DrawCaptureReason unavailable_reason = DrawCaptureReason::kNone;
+  uint32_t planned_address = 0;
+  uint32_t planned_length = 0;
 };
 
 struct DrawCaptureFrameInputSwapView {
+  // Paired prepared/original views share this ordered observer-local ID.
   uint64_t id = 0;
+  // Backend observations may repeat after original failure.
   uint64_t frame = 0;
   uint64_t submission = 0;
   uint64_t frontbuffer_ptr = 0;
@@ -483,13 +491,25 @@ class DrawCaptureFrameInputObserver {
  public:
   virtual ~DrawCaptureFrameInputObserver() = default;
 
-  // The first swap is delivered as the boundary that opens the stream. A
-  // callback may perform bounded synchronous setup here.
+  // The first selected swap boundary opens the stream, at decode for prepared
+  // opt-in or at original swap otherwise. Setup is bounded and synchronous.
   virtual bool OnFrameBegin(const DrawCaptureFrameInputSwapView& boundary) = 0;
   virtual bool OnDraw(const DrawCaptureFrameInputDrawView& draw) = 0;
   virtual bool OnCopy(const DrawCaptureFrameInputCopyView& copy) = 0;
   virtual bool OnSwap(const DrawCaptureFrameInputSwapView& swap) = 0;
   virtual bool OnFrameEnd(uint64_t frame, uint64_t submission, bool original_succeeded) = 0;
+
+  // Opt in before registration. Prepared views borrow proven CPU inputs before
+  // original submission setup, with original execution still unfinished.
+  // Texture-dependent draws are incomplete until their CPU metadata is proved.
+  virtual bool WantsPreparedDraws() const noexcept { return false; }
+  virtual bool OnDrawPrepared(const DrawCaptureFrameInputDrawView&) { return false; }
+  virtual bool WantsPreparedCopies() const noexcept { return false; }
+  virtual bool OnCopyPrepared(const DrawCaptureFrameInputCopyView&) { return false; }
+  // Frozen at registration. The decoded boundary opens successor preparation;
+  // original End(false) is an observation, not closure of this prepared stream.
+  virtual bool WantsPreparedSwaps() const noexcept { return false; }
+  virtual bool OnSwapPrepared(const DrawCaptureFrameInputSwapView&) { return false; }
 };
 
 class DrawCaptureMailbox {
@@ -544,10 +564,26 @@ class DrawCaptureMailbox {
   bool UnregisterFrameInputObserver(ObserverToken token);
   bool HasFrameInputObserver() const noexcept;
   ObserverToken GetFrameInputObserverToken() const noexcept;
+  bool HasFrameInputPreparedDrawObserver(ObserverToken token) const noexcept;
+  bool HasFrameInputPreparedCopyObserver(ObserverToken token) const noexcept;
+  bool HasFrameInputPreparedSwapObserver(ObserverToken token) const noexcept;
   bool DispatchFrameInputBegin(ObserverToken token, const DrawCaptureFrameInputSwapView& boundary);
   bool DispatchFrameInputDraw(ObserverToken token, const DrawCaptureFrameInputDrawView& draw);
+  // This result is advisory and never authorizes suppression of original GPU
+  // work. A later OnDraw for the same observer retains the ID and actual result.
+  bool DispatchFrameInputPreparedDraw(ObserverToken token,
+                                      const DrawCaptureFrameInputDrawView& draw);
   bool DispatchFrameInputCopy(ObserverToken token, const DrawCaptureFrameInputCopyView& copy);
+  // Frozen opt-in and advisory result follow prepared draws. The later OnCopy
+  // retains the event ID and reports actual original results, including failure
+  // after a nonzero partial write.
+  bool DispatchFrameInputPreparedCopy(ObserverToken token,
+                                      const DrawCaptureFrameInputCopyView& copy);
   bool DispatchFrameInputSwap(ObserverToken token, const DrawCaptureFrameInputSwapView& swap);
+  // Borrows final CPU state before original GPU setup, with false original
+  // provenance. The later OnSwap retains its ID and OnFrameEnd its actual result.
+  bool DispatchFrameInputPreparedSwap(ObserverToken token,
+                                      const DrawCaptureFrameInputSwapView& swap);
   bool DispatchFrameInputEnd(ObserverToken token, uint64_t frame, uint64_t submission,
                              bool original_succeeded);
 
@@ -572,6 +608,9 @@ class DrawCaptureMailbox {
   bool DispatchFrameInputObserver(ObserverToken token, Callback&& callback);
   std::shared_ptr<ObserverState> observer_state_;
   std::atomic<uint64_t> observer_fast_token_{0};
+  std::atomic<uint64_t> observer_prepared_draw_token_{0};
+  std::atomic<uint64_t> observer_prepared_copy_token_{0};
+  std::atomic<uint64_t> observer_prepared_swap_token_{0};
   uint64_t next_observer_token_ = 1;
   mutable std::mutex observer_mutex_;
 };

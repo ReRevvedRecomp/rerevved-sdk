@@ -766,10 +766,23 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
+  return GetResolveInfo(regs, memory, draw_resolution_scale_x, draw_resolution_scale_y,
+                        fixed_rg16_truncated_to_minus_1_to_1,
+                        fixed_rgba16_truncated_to_minus_1_to_1, info_out, {});
+}
+
+bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    std::span<const float> vertices_guest_snapshot) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
   info_out.height_div_8 = 0;
+  if (!vertices_guest_snapshot.empty() && vertices_guest_snapshot.size() != 6) {
+    return false;
+  }
 
   auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
   info_out.rb_copy_control = rb_copy_control;
@@ -793,8 +806,10 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     assert_always();
     return false;
   }
-  const float* vertices_guest =
-      reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+  const float* vertices_guest = vertices_guest_snapshot.empty()
+                                    ? reinterpret_cast<const float*>(memory.TranslatePhysical(
+                                          fetch.address * sizeof(uint32_t)))
+                                    : vertices_guest_snapshot.data();
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
@@ -882,11 +897,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     y1 = y0 + int32_t(xenos::kMaxResolveSize);
   }
 
-  assert_true(x0 < x1 && y0 < y1);
   if (x0 >= x1 || y0 >= y1) {
     REXGPU_ERROR("Resolve region is empty");
     return false;
   }
+  assert_true(x0 < x1 && y0 < y1);
 
   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;
   info_out.height_div_8 = uint32_t(y1 - y0) >> xenos::kResolveAlignmentPixelsLog2;

@@ -224,6 +224,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
 
+  void OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
@@ -521,20 +522,33 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   void RefreshFrameInputObserver();
+  struct FrameInputSwapIdentity {
+    diagnostic::DrawCaptureMailbox::ObserverToken token;
+    uint64_t id = 0;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    bool prepared = false;
+  };
   void DispatchFrameInputDraw(
       xenos::PrimitiveType primitive_type, uint32_t index_count,
       const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
       D3D12Shader* vertex_shader, D3D12Shader* pixel_shader, bool original_host_issued = true,
       diagnostic::DrawCaptureExecutionStatus execution_status =
           diagnostic::DrawCaptureExecutionStatus::kIssued,
-      diagnostic::DrawCaptureReason execution_reason = diagnostic::DrawCaptureReason::kNone);
+      diagnostic::DrawCaptureReason execution_reason = diagnostic::DrawCaptureReason::kNone,
+      bool prepared = false);
   void DispatchFrameInputCopy(std::string_view copy_mode, bool original_succeeded,
-                              uint32_t written_address, uint32_t written_length);
+                              uint32_t written_address, uint32_t written_length,
+                              bool prepared = false);
   void DispatchFrameInputSwap(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
-                              uint32_t frontbuffer_width, uint32_t frontbuffer_height);
-  void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded);
+                              uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                              const FrameInputSwapIdentity* identity = nullptr,
+                              bool prepared = false);
+  void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded,
+                             const FrameInputSwapIdentity* identity = nullptr);
   void RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address, uint32_t length) noexcept;
   bool IsFrameInputGuestMemoryDirty(uint32_t physical_address, uint32_t length) const noexcept;
+  bool IsFrameInputGuestMemoryReadable(uint32_t physical_address, uint32_t length) const noexcept;
   diagnostic::DrawCaptureGuestMemoryVersion GetFrameInputBufferVersion(uint32_t address,
                                                                        uint32_t size) noexcept;
   static bool CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
@@ -810,8 +824,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // This is a stream token, independent of the legacy capture request token.
   // Event IDs are only meaningful within the active observer registration.
   diagnostic::DrawCaptureMailbox::ObserverToken frame_input_observer_token_;
+  FrameInputSwapIdentity frame_input_pending_swap_;
   uint64_t frame_input_next_event_id_ = 1;
   bool frame_input_frame_open_ = false;
+  bool frame_input_prepared_draws_ = false;
   std::unique_ptr<FrameInputBufferVersions> frame_input_buffer_versions_;
   // GPU writes that may make later CPU input views stale. Generated texture
   // bindings can still bypass the reader when their copy destination matches.

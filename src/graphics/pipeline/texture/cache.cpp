@@ -1365,6 +1365,86 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   }
 }
 
+bool TextureCache::PrepareFrameInputTexture(
+    const xenos::xe_gpu_texture_fetch_t& fetch,
+    diagnostic::DrawCaptureFrameInputTextureView& view) const {
+  view.available = false;
+  view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+  if (fetch.type != xenos::FetchConstantType::kTexture) {
+    return false;
+  }
+  if (fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked) {
+    view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureDimension;
+    return false;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(fetch.format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (!format_info->block_width || !format_info->block_height || !bytes_per_block ||
+      (bytes_per_block & (bytes_per_block - 1))) {
+    view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureFormat;
+    return false;
+  }
+  // Validate before the legacy assert-based metadata helpers. Mip-only and
+  // malformed pitch/LOD layouts are outside this CPU preparation subset.
+  const uint32_t width = fetch.size_2d.width + 1;
+  const uint32_t height = fetch.size_2d.height + 1;
+  if (!fetch.base_address || !fetch.pitch || (fetch.pitch << 5) < width ||
+      fetch.mip_min_level != 0 || fetch.mip_max_level > rex::log2_floor(std::max(width, height))) {
+    return false;
+  }
+  TextureKey key;
+  uint8_t signs;
+  BindingInfoFromFetchConstant(fetch, key, &signs);
+  if (!key.is_valid) {
+    return false;
+  }
+  TextureInfo info;
+  if (!TextureInfo::Prepare(fetch, &info)) {
+    return false;
+  }
+  const auto layout = key.GetGuestLayout();
+  // Keep the established observer's TextureInfo ranges. An uploaded-resource
+  // watch covers different extents in some layouts, especially packed mips.
+  // Reject undercoverage rather than claiming those missing bytes are complete.
+  if ((key.base_page && (info.memory.base_address != key.base_page << 12 ||
+                         info.memory.base_size < layout.base.level_data_extent_bytes)) ||
+      (layout.mips_total_extent_bytes && (info.memory.mip_address != key.mip_page << 12 ||
+                                          info.memory.mip_size < layout.mips_total_extent_bytes))) {
+    return false;
+  }
+  const auto range_valid = [](uint32_t address, uint32_t size) {
+    return address <= SharedMemory::kBufferSize &&
+           uint64_t(size) <= uint64_t(SharedMemory::kBufferSize) - address;
+  };
+  if ((!info.memory.base_size && !info.memory.mip_size) ||
+      !range_valid(info.memory.base_address, info.memory.base_size) ||
+      !range_valid(info.memory.mip_address, info.memory.mip_size)) {
+    return false;
+  }
+  view.format = static_cast<uint32_t>(info.format);
+  view.endianness = static_cast<uint32_t>(info.endianness);
+  view.dimension = static_cast<uint32_t>(info.dimension);
+  view.width = info.width;
+  view.height = info.height;
+  view.depth = info.depth;
+  view.pitch = info.pitch;
+  view.mip_min_level = info.mip_min_level;
+  view.mip_max_level = info.mip_max_level;
+  view.tiled = info.is_tiled;
+  view.packed_mips = info.has_packed_mips;
+  view.base_address = info.memory.base_address;
+  view.base_size = info.memory.base_size;
+  view.mip_address = info.memory.mip_address;
+  view.mip_size = info.memory.mip_size;
+  view.swizzled_signs = signs;
+  view.component_mapping = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
+  view.required = view.is_signed ? texture_util::IsAnySignSigned(signs)
+                                 : texture_util::IsAnySignNotSigned(signs);
+  view.available = true;
+  view.unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+  return true;
+}
+
 void TextureCache::ResetTextureBindings(bool from_destructor) {
   uint32_t bindings_reset = 0;
   for (size_t i = 0; i < texture_bindings_.size(); ++i) {

@@ -7,15 +7,12 @@
 set(REXGPU_XENOS_SOURCES
     # Core GPU types
     flags.cpp
-    register_file.cpp
-    registers.cpp
     pipeline/shader/shader.cpp
     format/ucode.cpp
     sampler_info.cpp
 
     # GPU system
     graphics_system.cpp
-    command_processor.cpp
     diagnostic_util.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp

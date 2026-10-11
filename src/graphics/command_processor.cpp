@@ -25,9 +25,6 @@
 
 #include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/flags.h>
-#include <rex/graphics/graphics_system.h>
-#include <rex/graphics/pipeline/texture/info.h>
-#include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -104,11 +101,15 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
 }  // namespace
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
-                                   system::KernelState* kernel_state)
-    : memory_(graphics_system->memory()),
-      kernel_state_(kernel_state),
+                                   CommandProcessorCpuContext cpu_context)
+    : memory_(cpu_context.memory),
+      kernel_state_(cpu_context.kernel_state),
       graphics_system_(graphics_system),
-      register_file_(graphics_system_->register_file()),
+      register_file_(cpu_context.register_file),
+      interrupt_owner_(cpu_context.interrupt_owner),
+      dispatch_interrupt_(cpu_context.dispatch_interrupt),
+      packet_admission_owner_(cpu_context.packet_admission_owner),
+      admit_packet_(cpu_context.admit_packet),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
@@ -137,23 +138,48 @@ bool CommandProcessor::Initialize() {
     }
   }
 
-  worker_running_ = true;
-  worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-        WorkerThreadMain();
-        return 0;
-      }));
-  worker_thread_->set_name("GPU Commands");
-  worker_thread_->Create();
+  worker_running_.store(true, std::memory_order_release);
+  worker_started_.store(true, std::memory_order_release);
+  worker_failed_.store(false, std::memory_order_release);
+  worker_stop_requested_.store(false, std::memory_order_release);
+  progress_sequence_.store(0, std::memory_order_release);
+  try {
+    worker_thread_ = system::object_ref<system::XHostThread>(
+        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+          WorkerThreadMain();
+          return 0;
+        }));
+    worker_thread_->set_name("GPU Commands");
+  } catch (...) {
+    worker_running_.store(false, std::memory_order_release);
+    worker_started_.store(false, std::memory_order_release);
+    worker_failed_.store(true, std::memory_order_release);
+    worker_thread_.reset();
+    return false;
+  }
+
+  const X_STATUS create_status = worker_thread_->Create();
+  if (XFAILED(create_status)) {
+    worker_running_.store(false, std::memory_order_release);
+    worker_started_.store(false, std::memory_order_release);
+    worker_failed_.store(true, std::memory_order_release);
+    worker_thread_.reset();
+    return false;
+  }
 
   return true;
 }
 
 void CommandProcessor::Shutdown() {
-  worker_running_ = false;
+  worker_running_.store(false, std::memory_order_release);
+  if (!worker_thread_) {
+    worker_started_.store(false, std::memory_order_release);
+    return;
+  }
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
+  worker_started_.store(false, std::memory_order_release);
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -200,12 +226,27 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  const auto publish_admission_failure = [this]() {
+    worker_failed_.store(true, std::memory_order_release);
+    worker_running_.store(false, std::memory_order_release);
+  };
+
   if (!SetupContext()) {
+    if (admit_packet_) {
+      REXGPU_ERROR("Unable to setup command processor internal state");
+      publish_admission_failure();
+      return;
+    }
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
 
   while (worker_running_) {
+    if (worker_stop_requested_.load(std::memory_order_acquire)) {
+      publish_admission_failure();
+      break;
+    }
+
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -213,7 +254,8 @@ void CommandProcessor::WorkerThreadMain() {
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
-    if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+    if (write_ptr_index == 0xBAADF00D ||
+        read_ptr_index_.load(std::memory_order_acquire) == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
@@ -232,16 +274,25 @@ void CommandProcessor::WorkerThreadMain() {
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+               !worker_stop_requested_.load(std::memory_order_acquire) &&
+               (write_ptr_index == 0xBAADF00D ||
+                read_ptr_index_.load(std::memory_order_acquire) == write_ptr_index));
       ReturnFromWait();
+      if (worker_stop_requested_.load(std::memory_order_acquire)) {
+        publish_admission_failure();
+        break;
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
     }
-    assert_true(read_ptr_index_ != write_ptr_index);
+    const uint32_t read_ptr_index = read_ptr_index_.load(std::memory_order_acquire);
+    assert_true(read_ptr_index != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    bool range_succeeded = true;
+    const uint32_t next_read_ptr_index =
+        ExecutePrimaryBuffer(read_ptr_index, write_ptr_index, &range_succeeded);
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -251,12 +302,24 @@ void CommandProcessor::WorkerThreadMain() {
       if (fence_trace.enabled()) {
         uint32_t old_value = memory::load_and_swap<uint32_t>(readback);
         auto readback_admission = fence_trace.AdmitReadPointerWriteback();
-        memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
+        memory::store_and_swap<uint32_t>(readback, next_read_ptr_index);
         fence_trace.ReadPointerWriteback(std::move(readback_admission), read_ptr_writeback_ptr_,
-                                         old_value, read_ptr_index_);
+                                         old_value, next_read_ptr_index);
       } else {
-        memory::store_and_swap<uint32_t>(readback, read_ptr_index_);
+        memory::store_and_swap<uint32_t>(readback, next_read_ptr_index);
       }
+    }
+
+    // The read index and terminal status become observable only after the
+    // guest writeback is complete. Progress is the synchronization point for
+    // consumers waiting on either value.
+    read_ptr_index_.store(next_read_ptr_index, std::memory_order_release);
+    if ((!range_succeeded && admit_packet_) ||
+        worker_stop_requested_.load(std::memory_order_acquire)) {
+      publish_admission_failure();
+    }
+    if (read_ptr_writeback_ptr_) {
+      progress_sequence_.fetch_add(1, std::memory_order_release);
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -295,7 +358,7 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
 
   stream->Write<uint32_t>(primary_buffer_ptr_);
   stream->Write<uint32_t>(primary_buffer_size_);
-  stream->Write<uint32_t>(read_ptr_index_);
+  stream->Write<uint32_t>(read_ptr_index_.load(std::memory_order_acquire));
   stream->Write<uint32_t>(read_ptr_update_freq_);
   stream->Write<uint32_t>(read_ptr_writeback_ptr_);
   stream->Write<uint32_t>(write_ptr_index_.load());
@@ -308,7 +371,7 @@ bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
   primary_buffer_size_ = stream->Read<uint32_t>();
-  read_ptr_index_ = stream->Read<uint32_t>();
+  read_ptr_index_.store(stream->Read<uint32_t>(), std::memory_order_release);
   read_ptr_update_freq_ = stream->Read<uint32_t>();
   read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
   write_ptr_index_.store(stream->Read<uint32_t>());
@@ -323,11 +386,11 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-  read_ptr_index_ = 0;
+  read_ptr_index_.store(0, std::memory_order_release);
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
-  diagnostic::GetXenosFenceTrace().RingInitialized(ptr, size_log2, read_ptr_index_,
-                                                   write_ptr_index_.load());
+  diagnostic::GetXenosFenceTrace().RingInitialized(
+      ptr, size_log2, read_ptr_index_.load(std::memory_order_acquire), write_ptr_index_.load());
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -352,6 +415,34 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
     fence_trace.WritePointerPublished(previous_value, value);
   }
   write_ptr_index_event_->Set();
+}
+
+bool CommandProcessor::PublishWritePointer(uint32_t value) {
+  if (!admit_packet_) {
+    UpdateWritePointer(value);
+    return true;
+  }
+
+  const uint32_t ring_words = primary_buffer_size_ / sizeof(uint32_t);
+  if (worker_failed_.load(std::memory_order_acquire) ||
+      worker_stop_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (!worker_started_.load(std::memory_order_acquire) ||
+      !worker_running_.load(std::memory_order_acquire)) {
+    worker_failed_.store(true, std::memory_order_release);
+    worker_running_.store(false, std::memory_order_release);
+    write_ptr_index_event_->Set();
+    return false;
+  }
+  if (!ring_words || value >= ring_words) {
+    worker_stop_requested_.store(true, std::memory_order_release);
+    write_ptr_index_event_->Set();
+    return false;
+  }
+
+  UpdateWritePointer(value);
+  return true;
 }
 
 uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
@@ -634,7 +725,8 @@ void CommandProcessor::PrepareForWait() {}
 
 void CommandProcessor::ReturnFromWait() {}
 
-uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index,
+                                                bool* range_succeeded_out) {
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
@@ -644,8 +736,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   auto& fence_trace = diagnostic::GetXenosFenceTrace();
   uint64_t observed_range = fence_trace.ConsumerRangeBegin(read_index, write_index);
   bool range_succeeded = true;
+  uint32_t failed_packet_index = read_index;
   do {
     uint32_t packet_start_index = reader.read_offset() / sizeof(uint32_t);
+    failed_packet_index = packet_start_index;
     bool packet_succeeded = ExecutePacket(&reader);
     if (observed_range) {
       fence_trace.PrimaryPacketObserved(packet_start_index, reader.read_offset() / sizeof(uint32_t),
@@ -654,7 +748,9 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     if (!packet_succeeded) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
-      assert_always();
+      if (!admit_packet_) {
+        assert_always();
+      }
       range_succeeded = false;
       break;
     }
@@ -666,6 +762,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     fence_trace.ConsumerRangeEnd(reader.read_offset() / sizeof(uint32_t), range_succeeded);
   }
 
+  if (range_succeeded_out) {
+    *range_succeeded_out = range_succeeded;
+  }
+  if (!range_succeeded && admit_packet_) {
+    return failed_packet_index;
+  }
   return write_index;
 }
 
@@ -679,7 +781,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
-      assert_always();
+      if (!admit_packet_) {
+        assert_always();
+      }
       break;
     }
   } while (reader.read_count());
@@ -692,14 +796,36 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   do {
     if (!ExecutePacket(&reader)) {
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
-      assert_always();
+      if (!admit_packet_) {
+        assert_always();
+      }
       break;
     }
   } while (reader.read_count());
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  uint32_t packet;
+  if (!admit_packet_) {
+    // Keep the legacy path's consume and bounds-check behavior unchanged.
+    packet = reader->ReadAndSwap<uint32_t>();
+  } else {
+    if (reader->read_count() < sizeof(uint32_t)) {
+      return false;
+    }
+    const uint32_t packet_start_offset = reader->read_offset();
+    packet = memory::load_and_swap<uint32_t>(reader->buffer() + packet_start_offset);
+    const uint32_t packet_type = packet >> 30;
+    uint32_t count = 0;
+    if (packet_type == 0x03) {
+      count = ((packet >> 16) & 0x3FFF) + 1;
+    }
+    if (!admit_packet_(packet_admission_owner_, reader, packet, count)) {
+      return false;
+    }
+    reader->ReadAndSwap<uint32_t>();
+  }
+
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
     return true;
@@ -952,10 +1078,14 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  if (!interrupt_owner_ || !dispatch_interrupt_) {
+    REXGPU_ERROR("PM4_INTERRUPT has no interrupt dispatch owner");
+    return false;
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
-      if (graphics_system_) {
-        graphics_system_->DispatchInterruptCallback(1, n);
+      if (!dispatch_interrupt_(interrupt_owner_, 1, n)) {
+        return false;
       }
     }
   }
@@ -1009,10 +1139,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
         static_cast<uint32_t>(fetch.format), frontbuffer_width, frontbuffer_height);
   }
   current_xenos_fence_trace_token_ = correlation_token;
+  OnSwapDecoded(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   current_xenos_fence_trace_token_ = 0;
 
-  ++counter_;
+  counter_.fetch_add(1, std::memory_order_release);
   return true;
 }
 
@@ -1258,7 +1389,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
-    data_value = counter_;
+    data_value = counter_.load(std::memory_order_acquire);
   } else {
     // Write value.
     data_value = value;

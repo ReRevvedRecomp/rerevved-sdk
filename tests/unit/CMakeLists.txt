@@ -2,6 +2,8 @@
 
 add_executable(unit_tests
     graphics/draw_capture_mailbox_test.cpp
+    graphics/command_processor_swap_test.cpp
+    graphics/prepared_resource_input_test.cpp
     graphics/frame_input_costs_test.cpp
     graphics/frame_input_buffer_versions_test.cpp
     graphics/shared_memory_test.cpp
@@ -41,16 +43,31 @@ add_executable(unit_tests
 if(WIN32 AND REXGLUE_USE_D3D12)
     target_sources(unit_tests PRIVATE
         ui/d3d12_presenter_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+        ${PROJECT_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp
     )
+    target_compile_definitions(unit_tests PRIVATE REX_TEST_DXBC_TRANSLATION=1)
     target_link_libraries(unit_tests PRIVATE d3d12)
 endif()
 
 target_sources(unit_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/graphics/graphics_system.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/sampler_info.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
-    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/format/ucode.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/shader.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
@@ -58,6 +75,7 @@ target_sources(unit_tests PRIVATE
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/src
     ${REXGLUE_ROOT}/thirdparty/renderdoc
     ${CMAKE_CURRENT_SOURCE_DIR}

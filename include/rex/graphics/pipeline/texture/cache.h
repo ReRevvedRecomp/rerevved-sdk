@@ -135,6 +135,13 @@ class TextureCache {
   diagnostic::DrawCaptureGuestMemoryVersion GetActiveTextureGuestMemoryVersion(
       uint32_t fetch_constant_index, bool is_signed) const;
 
+  // Read-only metadata from the current fetch, independent of RequestTextures.
+  // Only ordinary nonstacked 2D layouts whose legacy view covers the canonical
+  // cache ranges are admitted. This creates no texture, upload, descriptor or
+  // watch; the caller must prove readability and CPU ownership of required data.
+  bool PrepareFrameInputTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                diagnostic::DrawCaptureFrameInputTextureView& view) const;
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch

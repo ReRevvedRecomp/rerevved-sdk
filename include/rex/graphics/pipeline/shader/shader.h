@@ -521,6 +521,23 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  struct SamplerOverrides {
+    xenos::TextureFilter mag_filter = xenos::TextureFilter::kUseFetchConst;
+    xenos::TextureFilter min_filter = xenos::TextureFilter::kUseFetchConst;
+    xenos::TextureFilter mip_filter = xenos::TextureFilter::kUseFetchConst;
+    xenos::AnisoFilter aniso_filter = xenos::AnisoFilter::kUseFetchConst;
+    friend bool operator==(const SamplerOverrides&, const SamplerOverrides&) = default;
+    // D3D sampler normalization, shared by translation and CPU preparation.
+    void Normalize();
+  };
+  bool UsesComputedLod(bool is_pixel_shader) const {
+    return attributes.use_computed_lod && (is_pixel_shader || attributes.use_register_gradients);
+  }
+  SamplerOverrides GetSamplerOverrides(bool is_pixel_shader) const;
+  static xenos::FetchOpDimension NormalizeBindingDimension(xenos::FetchOpDimension dimension) {
+    return dimension == xenos::FetchOpDimension::k1D ? xenos::FetchOpDimension::k2D : dimension;
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(string::StringBuffer* out) const;
 };
@@ -699,6 +716,22 @@ class Shader {
     // Fetch instruction with all parameters.
     ParsedTextureFetchInstruction fetch_instr;
   };
+
+  struct PreparedTextureBinding {
+    uint32_t fetch_constant;
+    bool is_signed;
+  };
+  struct PreparedSamplerBinding {
+    uint32_t fetch_constant;
+    ParsedTextureFetchInstruction::SamplerOverrides sampler;
+  };
+  // CPU-only descriptor ordering for ordinary nonstacked 2D sample demand.
+  // Consumes immutable analyzed instructions, never translated binding state.
+  // Failure clears the output rather than publishing a partial binding layout.
+  static bool PrepareTextureBindings(const std::vector<TextureBinding>& bindings,
+                                     bool is_pixel_shader,
+                                     std::vector<PreparedTextureBinding>& output,
+                                     std::vector<PreparedSamplerBinding>& samplers);
 
   struct ConstantRegisterMap {
     // Bitmap of all kConstantFloat registers read by the shader.

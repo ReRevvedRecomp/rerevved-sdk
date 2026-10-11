@@ -192,6 +192,9 @@ DrawCaptureMailbox::ObserverToken DrawCaptureMailbox::RegisterFrameInputObserver
   if (!observer) {
     return {};
   }
+  const bool wants_prepared_draws = observer->WantsPreparedDraws();
+  const bool wants_prepared_copies = observer->WantsPreparedCopies();
+  const bool wants_prepared_swaps = observer->WantsPreparedSwaps();
   std::lock_guard lock(observer_mutex_);
   if (observer_state_ && (observer_state_->active || observer_state_->in_flight)) {
     return {};
@@ -203,6 +206,12 @@ DrawCaptureMailbox::ObserverToken DrawCaptureMailbox::RegisterFrameInputObserver
   state->token = ObserverToken{next_observer_token_++};
   state->observer = std::move(observer);
   observer_state_ = state;
+  observer_prepared_draw_token_.store(wants_prepared_draws ? state->token.value : 0,
+                                      std::memory_order_release);
+  observer_prepared_copy_token_.store(wants_prepared_copies ? state->token.value : 0,
+                                      std::memory_order_release);
+  observer_prepared_swap_token_.store(wants_prepared_swaps ? state->token.value : 0,
+                                      std::memory_order_release);
   observer_fast_token_.store(state->token.value, std::memory_order_release);
   return state->token;
 }
@@ -219,6 +228,9 @@ bool DrawCaptureMailbox::UnregisterFrameInputObserver(ObserverToken token) {
   state->active = false;
   state->unregistering = true;
   observer_fast_token_.store(0, std::memory_order_release);
+  observer_prepared_draw_token_.store(0, std::memory_order_release);
+  observer_prepared_copy_token_.store(0, std::memory_order_release);
+  observer_prepared_swap_token_.store(0, std::memory_order_release);
   if (callback_state == state.get()) {
     // The caller is inside this observer. Waiting here would deadlock; the
     // dispatch epilogue will complete the requested unregister.
@@ -237,6 +249,18 @@ bool DrawCaptureMailbox::HasFrameInputObserver() const noexcept {
 
 DrawCaptureMailbox::ObserverToken DrawCaptureMailbox::GetFrameInputObserverToken() const noexcept {
   return ObserverToken{observer_fast_token_.load(std::memory_order_acquire)};
+}
+
+bool DrawCaptureMailbox::HasFrameInputPreparedDrawObserver(ObserverToken token) const noexcept {
+  return token && observer_prepared_draw_token_.load(std::memory_order_acquire) == token.value;
+}
+
+bool DrawCaptureMailbox::HasFrameInputPreparedCopyObserver(ObserverToken token) const noexcept {
+  return token && observer_prepared_copy_token_.load(std::memory_order_acquire) == token.value;
+}
+
+bool DrawCaptureMailbox::HasFrameInputPreparedSwapObserver(ObserverToken token) const noexcept {
+  return token && observer_prepared_swap_token_.load(std::memory_order_acquire) == token.value;
 }
 
 template <typename Callback>
@@ -272,6 +296,9 @@ bool DrawCaptureMailbox::DispatchFrameInputObserver(ObserverToken token, Callbac
     if (!result) {
       state->active = false;
       observer_fast_token_.store(0, std::memory_order_release);
+      observer_prepared_draw_token_.store(0, std::memory_order_release);
+      observer_prepared_copy_token_.store(0, std::memory_order_release);
+      observer_prepared_swap_token_.store(0, std::memory_order_release);
     }
     assert(state->in_flight != 0);
     --state->in_flight;
@@ -298,16 +325,49 @@ bool DrawCaptureMailbox::DispatchFrameInputDraw(ObserverToken token,
       token, [&draw](DrawCaptureFrameInputObserver& observer) { return observer.OnDraw(draw); });
 }
 
+bool DrawCaptureMailbox::DispatchFrameInputPreparedDraw(ObserverToken token,
+                                                        const DrawCaptureFrameInputDrawView& draw) {
+  if (!HasFrameInputPreparedDrawObserver(token) || draw.original_host_issued ||
+      draw.execution_status != DrawCaptureExecutionStatus::kUnfinished ||
+      draw.execution_reason != DrawCaptureReason::kNone) {
+    return false;
+  }
+  return DispatchFrameInputObserver(token, [&draw](DrawCaptureFrameInputObserver& observer) {
+    return observer.OnDrawPrepared(draw);
+  });
+}
+
 bool DrawCaptureMailbox::DispatchFrameInputCopy(ObserverToken token,
                                                 const DrawCaptureFrameInputCopyView& copy) {
   return DispatchFrameInputObserver(
       token, [&copy](DrawCaptureFrameInputObserver& observer) { return observer.OnCopy(copy); });
 }
 
+bool DrawCaptureMailbox::DispatchFrameInputPreparedCopy(ObserverToken token,
+                                                        const DrawCaptureFrameInputCopyView& copy) {
+  if (!HasFrameInputPreparedCopyObserver(token) || copy.original_succeeded ||
+      copy.written_address || copy.written_length) {
+    return false;
+  }
+  return DispatchFrameInputObserver(token, [&copy](DrawCaptureFrameInputObserver& observer) {
+    return observer.OnCopyPrepared(copy);
+  });
+}
+
 bool DrawCaptureMailbox::DispatchFrameInputSwap(ObserverToken token,
                                                 const DrawCaptureFrameInputSwapView& swap) {
   return DispatchFrameInputObserver(
       token, [&swap](DrawCaptureFrameInputObserver& observer) { return observer.OnSwap(swap); });
+}
+
+bool DrawCaptureMailbox::DispatchFrameInputPreparedSwap(ObserverToken token,
+                                                        const DrawCaptureFrameInputSwapView& swap) {
+  if (!HasFrameInputPreparedSwapObserver(token) || swap.original_succeeded) {
+    return false;
+  }
+  return DispatchFrameInputObserver(token, [&swap](DrawCaptureFrameInputObserver& observer) {
+    return observer.OnSwapPrepared(swap);
+  });
 }
 
 bool DrawCaptureMailbox::DispatchFrameInputEnd(ObserverToken token, uint64_t frame,

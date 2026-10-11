@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -585,5 +586,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
+
+// Optional immutable CPU geometry, in the guest fetch's endianness. An empty
+// span retains the original guest-memory read; a supplied span must contain
+// exactly the six resolve vertex floats and is borrowed only during this call.
+bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    std::span<const float> vertices_guest);
 
 }  // namespace rex::graphics::draw_util
