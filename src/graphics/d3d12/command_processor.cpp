@@ -29,7 +29,9 @@
 #include "frame_capture.h"
 #include "frame_input_copy_plan.h"
 #include "frame_input_costs.h"
+#include "frame_input_draw_builder.h"
 #include "../frame_input_buffer_versions.h"
+#include "../frame_input_native_sources.h"
 #include "../frame_input_swap_view.h"
 
 #include <rex/graphics/xenos_fence_trace.h>
@@ -104,6 +106,24 @@ namespace rex::graphics::d3d12 {
 namespace {
 
 constexpr uint64_t kLiveFrameMaxReadbackBytes = UINT64_C(512) * 1024 * 1024;
+
+bool IsPreparedNativeResolvePlan(const diagnostic::DrawCaptureFrameInputCopyView& copy) {
+  if (copy.copy_mode != "resolve" || !copy.cpu_data_complete || !copy.planned_address ||
+      !copy.planned_length || copy.registers.size() <= XE_GPU_REG_RB_COPY_DEST_INFO) {
+    return false;
+  }
+  reg::RB_COPY_CONTROL control{};
+  control.value = copy.registers[XE_GPU_REG_RB_COPY_CONTROL];
+  reg::RB_COPY_DEST_INFO destination{};
+  destination.value = copy.registers[XE_GPU_REG_RB_COPY_DEST_INFO];
+  return control.copy_src_select == 0 && !control.color_clear_enable &&
+         !control.depth_clear_enable &&
+         (control.copy_command == xenos::CopyCommand::kRaw ||
+          control.copy_command == xenos::CopyCommand::kConvert) &&
+         !destination.copy_dest_array &&
+         (destination.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 ||
+          destination.copy_dest_format == xenos::ColorFormat::k_16_16_FLOAT);
+}
 
 thread_local FrameInputCosts frame_input_costs;
 
@@ -2197,6 +2217,13 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   // Retire CPU watches even if draining the GPU queue fails below.
   frame_input_buffer_versions_.reset();
+  // The native sideband holds references to both owners. Retire it at the
+  // same boundary, before either the queue-drain early return or shared memory
+  // teardown can invalidate those references.
+  frame_input_native_sources_.reset();
+  frame_input_native_source_rejections_.reset();
+  frame_input_native_sources_failed_ = false;
+  frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
   if (frame_input_costs.ForOwner(this)) {
     LogFrameInputCosts(frame_input_costs.Flush(FrameInputCosts::Reason::kShutdown));
     (void)frame_input_costs.Bind(false, nullptr, 0);
@@ -4687,8 +4714,8 @@ bool D3D12CommandProcessor::IsFrameInputGuestMemoryReadable(uint32_t physical_ad
          memory_->TranslatePhysical(physical_address) != nullptr;
 }
 
-bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_address,
-                                                         uint32_t length) const noexcept {
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirtyLedger(uint32_t physical_address,
+                                                               uint32_t length) const noexcept {
   constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
   const uint32_t address = physical_address & kPhysicalAddressMask;
   if (!length || address >= SharedMemory::kBufferSize ||
@@ -4704,6 +4731,20 @@ bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_addre
     if (uint64_t(address) < dirty_end && uint64_t(dirty.first) < end) {
       return true;
     }
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_address,
+                                                         uint32_t length) const noexcept {
+  constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
+  const uint32_t address = physical_address & kPhysicalAddressMask;
+  if (!length || address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - address) {
+    return false;
+  }
+  if (IsFrameInputGuestMemoryDirtyLedger(address, length)) {
+    return true;
   }
   return !shared_memory_ || shared_memory_->IsRangeWrittenByGpu(address, length);
 }
@@ -4729,6 +4770,8 @@ void D3D12CommandProcessor::RefreshFrameInputObserver() {
   const auto mailbox = diagnostic::GetDrawCaptureMailbox();
   if (!mailbox->HasFrameInputObserver()) {
     frame_input_buffer_versions_.reset();
+    frame_input_native_sources_.reset();
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
     LogFrameInputCosts(frame_input_costs.Bind(false, nullptr, 0));
     frame_input_observer_token_ = {};
     frame_input_frame_open_ = false;
@@ -4743,11 +4786,35 @@ void D3D12CommandProcessor::RefreshFrameInputObserver() {
       frame_input_costs.Bind(REXCVAR_GET(d3d12_frame_input_costs), this, token.value));
   if (token != frame_input_observer_token_) {
     frame_input_buffer_versions_.reset();
+    frame_input_native_sources_.reset();
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
     frame_input_observer_token_ = token;
     frame_input_next_event_id_ = 1;
     frame_input_frame_open_ = false;
     frame_input_guest_memory_dirty_ranges_.clear();
     frame_input_guest_memory_dirty_all_ = false;
+  }
+  if (frame_input_prepared_draws_ && !frame_input_native_sources_) {
+    try {
+      if (!frame_input_native_source_rejections_) {
+        frame_input_native_source_rejections_ =
+            std::make_unique<FrameInputNativeSourceRejections>();
+        // A failed allocation may have left no interval owner. Retain that
+        // uncertainty across observer replacement before allowing CPU reads.
+        if (frame_input_native_sources_failed_) {
+          frame_input_native_source_rejections_->FailClosed();
+        }
+      }
+      frame_input_native_sources_ = std::make_unique<FrameInputNativeSources>(
+          *memory_, *shared_memory_, frame_input_native_source_rejections_.get());
+    } catch (...) {
+      // Keep the original command running while native-source admission stays
+      // closed for this command processor lifetime.
+      frame_input_native_sources_failed_ = true;
+      if (frame_input_native_source_rejections_) {
+        frame_input_native_source_rejections_->FailClosed();
+      }
+    }
   }
 }
 
@@ -4809,20 +4876,9 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
   if (!guest_pixel_shader) {
     guest_pixel_shader = pixel_shader;
   }
-  if (guest_vertex_shader) {
-    draw.vertex_shader.present = true;
-    draw.vertex_shader.hash = guest_vertex_shader->ucode_data_hash();
-    draw.vertex_shader.words = std::span<const uint32_t>(guest_vertex_shader->ucode_dwords(),
-                                                         guest_vertex_shader->ucode_dword_count());
-  }
   // Host setup may omit the pixel shader for a depth-only draw. Retain the
   // guest program identity even when no host pixel shader was necessary.
-  if (guest_pixel_shader) {
-    draw.pixel_shader.present = true;
-    draw.pixel_shader.hash = guest_pixel_shader->ucode_data_hash();
-    draw.pixel_shader.words = std::span<const uint32_t>(guest_pixel_shader->ucode_dwords(),
-                                                        guest_pixel_shader->ucode_dword_count());
-  }
+  FrameInputDrawBuilder::PopulateShaderViews(guest_vertex_shader, guest_pixel_shader, draw);
   if (index_buffer_info) {
     draw.index.present = true;
     draw.index.format = static_cast<uint32_t>(index_buffer_info->format);
@@ -4869,6 +4925,73 @@ void D3D12CommandProcessor::DispatchFrameInputDraw(
 
     const diagnostic::DrawCaptureGuestMemoryReader memory_reader{
         this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
+    if (prepared) {
+      FrameInputCostScope texture_cost_scope(costs, FrameInputCosts::Stage::kDrawTextures);
+      FrameInputDrawBuilderInput builder_input{
+          regs,
+          *texture_cache_,
+          vertex_shader,
+          pixel_shader,
+          guest_vertex_shader,
+          guest_pixel_shader,
+          memory_reader,
+          [this](uint32_t address, uint32_t size) {
+            return IsFrameInputGuestMemoryDirtyLedger(address, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return !shared_memory_ ||
+                   shared_memory_->IsRangeWrittenByGpu(address & 0x1FFFFFFFu, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return IsFrameInputGuestMemoryReadable(address, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return GetFrameInputBufferVersion(address, size);
+          },
+          [this](const Shader::PreparedSamplerBinding& binding, uint32_t& value) {
+            D3D12Shader::SamplerBinding sampler{0,
+                                                binding.fetch_constant,
+                                                binding.sampler.mag_filter,
+                                                binding.sampler.min_filter,
+                                                binding.sampler.mip_filter,
+                                                binding.sampler.aniso_filter};
+            value = texture_cache_->GetSamplerParameters(sampler).value;
+            return true;
+          },
+          [this](uint32_t address, uint32_t size) {
+            address &= 0x1FFFFFFFu;
+            // A failed resolve invalidates every retained CPU range. Do this
+            // before native-source classification so the exact RG16 owner
+            // cannot bypass a fail-closed dirty-all ledger.
+            if (frame_input_guest_memory_dirty_all_) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            if (frame_input_native_sources_failed_ && !frame_input_native_source_rejections_) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            if (frame_input_native_sources_) {
+              switch (frame_input_native_sources_->Classify(address, size)) {
+                case FrameInputNativeSources::State::kUnresolved:
+                  return diagnostic::DrawCaptureReason::kTextureUnresolved;
+                case FrameInputNativeSources::State::kRejected:
+                  return diagnostic::DrawCaptureReason::kTextureSource;
+                default:
+                  break;
+              }
+            }
+            if (frame_input_native_source_rejections_ &&
+                frame_input_native_source_rejections_->Overlaps(address, size)) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            return diagnostic::DrawCaptureReason::kNone;
+          },
+          index_count};
+      FrameInputDrawBuilderResult builder_result;
+      (void)FrameInputDrawBuilder::BuildPrepared(builder_input, builder_result, draw);
+      texture_cost_scope.Finish();
+      (void)dispatch_draw();
+      return;
+    }
     std::vector<diagnostic::DrawCaptureFrameInputVertexFetchView> vertex_fetches;
     bool vertex_fetches_valid = vertex_shader != nullptr;
     bool vertex_fetch_dirty = false;
@@ -5256,6 +5379,59 @@ void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
     copy.cpu_data_complete = false;
     copy.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
     copy.planned_address = copy.planned_length = 0;
+  }
+  if (prepared && IsPreparedNativeResolvePlan(copy)) {
+    if (frame_input_native_sources_failed_) {
+      try {
+        if (!frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_ =
+              std::make_unique<FrameInputNativeSourceRejections>();
+        }
+        (void)frame_input_native_source_rejections_->Add(copy.planned_address, copy.planned_length);
+      } catch (...) {
+        if (frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_->FailClosed();
+        }
+      }
+      frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+    } else {
+      try {
+        if (!frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_ =
+              std::make_unique<FrameInputNativeSourceRejections>();
+        }
+        if (!frame_input_native_sources_) {
+          frame_input_native_sources_ = std::make_unique<FrameInputNativeSources>(
+              *memory_, *shared_memory_, frame_input_native_source_rejections_.get());
+        }
+        if (frame_input_native_sources_->Arm(copy.planned_address, copy.planned_length)) {
+          frame_input_native_source_address_ = copy.planned_address;
+          frame_input_native_source_length_ = copy.planned_length;
+        } else {
+          frame_input_native_sources_failed_ = true;
+          (void)frame_input_native_source_rejections_->Add(copy.planned_address,
+                                                           copy.planned_length);
+          frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+        }
+      } catch (...) {
+        // Native-source observation is auxiliary to the original command, but
+        // a failed owner must prevent a later draw from falling back to stale
+        // CPU bytes for this exact plan. Keep the observer alive and fail its
+        // metadata closed without changing ordinary CPU texture handling.
+        frame_input_native_sources_failed_ = true;
+        if (frame_input_native_source_rejections_) {
+          (void)frame_input_native_source_rejections_->Add(copy.planned_address,
+                                                           copy.planned_length);
+          frame_input_native_source_rejections_->FailClosed();
+        }
+        frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+      }
+    }
+  } else if (!prepared && frame_input_native_sources_ && frame_input_native_source_address_ &&
+             frame_input_native_source_length_) {
+    frame_input_native_sources_->Complete(frame_input_native_source_address_,
+                                          frame_input_native_source_length_, original_succeeded);
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
   }
   (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kCopyCallback, [&] {
     return prepared ? mailbox->DispatchFrameInputPreparedCopy(token, copy)
@@ -6254,6 +6430,15 @@ bool D3D12CommandProcessor::IssueCopy() {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     FailLiveFrameCapture("begin_submission_failure");
     frame_capture_copy.SetResult(false, "submission_failure");
+    // The prepared plan never reached a submitted owner when setup failed.
+    // Retain a rejected marker so the next frame cannot fall back to stale
+    // CPU bytes from the abandoned plan.
+    if (frame_input_native_sources_ && frame_input_native_source_address_ &&
+        frame_input_native_source_length_) {
+      frame_input_native_sources_->Reject(frame_input_native_source_address_,
+                                          frame_input_native_source_length_);
+      frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+    }
     DispatchFrameInputCopy(copy_mode, false, 0, 0);
     return false;
   }

@@ -69,6 +69,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_input_draw_builder.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
 )
@@ -88,6 +89,48 @@ target_link_libraries(unit_tests PRIVATE
 )
 if(WIN32)
     target_link_libraries(unit_tests PRIVATE ws2_32)
+endif()
+
+if(WIN32 AND REXGLUE_USE_D3D12)
+    # Private bridge archive for the title's isolated prepared-input proof.
+    # It keeps the SDK's analyzed shader, texture and guard objects behind the
+    # test boundary without exporting them through the runtime package.
+    add_library(prepared_frame_input_test_support STATIC
+        graphics/prepared_frame_input_test_support.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_input_draw_builder.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_input_sampler.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/graphics_system.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/sampler_info.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/diagnostic_util.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/format/ucode.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/shader.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+        ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/d3d12/frame_capture.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc.cpp
+    )
+    target_compile_definitions(prepared_frame_input_test_support PRIVATE REX_TEST_DXBC_TRANSLATION=1)
+    target_include_directories(prepared_frame_input_test_support PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src
+        ${REXGLUE_ROOT}/thirdparty/renderdoc
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(prepared_frame_input_test_support PRIVATE
+        rexcodegen
+        rexruntime
+        d3d12
+    )
+    if(WIN32)
+        target_link_libraries(prepared_frame_input_test_support PRIVATE ws2_32)
+    endif()
+    add_dependencies(unit_tests prepared_frame_input_test_support)
 endif()
 
 add_executable(mod_plugin_tests

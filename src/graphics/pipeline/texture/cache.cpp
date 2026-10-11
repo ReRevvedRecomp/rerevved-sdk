@@ -148,6 +148,110 @@ namespace {
 
 std::atomic<uint64_t> next_texture_instance_id{1};
 
+// TextureInfo's legacy base_size is the visible block payload. Prepared
+// native resolves own the complete tiled allocation, including tile padding
+// and the final guard tile, for this one captured float form. Keep this
+// exception local to the read-only Prepared view; ordinary texture cache
+// metadata and watches already use TextureGuestLayout's full extent.
+bool IsPreparedSignedRg16Float(const xenos::xe_gpu_texture_fetch_t& fetch,
+                               const diagnostic::DrawCaptureFrameInputTextureView& view,
+                               uint8_t swizzled_signs) {
+  // This is the one captured producer shape whose resolve range is known to
+  // include the tiled padding and guard tile. Keep the view correction tied
+  // to its complete source-backed descriptor rather than admitting another
+  // single-level RG16 fetch by coincidence.
+  constexpr uint32_t kWidth = 1280;
+  constexpr uint32_t kHeight = 720;
+  constexpr uint32_t kPitch = 40;
+  constexpr uint32_t kSwizzle = 0xB48;
+  constexpr uint8_t kAllSigned = uint8_t(xenos::TextureSign::kSigned) * uint8_t(0b01010101);
+  return view.is_signed && swizzled_signs == kAllSigned &&
+         fetch.format == xenos::TextureFormat::k_16_16_FLOAT &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.width + 1 == kWidth && fetch.size_2d.height + 1 == kHeight &&
+         fetch.pitch == kPitch && fetch.swizzle == kSwizzle && fetch.tiled && !fetch.packed_mips &&
+         fetch.mip_min_level == 0 && fetch.mip_max_level == 0 &&
+         fetch.sign_x == xenos::TextureSign::kSigned &&
+         fetch.sign_y == xenos::TextureSign::kSigned &&
+         fetch.sign_z == xenos::TextureSign::kSigned && fetch.sign_w == xenos::TextureSign::kSigned;
+}
+
+bool IsPreparedUnsignedBc1Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                 const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                 uint8_t swizzled_signs) {
+  constexpr uint32_t k64Width = 64;
+  constexpr uint32_t k64Height = 64;
+  constexpr uint32_t k64Pitch = 4;
+  constexpr uint32_t k64MipMaxLevel = 6;
+  constexpr uint32_t k128Width = 128;
+  constexpr uint32_t k128Height = 128;
+  constexpr uint32_t k128Pitch = 4;
+  constexpr uint32_t k128MipMaxLevel = 7;
+  constexpr uint32_t k256Width = 256;
+  constexpr uint32_t k256Height = 256;
+  constexpr uint32_t k256Pitch = 8;
+  constexpr uint32_t k256MipMaxLevel = 8;
+  constexpr uint32_t k256RectHeight = 128;
+  constexpr uint32_t k512Width = 512;
+  constexpr uint32_t k512Height = 512;
+  constexpr uint32_t k512Pitch = 16;
+  constexpr uint32_t k512MipMaxLevel = 9;
+  constexpr uint32_t kSwizzle = 0x688;
+  constexpr uint8_t kAllUnsigned = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
+  const uint32_t width = fetch.size_2d.width + 1;
+  const uint32_t height = fetch.size_2d.height + 1;
+  const bool is_64_square_form = width == k64Width && height == k64Height &&
+                                 fetch.pitch == k64Pitch && fetch.mip_max_level == k64MipMaxLevel;
+  const bool is_128_square_form = width == k128Width && height == k128Height &&
+                                  fetch.pitch == k128Pitch &&
+                                  fetch.mip_max_level == k128MipMaxLevel;
+  const bool is_256_square_form = width == k256Width && height == k256Height &&
+                                  fetch.pitch == k256Pitch &&
+                                  fetch.mip_max_level == k256MipMaxLevel;
+  const bool is_256_rectangular_form = width == k256Width && height == k256RectHeight &&
+                                       fetch.pitch == k256Pitch &&
+                                       fetch.mip_max_level == k256MipMaxLevel;
+  const bool is_512_square_form = width == k512Width && height == k512Height &&
+                                  fetch.pitch == k512Pitch &&
+                                  fetch.mip_max_level == k512MipMaxLevel;
+  return !view.is_signed && swizzled_signs == kAllUnsigned &&
+         fetch.format == xenos::TextureFormat::k_DXT1 &&
+         fetch.endianness == xenos::Endian::k8in16 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.swizzle == kSwizzle && !fetch.tiled && fetch.packed_mips &&
+         fetch.mip_min_level == 0 &&
+         (is_64_square_form || is_128_square_form || is_256_square_form ||
+          is_256_rectangular_form || is_512_square_form) &&
+         fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+bool IsPreparedUnsignedBc2Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                 const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                 uint8_t swizzled_signs) {
+  constexpr uint32_t kPitch = 4;
+  constexpr uint32_t kSwizzle = 0x688;
+  constexpr uint8_t kAllUnsigned = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
+  const uint32_t width = fetch.size_2d.width + 1;
+  const uint32_t height = fetch.size_2d.height + 1;
+  const bool is_square_form = width == 64 && height == 64 && fetch.mip_max_level == 6;
+  const bool is_128_square_form = width == 128 && height == 128 && fetch.mip_max_level == 7;
+  const bool is_rectangular_form = width == 128 && height == 256 && fetch.mip_max_level == 8;
+  return !view.is_signed && swizzled_signs == kAllUnsigned &&
+         fetch.format == xenos::TextureFormat::k_DXT2_3 &&
+         fetch.endianness == xenos::Endian::k8in16 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.pitch == kPitch && fetch.swizzle == kSwizzle && !fetch.tiled && fetch.packed_mips &&
+         fetch.mip_min_level == 0 &&
+         (is_square_form || is_128_square_form || is_rectangular_form) &&
+         fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
 struct TextureLoadDumpFilter {
   uint32_t address;
   uint32_t width;
@@ -1403,14 +1507,32 @@ bool TextureCache::PrepareFrameInputTexture(
     return false;
   }
   const auto layout = key.GetGuestLayout();
-  // Keep the established observer's TextureInfo ranges. An uploaded-resource
-  // watch covers different extents in some layouts, especially packed mips.
-  // Reject undercoverage rather than claiming those missing bytes are complete.
-  if ((key.base_page && (info.memory.base_address != key.base_page << 12 ||
-                         info.memory.base_size < layout.base.level_data_extent_bytes)) ||
-      (layout.mips_total_extent_bytes && (info.memory.mip_address != key.mip_page << 12 ||
-                                          info.memory.mip_size < layout.mips_total_extent_bytes))) {
+  // TextureInfo's visible-block size can omit bytes from a source-backed
+  // Prepared range. Expose the canonical layout only for the selected forms;
+  // ordinary texture-cache metadata and every other undercovered form remain
+  // unchanged.
+  const bool selected_signed_rg16 = IsPreparedSignedRg16Float(fetch, view, signs);
+  const bool selected_unsigned_bc1 = IsPreparedUnsignedBc1Packed(fetch, view, signs);
+  const bool selected_unsigned_bc2 = IsPreparedUnsignedBc2Packed(fetch, view, signs);
+  if (key.base_page && info.memory.base_address != key.base_page << 12) {
     return false;
+  }
+  if (layout.mips_total_extent_bytes) {
+    if (info.memory.mip_address != key.mip_page << 12) {
+      return false;
+    }
+    if (info.memory.mip_size < layout.mips_total_extent_bytes) {
+      if (!selected_unsigned_bc1 && !selected_unsigned_bc2) {
+        return false;
+      }
+      info.memory.mip_size = layout.mips_total_extent_bytes;
+    }
+  }
+  if (key.base_page && info.memory.base_size < layout.base.level_data_extent_bytes) {
+    if (!selected_signed_rg16 || !layout.base.level_data_extent_bytes) {
+      return false;
+    }
+    info.memory.base_size = layout.base.level_data_extent_bytes;
   }
   const auto range_valid = [](uint32_t address, uint32_t size) {
     return address <= SharedMemory::kBufferSize &&

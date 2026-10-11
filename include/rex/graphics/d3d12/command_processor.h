@@ -48,7 +48,9 @@
 
 namespace rex::graphics {
 class FrameInputBufferVersions;
-}
+class FrameInputNativeSourceRejections;
+class FrameInputNativeSources;
+}  // namespace rex::graphics
 
 namespace rex::graphics::d3d12 {
 
@@ -547,6 +549,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded,
                              const FrameInputSwapIdentity* identity = nullptr);
   void RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address, uint32_t length) noexcept;
+  bool IsFrameInputGuestMemoryDirtyLedger(uint32_t physical_address,
+                                          uint32_t length) const noexcept;
   bool IsFrameInputGuestMemoryDirty(uint32_t physical_address, uint32_t length) const noexcept;
   bool IsFrameInputGuestMemoryReadable(uint32_t physical_address, uint32_t length) const noexcept;
   diagnostic::DrawCaptureGuestMemoryVersion GetFrameInputBufferVersion(uint32_t address,
@@ -829,6 +833,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool frame_input_frame_open_ = false;
   bool frame_input_prepared_draws_ = false;
   std::unique_ptr<FrameInputBufferVersions> frame_input_buffer_versions_;
+  std::unique_ptr<FrameInputNativeSourceRejections> frame_input_native_source_rejections_;
+  std::unique_ptr<FrameInputNativeSources> frame_input_native_sources_;
+  bool frame_input_native_sources_failed_ = false;
+  uint32_t frame_input_native_source_address_ = 0;
+  uint32_t frame_input_native_source_length_ = 0;
   // GPU writes that may make later CPU input views stale. Generated texture
   // bindings can still bypass the reader when their copy destination matches.
   std::vector<std::pair<uint32_t, uint32_t>> frame_input_guest_memory_dirty_ranges_;

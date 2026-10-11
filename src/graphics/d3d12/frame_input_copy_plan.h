@@ -30,6 +30,60 @@ struct FrameInputCopyGeometry {
   }
 };
 
+namespace {
+
+// The selected clear resolve is the only clear combination owned by this
+// prepared boundary. Keep the values here beside the planner so a later
+// control bit cannot accidentally widen the admission surface.
+constexpr uint32_t kPreparedMainSurfaceInfo = 0x0A010280U;
+constexpr uint32_t kPreparedMainColorInfo = 0U;
+constexpr uint32_t kPreparedMainDepthInfo = 0x00000530U;
+constexpr uint32_t kPreparedMainModeControl = 6U;
+constexpr uint32_t kPreparedMainCopyControl = 0x00100340U;
+constexpr uint32_t kPreparedMainDestPitch = 0x02D00500U;
+constexpr uint32_t kPreparedMainDestInfo = 0x01000300U;
+constexpr uint32_t kPreparedMainHizClear = 0x00000FFFU;
+constexpr uint32_t kPreparedMainDepthClear = 0xFFFFFF00U;
+constexpr uint32_t kPreparedMainWindowOffset = 0U;
+constexpr uint32_t kPreparedMainWindowScissorTl = 0U;
+constexpr uint32_t kPreparedMainWindowScissorBr = 0x02D00280U;
+constexpr uint32_t kPreparedMainSetupMode = 0x00010000U;
+
+bool IsPreparedMainClear(const RegisterFile& registers, const FrameInputCopyGeometry& geometry,
+                         const diagnostic::DrawCaptureFrameInputCopyView& copy,
+                         const xenos::xe_gpu_vertex_fetch_t& fetch) {
+  const auto control = registers.Get<reg::RB_COPY_CONTROL>();
+  if (control.value != kPreparedMainCopyControl ||
+      registers[XE_GPU_REG_RB_SURFACE_INFO] != kPreparedMainSurfaceInfo ||
+      registers[XE_GPU_REG_RB_COLOR_INFO] != kPreparedMainColorInfo ||
+      registers[XE_GPU_REG_RB_DEPTH_INFO] != kPreparedMainDepthInfo ||
+      registers[XE_GPU_REG_RB_MODECONTROL] != kPreparedMainModeControl ||
+      registers[XE_GPU_REG_RB_COPY_DEST_PITCH] != kPreparedMainDestPitch ||
+      registers[XE_GPU_REG_RB_COPY_DEST_INFO] != kPreparedMainDestInfo ||
+      registers[XE_GPU_REG_RB_HIZ_CLEAR] != kPreparedMainHizClear ||
+      registers[XE_GPU_REG_RB_DEPTH_CLEAR] != kPreparedMainDepthClear ||
+      registers[XE_GPU_REG_PA_SC_WINDOW_OFFSET] != kPreparedMainWindowOffset ||
+      registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] != kPreparedMainWindowScissorTl ||
+      registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] != kPreparedMainWindowScissorBr ||
+      registers[XE_GPU_REG_PA_SU_SC_MODE_CNTL] != kPreparedMainSetupMode ||
+      registers[XE_GPU_REG_RB_COLOR_CLEAR] != 0 || registers[XE_GPU_REG_RB_COLOR_CLEAR_LO] != 0 ||
+      copy.source_x != 0 || copy.source_y != 0 || copy.source_width != 640 ||
+      copy.source_height != 720 || !geometry.present ||
+      fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 6) {
+    return false;
+  }
+
+  constexpr std::array<float, 6> kLeftGeometry = {-0.5F, -0.5F, 639.5F, -0.5F, 639.5F, 719.5F};
+  for (std::size_t index = 0; index < kLeftGeometry.size(); ++index) {
+    if (xenos::GpuSwap(geometry.vertices[index], fetch.endian) != kLeftGeometry[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 // CPU-only value preparation shared by both observer boundaries. The reader
 // must guard CPU accessibility and GPU ownership, as it does for draw inputs.
 inline void PrepareFrameInputCopyPlan(diagnostic::DrawCaptureFrameInputCopyView& copy,
@@ -158,10 +212,12 @@ inline void PrepareFrameInputCopyPlan(diagnostic::DrawCaptureFrameInputCopyView&
     copy.unavailable_reason = DrawCaptureReason::kNoEffect;
     return;
   }
+  const bool clear_requested = control.color_clear_enable || control.depth_clear_enable;
   if (!supported_input || !finite_vertices || !nondegenerate_vertices || !nonempty_scissor ||
-      !supported_destination || control.color_clear_enable || control.depth_clear_enable) {
-    // Legacy rectangle extraction does not admit unsupported CPU input or
-    // prove that either original clear occurred.
+      !supported_destination ||
+      (clear_requested && !IsPreparedMainClear(registers, geometry, copy, fetch))) {
+    // Prepared extraction admits only supported CPU input and the selected
+    // clear state; other clear combinations remain incomplete.
     return;
   }
   copy.cpu_data_complete = true;

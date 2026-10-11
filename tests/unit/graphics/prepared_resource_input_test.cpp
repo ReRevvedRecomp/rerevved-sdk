@@ -1,8 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <utility>
 
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/cache.h>
@@ -12,10 +15,13 @@
 #endif
 
 #include "graphics/d3d12/frame_input_copy_plan.h"
+#include "graphics/d3d12/frame_input_draw_builder.h"
+#include "graphics/frame_input_native_sources.h"
 #include "test_memory.h"
 
 namespace {
 using namespace rex::graphics;
+using namespace rex::graphics::d3d12;
 using diagnostic::DrawCaptureFrameInputCopyView;
 using diagnostic::DrawCaptureFrameInputTextureView;
 
@@ -124,6 +130,70 @@ std::vector<uint32_t> SampleUcode(bool computed_lod) {
   return words;
 }
 
+std::vector<uint32_t> NoTextureUcode() {
+  return {1 | (3 << 12), uint32_t(ucode::ControlFlowOpcode::kExecEnd) << 12, 0};
+}
+
+TEST_CASE("Prepared omitted host shader with no texture demand remains complete",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto no_texture_words = NoTextureUcode();
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, no_texture_words.data(), no_texture_words.size(),
+                    std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, no_texture_words.data(), no_texture_words.size(),
+                   std::endian::native);
+  const auto textured_words = SampleUcode(false);
+  DxbcShader textured_pixel(xenos::ShaderType::kPixel, 3, textured_words.data(),
+                            textured_words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+  textured_pixel.AnalyzeUcode(disassembly);
+  REQUIRE(vertex.is_ucode_analyzed());
+  REQUIRE(pixel.is_ucode_analyzed());
+  REQUIRE(pixel.texture_bindings().empty());
+  REQUIRE(!textured_pixel.texture_bindings().empty());
+
+  FrameInputDrawBuilderInput input{
+      registers,
+      cache,
+      &vertex,
+      nullptr,
+      &vertex,
+      &pixel,
+      {},
+      [](uint32_t, uint32_t) { return false; },
+      [](uint32_t, uint32_t) { return false; },
+      [](uint32_t, uint32_t) { return true; },
+      [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+      [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+        value = 0x1000;
+        return true;
+      },
+      [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+      0};
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  draw.index.present = false;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(FrameInputDrawBuilder::BuildPrepared(input, result, draw));
+  CHECK(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  CHECK(result.textures.empty());
+
+  input.guest_pixel_shader = &textured_pixel;
+  draw = {};
+  draw.index.present = false;
+  REQUIRE_FALSE(FrameInputDrawBuilder::BuildPrepared(input, result, draw));
+  CHECK_FALSE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+  CHECK_FALSE(result.texture_bindings_complete);
+  CHECK_FALSE(result.textures.empty());
+}
+
 TEST_CASE("Prepared binding metadata matches actual DXBC translation",
           "[graphics][prepared][dxbc]") {
   for (const auto stage : {xenos::ShaderType::kVertex, xenos::ShaderType::kPixel}) {
@@ -163,6 +233,2679 @@ TEST_CASE("Prepared binding metadata matches actual DXBC translation",
       }
     }
   }
+}
+#endif
+
+TEST_CASE("Prepared native source sideband rejects writes and overlapping plans",
+          "[graphics][prepared][native]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  auto* heap = const_cast<rex::memory::BaseHeap*>(memory.LookupHeap(0xA0000000));
+  REQUIRE(heap);
+  const uint32_t page = uint32_t(rex::memory::page_size());
+  uint32_t guest = 0;
+  REQUIRE(heap->Alloc(
+      page, page, rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+      rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, false, &guest));
+  const uint32_t address = memory.GetPhysicalAddress(guest);
+  {
+    rex::graphics::FrameInputNativeSources sources(memory, shared);
+    REQUIRE(sources.Arm(address, 16));
+    CHECK_FALSE(sources.Complete(address, 16, false));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    CHECK_FALSE(sources.Arm(address + 8, 16));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    *memory.TranslateVirtual<volatile uint32_t*>(guest) = 1;
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    shared.RangeWrittenByGpu(address, 16);
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    REQUIRE(heap->Protect(guest, page, rex::memory::kMemoryProtectNoAccess));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    REQUIRE(heap->Protect(guest, page,
+                          rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    shared.ClearCache();
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+
+    sources.Reset();
+    for (size_t index = 0; index < rex::graphics::FrameInputNativeSources::kMaxRanges; ++index) {
+      REQUIRE(sources.Arm(address + uint32_t(index * 32), 16));
+    }
+    CHECK_FALSE(sources.Arm(
+        address + uint32_t(rex::graphics::FrameInputNativeSources::kMaxRanges * 32), 16));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    // Once the sideband reaches its sticky cap, unrelated ranges must fail
+    // closed rather than fall through to stale CPU bytes.
+    CHECK(sources.Classify(
+              address + uint32_t(rex::graphics::FrameInputNativeSources::kMaxRanges * 32), 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    sources.Reset();
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    sources.Reset();
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    REQUIRE(heap->Decommit(guest, page));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+  }
+  REQUIRE(heap->Release(guest, nullptr));
+}
+
+TEST_CASE("Prepared native rejection coverage survives source replacement",
+          "[graphics][prepared][native]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  auto* heap = const_cast<rex::memory::BaseHeap*>(memory.LookupHeap(0xA0000000));
+  REQUIRE(heap);
+  const uint32_t page = uint32_t(rex::memory::page_size());
+  uint32_t guest = 0;
+  REQUIRE(heap->Alloc(
+      page, page, rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+      rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, false, &guest));
+  const uint32_t address = memory.GetPhysicalAddress(guest);
+
+  rex::graphics::FrameInputNativeSourceRejections rejections;
+  {
+    rex::graphics::FrameInputNativeSources sources(memory, shared, &rejections);
+    REQUIRE(sources.Arm(address, 16));
+    REQUIRE(sources.Complete(address, 16, true));
+    CHECK(sources.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+  }
+  // Retiring the borrowed source records its range. A changed-size fetch is
+  // rejected even though no new source owner has been constructed yet.
+  CHECK(rejections.Overlaps(address, 16));
+  CHECK(rejections.Overlaps(address, 32));
+
+  {
+    rex::graphics::FrameInputNativeSources replacement(memory, shared, &rejections);
+    CHECK(replacement.Classify(address, 32) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    REQUIRE(replacement.Arm(address, 16));
+    REQUIRE(replacement.Complete(address, 16, true));
+    // The active exact generation is still eligible; the persistent bank does
+    // not turn a mismatched alias into a native source.
+    CHECK_FALSE(rejections.Overlaps(address, 16));
+    CHECK(replacement.Classify(address, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kUnresolved);
+    CHECK(replacement.Classify(address + 4, 4) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+  }
+  // The successful generation's exact temporary rejection is retired again
+  // before its owner disappears, so a future observer cannot use CPU bytes.
+  CHECK(rejections.Overlaps(address, 16));
+
+  rex::graphics::FrameInputNativeSourceRejections sticky;
+  {
+    rex::graphics::FrameInputNativeSources sources(memory, shared, &sticky);
+    REQUIRE(sources.Arm(address, 16));
+    CHECK_FALSE(sources.Arm(address + 8, 16));
+  }
+  // An ambiguous overlapping plan is sticky and rejects a later unrelated
+  // range instead of allowing an unobserved plan to fall back to CPU bytes.
+  CHECK(sticky.Overlaps(address + page, 16));
+
+  // A later failed plan can extend an earlier rejection. Its non-overlapping
+  // tail must remain closed when a new observer changes its fetch range.
+  rex::graphics::FrameInputNativeSourceRejections failed_plans;
+  REQUIRE(failed_plans.Add(address, 16));
+  REQUIRE(failed_plans.Add(address + 8, 32));
+  {
+    rex::graphics::FrameInputNativeSources replacement(memory, shared, &failed_plans);
+    CHECK(replacement.Classify(address + 32, 4) ==
+          rex::graphics::FrameInputNativeSources::State::kRejected);
+    CHECK(replacement.Classify(address + page, 16) ==
+          rex::graphics::FrameInputNativeSources::State::kNone);
+  }
+
+  REQUIRE(heap->Release(guest, nullptr));
+}
+
+#ifdef REX_TEST_DXBC_TRANSLATION
+TEST_CASE("Prepared constructor emits an unresolved native source after analysis",
+          "[graphics][prepared][native]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.type = xenos::FetchConstantType::kTexture;
+    fetch.dimension = xenos::DataDimension::k2DOrStacked;
+    fetch.size_2d.width = 31;
+    fetch.size_2d.height = 31;
+    fetch.pitch = 1;
+    fetch.base_address = 16;
+    fetch.format = xenos::TextureFormat::k_8_8_8_8;
+    fetch.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+    fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kUnsigned;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilder::PopulateShaderViews(&vertex, &pixel, draw);
+  REQUIRE(draw.vertex_shader.present);
+  REQUIRE(draw.pixel_shader.present);
+  CHECK(draw.vertex_shader.hash == vertex.ucode_data_hash());
+  CHECK(draw.pixel_shader.hash == pixel.ucode_data_hash());
+  CHECK(draw.vertex_shader.words.size() == vertex.ucode_dword_count());
+  CHECK(draw.pixel_shader.words.size() == pixel.ucode_dword_count());
+  draw.index.present = false;
+  uint32_t sampler_calls = 0;
+  FrameInputDrawBuilderInput input{
+      registers,
+      cache,
+      &vertex,
+      &pixel,
+      &vertex,
+      &pixel,
+      {},
+      [](uint32_t, uint32_t) { return false; },
+      [](uint32_t, uint32_t) { return false; },
+      [](uint32_t, uint32_t) { return true; },
+      [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+      [&sampler_calls](const Shader::PreparedSamplerBinding& binding, uint32_t& value) {
+        ++sampler_calls;
+        value = 0x1000 + binding.fetch_constant;
+        return true;
+      },
+      [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kTextureUnresolved; },
+      0};
+  FrameInputDrawBuilderResult result;
+  REQUIRE(FrameInputDrawBuilder::BuildPrepared(input, result, draw));
+  CHECK(sampler_calls != 0);
+  CHECK_FALSE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureUnresolved);
+  CHECK_FALSE(result.textures.empty());
+  const auto unresolved =
+      std::find_if(result.textures.begin(), result.textures.end(), [](const auto& view) {
+        return view.required && !view.available &&
+               view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureUnresolved;
+      });
+  REQUIRE(unresolved != result.textures.end());
+  CHECK_FALSE(unresolved->gpu_written);
+  CHECK_FALSE(unresolved->memory_version.identity);
+  CHECK_FALSE(unresolved->memory_version.generation);
+  CHECK(unresolved->fetch_words.size() == 6);
+  CHECK(unresolved->width == 32);
+  CHECK(unresolved->height == 32);
+  CHECK(unresolved->depth == 1);
+  CHECK(unresolved->pitch == 1);
+  CHECK(unresolved->swizzled_signs == 0);
+
+  bool actual_gpu_written = true;
+  input.gpu_written = [&actual_gpu_written](uint32_t, uint32_t) { return actual_gpu_written; };
+  diagnostic::DrawCaptureFrameInputDrawView gpu_draw;
+  gpu_draw.vertex_shader.present = true;
+  gpu_draw.pixel_shader.present = true;
+  gpu_draw.index.present = false;
+  FrameInputDrawBuilderResult gpu_result;
+  REQUIRE(FrameInputDrawBuilder::BuildPrepared(input, gpu_result, gpu_draw));
+  const auto gpu_unresolved =
+      std::find_if(gpu_result.textures.begin(), gpu_result.textures.end(), [](const auto& view) {
+        return view.required && !view.available &&
+               view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureUnresolved;
+      });
+  REQUIRE(gpu_unresolved != gpu_result.textures.end());
+  CHECK(gpu_unresolved->gpu_written);
+  CHECK_FALSE(gpu_unresolved->memory_version.identity);
+  CHECK_FALSE(gpu_unresolved->memory_version.generation);
+
+  const auto unsigned_registers = registers;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    auto fetch = registers.GetTextureFetch(fetch_constant);
+    fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kSigned;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+  actual_gpu_written = false;
+  diagnostic::DrawCaptureFrameInputDrawView signed_draw;
+  signed_draw.vertex_shader.present = true;
+  signed_draw.pixel_shader.present = true;
+  FrameInputDrawBuilderResult signed_result;
+  CHECK_FALSE(FrameInputDrawBuilder::BuildPrepared(input, signed_result, signed_draw));
+  CHECK(signed_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+
+  // Changing the sign interpretation does not make rejected native bytes a
+  // CPU payload, even when the original resolve never set a GPU page flag.
+  rex::graphics::FrameInputNativeSourceRejections rejected_ranges;
+  for (const auto& view : result.textures) {
+    if (view.required) {
+      REQUIRE(rejected_ranges.Add(view.base_address, view.base_size));
+    }
+  }
+  rex::graphics::FrameInputNativeSources replacement(memory, shared, &rejected_ranges);
+  input.native_source = [&replacement](uint32_t address, uint32_t size) {
+    return replacement.Classify(address, size) ==
+                   rex::graphics::FrameInputNativeSources::State::kRejected
+               ? diagnostic::DrawCaptureReason::kTextureSource
+               : diagnostic::DrawCaptureReason::kNone;
+  };
+  CHECK_FALSE(FrameInputDrawBuilder::BuildPrepared(input, signed_result, signed_draw));
+  CHECK(signed_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+  registers = unsigned_registers;
+}
+
+TEST_CASE("Prepared optional signed companion failure preserves unsigned completeness",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.type = xenos::FetchConstantType::kTexture;
+    fetch.dimension = xenos::DataDimension::k2DOrStacked;
+    fetch.size_2d.width = 31;
+    fetch.size_2d.height = 31;
+    fetch.pitch = 1;
+    fetch.base_address = 16;
+    fetch.format = xenos::TextureFormat::k_8_8_8_8;
+    fetch.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+    fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kUnsigned;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+
+  uint32_t prepare_calls = 0;
+  uint32_t optional_prepare_failures = 0;
+  uint32_t gpu_written_calls = 0;
+  uint32_t readable_calls = 0;
+  uint32_t version_calls = 0;
+  uint32_t native_source_calls = 0;
+  FrameInputDrawBuilderInput input{registers,
+                                   cache,
+                                   &vertex,
+                                   &pixel,
+                                   &vertex,
+                                   &pixel,
+                                   {},
+                                   [](uint32_t, uint32_t) { return false; },
+                                   [&gpu_written_calls](uint32_t, uint32_t) {
+                                     ++gpu_written_calls;
+                                     return false;
+                                   },
+                                   [&readable_calls](uint32_t, uint32_t) {
+                                     ++readable_calls;
+                                     return true;
+                                   },
+                                   [&version_calls](uint32_t, uint32_t) {
+                                     ++version_calls;
+                                     return diagnostic::DrawCaptureGuestMemoryVersion{};
+                                   },
+                                   [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+                                     value = 0x1000;
+                                     return true;
+                                   },
+                                   [&native_source_calls](uint32_t, uint32_t) {
+                                     ++native_source_calls;
+                                     return diagnostic::DrawCaptureReason::kNone;
+                                   },
+                                   0};
+  input.prepare_texture = [&cache, &prepare_calls, &optional_prepare_failures](
+                              const xenos::xe_gpu_texture_fetch_t& fetch,
+                              diagnostic::DrawCaptureFrameInputTextureView& view) {
+    ++prepare_calls;
+    if (view.is_signed && !view.required) {
+      ++optional_prepare_failures;
+      view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureFormat;
+      return false;
+    }
+    return cache.PrepareFrameInputTexture(fetch, view);
+  };
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  draw.index.present = false;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(FrameInputDrawBuilder::BuildPrepared(input, result, draw));
+  CHECK(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  CHECK_FALSE(result.non_native_texture_incomplete);
+  CHECK(prepare_calls == 8);
+  CHECK(optional_prepare_failures == 4);
+  CHECK(gpu_written_calls == 8);
+  CHECK(readable_calls == 8);
+  CHECK(version_calls == 0);
+  CHECK(native_source_calls == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+  REQUIRE(result.textures.size() == 8);
+
+  const std::array<uint32_t, 4> expected_fetches{7, 7, 2, 2};
+  for (size_t stage = 0; stage < 2; ++stage) {
+    for (size_t binding = 0; binding < expected_fetches.size(); ++binding) {
+      const auto& view = result.textures[stage * expected_fetches.size() + binding];
+      CHECK(view.stage == stage);
+      CHECK(view.shader_binding_index == binding);
+      CHECK(view.fetch_constant == expected_fetches[binding]);
+      CHECK(view.fetch_words.size() == 6);
+      if (view.is_signed) {
+        CHECK_FALSE(view.required);
+        CHECK_FALSE(view.available);
+        CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureFormat);
+        CHECK_FALSE(view.memory_version.identity);
+        CHECK_FALSE(view.memory_version.generation);
+      } else {
+        CHECK(view.required);
+        CHECK(view.available);
+        CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+      }
+    }
+  }
+}
+#endif
+
+#ifdef REX_TEST_DXBC_TRANSLATION
+TEST_CASE("Prepared signed RG16 owner bypasses only its exact dirty range",
+          "[graphics][prepared][native]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.type = xenos::FetchConstantType::kTexture;
+    fetch.dimension = xenos::DataDimension::k2DOrStacked;
+    fetch.size_2d.width = 1279;
+    fetch.size_2d.height = 719;
+    fetch.pitch = 40;
+    fetch.base_address = 16;
+    fetch.format = xenos::TextureFormat::k_16_16_FLOAT;
+    fetch.tiled = true;
+    fetch.swizzle = 0xB48;
+    fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kSigned;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<diagnostic::DrawCaptureReason(uint32_t, uint32_t)> native_source,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    draw = {};
+    draw.vertex_shader.present = true;
+    draw.pixel_shader.present = true;
+    draw.index.present = false;
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        [](uint32_t, uint32_t) { return false; },
+        [](uint32_t, uint32_t) { return true; },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0x1000;
+          return true;
+        },
+        std::move(native_source),
+        0};
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  diagnostic::DrawCaptureFrameInputDrawView native_draw;
+  FrameInputDrawBuilderResult native_result;
+  const bool native_build =
+      build([](uint32_t, uint32_t) { return true; },
+            [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kTextureUnresolved; },
+            native_draw, native_result);
+  REQUIRE(native_build);
+  CHECK_FALSE(native_draw.cpu_data_complete);
+  CHECK(native_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureUnresolved);
+  CHECK(native_result.native_texture_unresolved);
+  const auto selected = std::find_if(
+      native_result.textures.begin(), native_result.textures.end(), [](const auto& view) {
+        return view.format == static_cast<uint32_t>(xenos::TextureFormat::k_16_16_FLOAT);
+      });
+  REQUIRE(selected != native_result.textures.end());
+  CHECK(selected->base_size == 0x398000);
+  CHECK(selected->swizzled_signs == 0x55);
+
+  // Shader::PrepareTextureBindings emits a signed and unsigned candidate for
+  // each fetch. The unsigned candidate is optional only when the actual
+  // selected fetch is the complete signed RG16 form; it must stay required
+  // for an unsigned or mixed-sign fetch.
+  size_t signed_owners = 0;
+  size_t unsigned_companions = 0;
+  for (const auto& view : native_result.textures) {
+    if (view.format != static_cast<uint32_t>(xenos::TextureFormat::k_16_16_FLOAT)) {
+      continue;
+    }
+    if (view.is_signed) {
+      ++signed_owners;
+      CHECK(view.required);
+    } else {
+      ++unsigned_companions;
+      CHECK_FALSE(view.required);
+      CHECK(view.base_size == 0x398000);
+    }
+  }
+  CHECK(signed_owners != 0);
+  CHECK(unsigned_companions != 0);
+
+  const auto signed_registers = registers;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    auto fetch = registers.GetTextureFetch(fetch_constant);
+    fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kUnsigned;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+  diagnostic::DrawCaptureFrameInputDrawView unsigned_draw;
+  FrameInputDrawBuilderResult unsigned_result;
+  CHECK_FALSE(build([](uint32_t, uint32_t) { return false; },
+                    [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+                    unsigned_draw, unsigned_result));
+  CHECK(unsigned_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+  const auto required_unsigned = std::find_if(
+      unsigned_result.textures.begin(), unsigned_result.textures.end(),
+      [](const auto& view) { return !view.is_signed && view.required && !view.available; });
+  REQUIRE(required_unsigned != unsigned_result.textures.end());
+  const auto optional_signed = std::find_if(
+      unsigned_result.textures.begin(), unsigned_result.textures.end(),
+      [](const auto& view) { return view.is_signed && !view.required && !view.available; });
+  REQUIRE(optional_signed != unsigned_result.textures.end());
+  CHECK(optional_signed->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+
+  registers = signed_registers;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    auto fetch = registers.GetTextureFetch(fetch_constant);
+    fetch.sign_y = xenos::TextureSign::kUnsignedBiased;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+  diagnostic::DrawCaptureFrameInputDrawView mixed_draw;
+  FrameInputDrawBuilderResult mixed_result;
+  CHECK_FALSE(build([](uint32_t, uint32_t) { return false; },
+                    [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+                    mixed_draw, mixed_result));
+  CHECK(mixed_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+  const auto required_mixed = std::find_if(
+      mixed_result.textures.begin(), mixed_result.textures.end(),
+      [](const auto& view) { return !view.is_signed && view.required && !view.available; });
+  REQUIRE(required_mixed != mixed_result.textures.end());
+  const auto required_mixed_signed =
+      std::find_if(mixed_result.textures.begin(), mixed_result.textures.end(),
+                   [](const auto& view) { return view.is_signed && view.required; });
+  REQUIRE(required_mixed_signed != mixed_result.textures.end());
+  registers = signed_registers;
+
+  diagnostic::DrawCaptureFrameInputDrawView dirty_draw;
+  FrameInputDrawBuilderResult dirty_result;
+  CHECK_FALSE(build([](uint32_t, uint32_t) { return true; },
+                    [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+                    dirty_draw, dirty_result));
+  CHECK(dirty_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+
+  // A fail-closed dirty-all ledger is reported as a rejected native source;
+  // retaining the old bytes must not turn that state into an RG16 owner.
+  diagnostic::DrawCaptureFrameInputDrawView dirty_all_draw;
+  FrameInputDrawBuilderResult dirty_all_result;
+  CHECK_FALSE(
+      build([](uint32_t, uint32_t) { return true; },
+            [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kTextureSource; },
+            dirty_all_draw, dirty_all_result));
+  CHECK(dirty_all_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+
+  // A signed binding with biased metadata is not admitted as the float owner.
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    auto fetch = registers.GetTextureFetch(fetch_constant);
+    fetch.sign_y = xenos::TextureSign::kUnsignedBiased;
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &fetch, sizeof(fetch));
+  }
+  diagnostic::DrawCaptureFrameInputDrawView mismatch_draw;
+  FrameInputDrawBuilderResult mismatch_result;
+  CHECK_FALSE(
+      build([](uint32_t, uint32_t) { return true; },
+            [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kTextureUnresolved; },
+            mismatch_draw, mismatch_result));
+  CHECK(mismatch_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+}
+
+TEST_CASE("Prepared unsigned 64x64 BC1 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc1Fetch{0x01000002, 0x155CB052, 0x000FE07F,
+                                                      0x00A80D10, 0x000001C3, 0x155C5A18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc1Fetch.data(), sizeof(kSelectedBc1Fetch));
+  }
+  auto selected_fetch = registers.GetTextureFetch(2);
+  selected_fetch.size_2d.width = 63;
+  selected_fetch.size_2d.height = 63;
+  selected_fetch.pitch = 4;
+  selected_fetch.mip_max_level = 6;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &selected_fetch, sizeof(selected_fetch));
+  }
+  selected_fetch = registers.GetTextureFetch(2);
+
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x1000);
+  CHECK(legacy.memory.mip_size == 0x2000);
+  CHECK(layout.base.level_data_extent_bytes == 0xF80);
+  CHECK(layout.base.row_pitch_bytes == 256);
+  CHECK(layout.mips_total_extent_bytes == 0x2340);
+  CHECK(layout.packed_level == 2);
+  CHECK(layout.mip_offsets_bytes[1] == 0);
+  CHECK(layout.mip_offsets_bytes[2] == 0x2000);
+  CHECK(layout.mips[1].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[1].array_slice_data_extent_bytes == 0x740);
+  CHECK(layout.mips[2].row_pitch_bytes == 256);
+  CHECK(layout.mips[2].x_extent_blocks == 8);
+  CHECK(layout.mips[2].y_extent_blocks == 4);
+  CHECK(layout.mips[2].array_slice_data_extent_bytes == 0x340);
+  CHECK(layout.mips[2].level_data_extent_bytes == 0x340);
+  for (uint32_t level = 0; level <= 6; ++level) {
+    const auto& level_layout =
+        level == 0 ? layout.base : (level == 1 ? layout.mips[1] : layout.mips[layout.packed_level]);
+    CHECK(level_layout.row_pitch_bytes == 256);
+  }
+  constexpr std::array<uint32_t, 7> kMipOffsets{0, 0, 0x2020, 0x2010, 0x2008, 0x2200, 0x2100};
+  for (uint32_t level = 0; level < layout.packed_level; ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    const uint32_t location = legacy.GetMipLocation(level, &offset_x, &offset_y, true);
+    const uint32_t bank_address =
+        level == 0 ? legacy.memory.base_address : legacy.memory.mip_address;
+    CHECK(location - bank_address == kMipOffsets[level]);
+    CHECK(offset_x == 0);
+    CHECK(offset_y == 0);
+  }
+  constexpr std::array<uint32_t, 5> kPackedX{4, 2, 1, 0, 0};
+  constexpr std::array<uint32_t, 5> kPackedY{0, 0, 0, 2, 1};
+  for (uint32_t level = layout.packed_level; level < kMipOffsets.size(); ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint32_t offset_z = 0;
+    REQUIRE(texture_util::GetPackedMipOffset(64, 64, 1, xenos::TextureFormat::k_DXT1, level,
+                                             offset_x, offset_y, offset_z));
+    CHECK(offset_z == 0);
+    CHECK(layout.mip_offsets_bytes[layout.packed_level] +
+              offset_y * layout.mips[layout.packed_level].row_pitch_bytes + offset_x * 8 ==
+          kMipOffsets[level]);
+    CHECK(offset_x == kPackedX[level - layout.packed_level]);
+    CHECK(offset_y == kPackedY[level - layout.packed_level]);
+  }
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.dimension == static_cast<uint32_t>(xenos::DataDimension::k2DOrStacked));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 6);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x1000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x2340);
+  CHECK(prepared_view.swizzled_signs == 0);
+  CHECK_FALSE(prepared_view.memory_version.identity);
+  CHECK_FALSE(prepared_view.memory_version.generation);
+  CHECK_FALSE(prepared_view.memory_version.check);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+      CHECK(view.base_address == key.base_page << 12);
+      CHECK(view.base_size == 0x1000);
+      CHECK(view.mip_address == key.mip_page << 12);
+      CHECK(view.mip_size == 0x2340);
+      CHECK(view.width == 64);
+      CHECK(view.height == 64);
+      CHECK(view.pitch == 4);
+      CHECK(view.mip_max_level == 6);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+      CHECK_FALSE(view.memory_version.check);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+      CHECK_FALSE(view.memory_version.check);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t base_address = key.base_page << 12;
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0x2000;
+  const uint32_t tail_end = mip_address + 0x2340;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0x2000));
+  CHECK(overlaps_tail(mip_address, 0x2340));
+  const auto expect_texture_source_rejection =
+      [&](std::function<bool(uint32_t, uint32_t)> dirty,
+          std::function<bool(uint32_t, uint32_t)> gpu_written,
+          std::function<bool(uint32_t, uint32_t)> readable) {
+        diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+        FrameInputDrawBuilderResult rejected_result;
+        CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable),
+                          rejected_draw, rejected_result));
+        CHECK_FALSE(rejected_draw.cpu_data_complete);
+        CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+        const auto required =
+            std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                         [](const auto& view) { return !view.is_signed && view.required; });
+        REQUIRE(required != rejected_result.textures.end());
+        CHECK_FALSE(required->available);
+        CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+        CHECK(required->base_address == base_address);
+        CHECK(required->base_size == 0x1000);
+        CHECK(required->mip_address == mip_address);
+        CHECK(required->mip_size == 0x2340);
+      };
+  expect_texture_source_rejection(
+      [base_address](uint32_t address, uint32_t) { return address == base_address; },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [mip_address](uint32_t address, uint32_t) { return address == mip_address; },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; },
+      [base_address](uint32_t address, uint32_t) { return address == base_address; },
+      [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; },
+      [mip_address](uint32_t address, uint32_t) { return address == mip_address; },
+      [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+      [mip_address](uint32_t address, uint32_t) { return address != mip_address; });
+
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto required =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(required != rejected_result.textures.end());
+    CHECK_FALSE(required->available);
+    CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(required->base_size == 0x1000);
+    CHECK(required->mip_size == 0x2340);
+  };
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (address == mip_address && overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= size == 0x2340;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= size == 0x2340;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= size == 0x2340;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
+  reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 127; });
+  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 127; });
+  reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 8; });
+  reject_fetch("mip_max_level", [](auto& fetch) { fetch.mip_max_level = 7; });
+  reject_fetch("endianness", [](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch("swizzle", [](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch("signed component", [](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch("tiled", [](auto& fetch) { fetch.tiled = true; });
+  reject_fetch("cube", [](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch("stacked", [](auto& fetch) { fetch.stacked = true; });
+  reject_fetch("base_address", [](auto& fetch) { fetch.base_address = 0; });
+  reject_fetch("mip_min_level", [](auto& fetch) { fetch.mip_min_level = 1; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+
+  const auto ordinary_fetch = [&] {
+    auto fetch = selected_fetch;
+    fetch.packed_mips = false;
+    return fetch;
+  }();
+  DrawCaptureFrameInputTextureView ordinary_view;
+  REQUIRE(cache.PrepareFrameInputTexture(ordinary_fetch, ordinary_view));
+  TextureInfo ordinary_info;
+  REQUIRE(TextureInfo::Prepare(ordinary_fetch, &ordinary_info));
+  TestTextureCache::TextureKey ordinary_key;
+  TestTextureCache::BindingInfoFromFetchConstant(ordinary_fetch, ordinary_key, nullptr);
+  const auto ordinary_layout = ordinary_key.GetGuestLayout();
+  CHECK(ordinary_view.available);
+  CHECK_FALSE(ordinary_view.packed_mips);
+  CHECK(ordinary_view.base_size == ordinary_info.memory.base_size);
+  CHECK(ordinary_view.mip_size == ordinary_info.memory.mip_size);
+  CHECK(ordinary_view.base_size >= ordinary_layout.base.level_data_extent_bytes);
+  CHECK(ordinary_view.mip_size >= ordinary_layout.mips_total_extent_bytes);
+}
+
+TEST_CASE("Prepared unsigned BC1 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc1Fetch{0x01000002, 0x155CB052, 0x000FE07F,
+                                                      0x00A80D10, 0x000001C3, 0x155C5A18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc1Fetch.data(), sizeof(kSelectedBc1Fetch));
+  }
+
+  const auto selected_fetch = registers.GetTextureFetch(2);
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x2000);
+  CHECK(legacy.memory.mip_size == 0x4000);
+  CHECK(layout.base.level_data_extent_bytes == 0x2000);
+  CHECK(layout.mips_total_extent_bytes == 0x4340);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 7);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x2000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x4340);
+  CHECK(prepared_view.swizzled_signs == 0);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.base_size == 0x2000);
+      CHECK(view.mip_size == 0x4340);
+      CHECK(view.width == 128);
+      CHECK(view.height == 128);
+      CHECK(view.pitch == 4);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+
+  const auto expect_texture_source_rejection =
+      [&](std::function<bool(uint32_t, uint32_t)> dirty,
+          std::function<bool(uint32_t, uint32_t)> gpu_written,
+          std::function<bool(uint32_t, uint32_t)> readable) {
+        diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+        FrameInputDrawBuilderResult rejected_result;
+        CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable),
+                          rejected_draw, rejected_result));
+        CHECK_FALSE(rejected_draw.cpu_data_complete);
+        CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+        const auto required =
+            std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                         [](const auto& view) { return !view.is_signed && view.required; });
+        REQUIRE(required != rejected_result.textures.end());
+        CHECK_FALSE(required->available);
+        CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      };
+  const uint32_t base_address = key.base_page << 12;
+  const uint32_t mip_address = key.mip_page << 12;
+  expect_texture_source_rejection(
+      [base_address](uint32_t address, uint32_t) { return address == base_address; },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [mip_address](uint32_t address, uint32_t) { return address == mip_address; },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; },
+      [base_address](uint32_t address, uint32_t) { return address == base_address; },
+      [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; },
+      [mip_address](uint32_t address, uint32_t) { return address == mip_address; },
+      [](uint32_t, uint32_t) { return true; });
+  expect_texture_source_rejection(
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+      [mip_address](uint32_t address, uint32_t) { return address != mip_address; });
+
+  const auto reject_fetch = [&](auto mutate) {
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch([](auto& fetch) { fetch.tiled = true; });
+  reject_fetch([](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch([](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch([](auto& fetch) { fetch.format = xenos::TextureFormat::k_8_8_8_8; });
+  reject_fetch([](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+  reject_fetch([](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch([](auto& fetch) { fetch.stacked = true; });
+  reject_fetch([](auto& fetch) { fetch.base_address = 0; });
+  reject_fetch([](auto& fetch) { fetch.mip_min_level = 1; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 8; });
+}
+
+TEST_CASE("Prepared unsigned 256x256 BC1 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc1Fetch{0x01000002, 0x155CB052, 0x000FE07F,
+                                                      0x00A80D10, 0x000001C3, 0x155C5A18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc1Fetch.data(), sizeof(kSelectedBc1Fetch));
+  }
+  auto selected_fetch = registers.GetTextureFetch(2);
+  selected_fetch.size_2d.width = 255;
+  selected_fetch.size_2d.height = 255;
+  selected_fetch.pitch = 8;
+  selected_fetch.mip_max_level = 8;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &selected_fetch, sizeof(selected_fetch));
+  }
+  selected_fetch = registers.GetTextureFetch(2);
+
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x8000);
+  CHECK(legacy.memory.mip_size == 0x6000);
+  CHECK(layout.base.level_data_extent_bytes == 0x8000);
+  CHECK(layout.base.row_pitch_bytes == 512);
+  CHECK(layout.mips_total_extent_bytes == 0x6340);
+  CHECK(layout.packed_level == 4);
+  CHECK(layout.mip_offsets_bytes[1] == 0);
+  CHECK(layout.mip_offsets_bytes[2] == 0x2000);
+  CHECK(layout.mip_offsets_bytes[3] == 0x4000);
+  CHECK(layout.mip_offsets_bytes[4] == 0x6000);
+  CHECK(layout.mip_offsets_bytes[5] == 0);
+  CHECK(layout.mip_offsets_bytes[6] == 0);
+  CHECK(layout.mip_offsets_bytes[7] == 0);
+  CHECK(layout.mip_offsets_bytes[8] == 0);
+  constexpr std::array<uint32_t, 9> kMipOffsets{0,      0,      0x2000, 0x4000, 0x6020,
+                                                0x6010, 0x6008, 0x6200, 0x6100};
+  for (uint32_t level = 0; level < 4; ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    const uint32_t location = legacy.GetMipLocation(level, &offset_x, &offset_y, true);
+    const uint32_t bank_address =
+        level == 0 ? legacy.memory.base_address : legacy.memory.mip_address;
+    CHECK(location - bank_address == kMipOffsets[level]);
+    CHECK(offset_x == 0);
+    CHECK(offset_y == 0);
+  }
+  for (uint32_t level = layout.packed_level; level < kMipOffsets.size(); ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint32_t offset_z = 0;
+    REQUIRE(texture_util::GetPackedMipOffset(256, 256, 1, xenos::TextureFormat::k_DXT1, level,
+                                             offset_x, offset_y, offset_z));
+    CHECK(offset_z == 0);
+    CHECK(layout.mip_offsets_bytes[layout.packed_level] +
+              offset_y * layout.mips[layout.packed_level].row_pitch_bytes + offset_x * 8 ==
+          kMipOffsets[level]);
+  }
+  CHECK(layout.mips[1].row_pitch_bytes == 256);
+  CHECK(layout.mips[1].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[1].array_slice_data_extent_bytes == 0x2000);
+  CHECK(layout.mips[2].row_pitch_bytes == 256);
+  CHECK(layout.mips[2].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[2].array_slice_data_extent_bytes == 0xF80);
+  CHECK(layout.mips[3].row_pitch_bytes == 256);
+  CHECK(layout.mips[3].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[3].array_slice_data_extent_bytes == 0x740);
+  CHECK(layout.mips[4].row_pitch_bytes == 256);
+  CHECK(layout.mips[4].x_extent_blocks == 8);
+  CHECK(layout.mips[4].y_extent_blocks == 4);
+  CHECK(layout.mips[4].array_slice_data_extent_bytes == 0x340);
+  CHECK(layout.mips[4].level_data_extent_bytes == 0x340);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 8);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x8000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x6340);
+  CHECK(prepared_view.swizzled_signs == 0);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+      CHECK(view.width == 256);
+      CHECK(view.height == 256);
+      CHECK(view.pitch == 8);
+      CHECK(view.mip_max_level == 8);
+      CHECK(view.base_size == 0x8000);
+      CHECK(view.mip_size == 0x6340);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0x6000;
+  const uint32_t tail_end = mip_address + 0x6340;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0x6000));
+  CHECK(overlaps_tail(mip_address, 0x6340));
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto required =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(required != rejected_result.textures.end());
+    CHECK_FALSE(required->available);
+    CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(required->base_size == 0x8000);
+    CHECK(required->mip_size == 0x6340);
+  };
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (address == mip_address && overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= address == mip_address && size == 0x6340;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= address == mip_address && size == 0x6340;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= address == mip_address && size == 0x6340;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 127; });
+  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 63; });
+  reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 4; });
+  reject_fetch("mip_max_level", [](auto& fetch) { fetch.mip_max_level = 7; });
+  reject_fetch("endianness", [](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch("swizzle", [](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch("signed component", [](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch("tiled", [](auto& fetch) { fetch.tiled = true; });
+  const auto expect_ordinary_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto ordinary_fetch = selected_fetch;
+    mutate(ordinary_fetch);
+    DrawCaptureFrameInputTextureView ordinary_view;
+    REQUIRE(cache.PrepareFrameInputTexture(ordinary_fetch, ordinary_view));
+    TextureInfo ordinary_info;
+    REQUIRE(TextureInfo::Prepare(ordinary_fetch, &ordinary_info));
+    TestTextureCache::TextureKey ordinary_key;
+    TestTextureCache::BindingInfoFromFetchConstant(ordinary_fetch, ordinary_key, nullptr);
+    const auto ordinary_layout = ordinary_key.GetGuestLayout();
+    CHECK(ordinary_view.available);
+    CHECK_FALSE(ordinary_view.packed_mips);
+    CHECK(ordinary_view.base_size == ordinary_info.memory.base_size);
+    CHECK(ordinary_view.mip_size == ordinary_info.memory.mip_size);
+    CHECK(ordinary_view.base_size >= ordinary_layout.base.level_data_extent_bytes);
+    CHECK(ordinary_view.mip_size >= ordinary_layout.mips_total_extent_bytes);
+  };
+  expect_ordinary_fetch("packed_mips", [](auto& fetch) { fetch.packed_mips = false; });
+  reject_fetch("cube", [](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch("stacked", [](auto& fetch) { fetch.stacked = true; });
+  reject_fetch("base_address", [](auto& fetch) { fetch.base_address = 0; });
+  reject_fetch("mip_min_level", [](auto& fetch) { fetch.mip_min_level = 1; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+}
+
+TEST_CASE("Prepared unsigned 256x128 BC1 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc1Fetch{0x01000002, 0x155CB052, 0x000FE07F,
+                                                      0x00A80D10, 0x000001C3, 0x155C5A18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc1Fetch.data(), sizeof(kSelectedBc1Fetch));
+  }
+  auto selected_fetch = registers.GetTextureFetch(2);
+  selected_fetch.size_2d.width = 255;
+  selected_fetch.size_2d.height = 127;
+  selected_fetch.pitch = 8;
+  selected_fetch.mip_max_level = 8;
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                &selected_fetch, sizeof(selected_fetch));
+  }
+  selected_fetch = registers.GetTextureFetch(2);
+
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x4000);
+  CHECK(legacy.memory.mip_size == 0x4000);
+  CHECK(layout.base.level_data_extent_bytes == 0x4000);
+  CHECK(layout.base.row_pitch_bytes == 512);
+  CHECK(layout.mips_total_extent_bytes == 0x4740);
+  CHECK(layout.packed_level == 3);
+  CHECK(layout.mip_offsets_bytes[1] == 0);
+  CHECK(layout.mip_offsets_bytes[2] == 0x2000);
+  CHECK(layout.mip_offsets_bytes[3] == 0x4000);
+  CHECK(layout.mip_offsets_bytes[4] == 0);
+  CHECK(layout.mip_offsets_bytes[5] == 0);
+  CHECK(layout.mip_offsets_bytes[6] == 0);
+  CHECK(layout.mip_offsets_bytes[7] == 0);
+  CHECK(layout.mip_offsets_bytes[8] == 0);
+  constexpr std::array<uint32_t, 9> kMipOffsets{0,      0,      0x2000, 0x4400, 0x4200,
+                                                0x4100, 0x4020, 0x4010, 0x4008};
+  for (uint32_t level = 0; level < layout.packed_level; ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    const uint32_t location = legacy.GetMipLocation(level, &offset_x, &offset_y, true);
+    const uint32_t bank_address =
+        level == 0 ? legacy.memory.base_address : legacy.memory.mip_address;
+    CHECK(location - bank_address == kMipOffsets[level]);
+    CHECK(offset_x == 0);
+    CHECK(offset_y == 0);
+  }
+  constexpr std::array<uint32_t, 6> kPackedX{0, 0, 0, 4, 2, 1};
+  constexpr std::array<uint32_t, 6> kPackedY{4, 2, 1, 0, 0, 0};
+  for (uint32_t level = layout.packed_level; level < kMipOffsets.size(); ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint32_t offset_z = 0;
+    REQUIRE(texture_util::GetPackedMipOffset(256, 128, 1, xenos::TextureFormat::k_DXT1, level,
+                                             offset_x, offset_y, offset_z));
+    CHECK(offset_z == 0);
+    CHECK(layout.mip_offsets_bytes[layout.packed_level] +
+              offset_y * layout.mips[layout.packed_level].row_pitch_bytes + offset_x * 8 ==
+          kMipOffsets[level]);
+    CHECK(offset_x == kPackedX[level - layout.packed_level]);
+    CHECK(offset_y == kPackedY[level - layout.packed_level]);
+  }
+  CHECK(layout.mips[1].row_pitch_bytes == 256);
+  CHECK(layout.mips[1].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[1].array_slice_data_extent_bytes == 0x1000);
+  CHECK(layout.mips[2].row_pitch_bytes == 256);
+  CHECK(layout.mips[2].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[2].array_slice_data_extent_bytes == 0x780);
+  CHECK(layout.mips[3].row_pitch_bytes == 256);
+  CHECK(layout.mips[3].x_extent_blocks == 8);
+  CHECK(layout.mips[3].y_extent_blocks == 8);
+  CHECK(layout.mips[3].array_slice_data_extent_bytes == 0x740);
+  CHECK(layout.mips[3].level_data_extent_bytes == 0x740);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 8);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x4000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x4740);
+  CHECK(prepared_view.swizzled_signs == 0);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+      CHECK(view.width == 256);
+      CHECK(view.height == 128);
+      CHECK(view.pitch == 8);
+      CHECK(view.mip_max_level == 8);
+      CHECK(view.base_size == 0x4000);
+      CHECK(view.mip_size == 0x4740);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0x4000;
+  const uint32_t tail_end = mip_address + 0x4740;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0x4000));
+  CHECK(overlaps_tail(mip_address, 0x4740));
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto required =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(required != rejected_result.textures.end());
+    CHECK_FALSE(required->available);
+    CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(required->base_size == 0x4000);
+    CHECK(required->mip_size == 0x4740);
+  };
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (address == mip_address && overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= address == mip_address && size == 0x4740;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= address == mip_address && size == 0x4740;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= address == mip_address && size == 0x4740;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 127; });
+  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 63; });
+  reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 4; });
+  reject_fetch("mip_max_level", [](auto& fetch) { fetch.mip_max_level = 7; });
+  reject_fetch("endianness", [](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch("swizzle", [](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch("signed component", [](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch("tiled", [](auto& fetch) { fetch.tiled = true; });
+  reject_fetch("cube", [](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch("stacked", [](auto& fetch) { fetch.stacked = true; });
+  reject_fetch("base_address", [](auto& fetch) { fetch.base_address = 0; });
+  reject_fetch("mip_min_level", [](auto& fetch) { fetch.mip_min_level = 1; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+
+  const auto ordinary_fetch = [&] {
+    auto fetch = selected_fetch;
+    fetch.packed_mips = false;
+    return fetch;
+  }();
+  DrawCaptureFrameInputTextureView ordinary_view;
+  REQUIRE(cache.PrepareFrameInputTexture(ordinary_fetch, ordinary_view));
+  TextureInfo ordinary_info;
+  REQUIRE(TextureInfo::Prepare(ordinary_fetch, &ordinary_info));
+  TestTextureCache::TextureKey ordinary_key;
+  TestTextureCache::BindingInfoFromFetchConstant(ordinary_fetch, ordinary_key, nullptr);
+  const auto ordinary_layout = ordinary_key.GetGuestLayout();
+  CHECK(ordinary_view.available);
+  CHECK_FALSE(ordinary_view.packed_mips);
+  CHECK(ordinary_view.base_size == ordinary_info.memory.base_size);
+  CHECK(ordinary_view.mip_size == ordinary_info.memory.mip_size);
+  CHECK(ordinary_view.base_size >= ordinary_layout.base.level_data_extent_bytes);
+  CHECK(ordinary_view.mip_size >= ordinary_layout.mips_total_extent_bytes);
+}
+
+TEST_CASE("Prepared unsigned 512x512 BC1 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc1Fetch{0x04000002, 0x19F61052, 0x003FE1FF,
+                                                      0x00A80D10, 0x00000243, 0x19F51A18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc1Fetch.data(), sizeof(kSelectedBc1Fetch));
+  }
+
+  const auto selected_fetch = registers.GetTextureFetch(2);
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x20000);
+  CHECK(legacy.memory.mip_size == 0xE000);
+  CHECK(layout.base.level_data_extent_bytes == 0x20000);
+  CHECK(layout.base.row_pitch_bytes == 1024);
+  CHECK(layout.mips_total_extent_bytes == 0xE340);
+  CHECK(layout.packed_level == 5);
+  CHECK(layout.mip_offsets_bytes[1] == 0);
+  CHECK(layout.mip_offsets_bytes[2] == 0x8000);
+  CHECK(layout.mip_offsets_bytes[3] == 0xA000);
+  CHECK(layout.mip_offsets_bytes[4] == 0xC000);
+  CHECK(layout.mip_offsets_bytes[5] == 0xE000);
+  CHECK(layout.mip_offsets_bytes[6] == 0);
+  CHECK(layout.mip_offsets_bytes[7] == 0);
+  CHECK(layout.mip_offsets_bytes[8] == 0);
+  CHECK(layout.mip_offsets_bytes[9] == 0);
+  constexpr std::array<uint32_t, 10> kMipOffsets{0,      0,      0x8000, 0xA000, 0xC000,
+                                                 0xE020, 0xE010, 0xE008, 0xE200, 0xE100};
+  for (uint32_t level = 0; level < 5; ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    const uint32_t location = legacy.GetMipLocation(level, &offset_x, &offset_y, true);
+    const uint32_t bank_address =
+        level == 0 ? legacy.memory.base_address : legacy.memory.mip_address;
+    CHECK(location - bank_address == kMipOffsets[level]);
+    CHECK(offset_x == 0);
+    CHECK(offset_y == 0);
+  }
+  for (uint32_t level = layout.packed_level; level < kMipOffsets.size(); ++level) {
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint32_t offset_z = 0;
+    REQUIRE(texture_util::GetPackedMipOffset(512, 512, 1, xenos::TextureFormat::k_DXT1, level,
+                                             offset_x, offset_y, offset_z));
+    CHECK(offset_z == 0);
+    CHECK(layout.mip_offsets_bytes[layout.packed_level] +
+              offset_y * layout.mips[layout.packed_level].row_pitch_bytes + offset_x * 8 ==
+          kMipOffsets[level]);
+  }
+  CHECK(layout.mips[1].row_pitch_bytes == 512);
+  CHECK(layout.mips[1].array_slice_stride_bytes == 0x8000);
+  CHECK(layout.mips[1].array_slice_data_extent_bytes == 0x8000);
+  CHECK(layout.mips[2].row_pitch_bytes == 256);
+  CHECK(layout.mips[2].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[2].array_slice_data_extent_bytes == 0x2000);
+  CHECK(layout.mips[3].row_pitch_bytes == 256);
+  CHECK(layout.mips[3].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[3].array_slice_data_extent_bytes == 0xF80);
+  CHECK(layout.mips[4].row_pitch_bytes == 256);
+  CHECK(layout.mips[4].array_slice_stride_bytes == 0x2000);
+  CHECK(layout.mips[4].array_slice_data_extent_bytes == 0x740);
+  CHECK(layout.mips[5].row_pitch_bytes == 256);
+  CHECK(layout.mips[5].x_extent_blocks == 8);
+  CHECK(layout.mips[5].y_extent_blocks == 4);
+  CHECK(layout.mips[5].array_slice_data_extent_bytes == 0x340);
+  CHECK(layout.mips[5].level_data_extent_bytes == 0x340);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 9);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x20000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0xE340);
+  CHECK(prepared_view.swizzled_signs == 0);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT1));
+      CHECK(view.width == 512);
+      CHECK(view.height == 512);
+      CHECK(view.pitch == 16);
+      CHECK(view.mip_max_level == 9);
+      CHECK(view.base_size == 0x20000);
+      CHECK(view.mip_size == 0xE340);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0xE000;
+  const uint32_t tail_end = mip_address + 0xE340;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0xE000));
+  CHECK(overlaps_tail(mip_address, 0xE340));
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto required =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(required != rejected_result.textures.end());
+    CHECK_FALSE(required->available);
+    CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(required->base_size == 0x20000);
+    CHECK(required->mip_size == 0xE340);
+  };
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (address == mip_address && overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= size == 0xE340;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= size == 0xE340;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (address == mip_address && overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= size == 0xE340;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 255; });
+  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 255; });
+  reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 8; });
+  reject_fetch("mip_max_level", [](auto& fetch) { fetch.mip_max_level = 8; });
+  reject_fetch("endianness", [](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch("swizzle", [](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch("signed component", [](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch("tiled", [](auto& fetch) { fetch.tiled = true; });
+  const auto expect_ordinary_fetch = [&](const char* control, auto mutate) {
+    CAPTURE(control);
+    auto ordinary_fetch = selected_fetch;
+    mutate(ordinary_fetch);
+    DrawCaptureFrameInputTextureView ordinary_view;
+    REQUIRE(cache.PrepareFrameInputTexture(ordinary_fetch, ordinary_view));
+    TextureInfo ordinary_info;
+    REQUIRE(TextureInfo::Prepare(ordinary_fetch, &ordinary_info));
+    TestTextureCache::TextureKey ordinary_key;
+    TestTextureCache::BindingInfoFromFetchConstant(ordinary_fetch, ordinary_key, nullptr);
+    const auto ordinary_layout = ordinary_key.GetGuestLayout();
+    CHECK(ordinary_view.available);
+    CHECK_FALSE(ordinary_view.packed_mips);
+    CHECK(ordinary_view.base_size == ordinary_info.memory.base_size);
+    CHECK(ordinary_view.mip_size == ordinary_info.memory.mip_size);
+    CHECK(ordinary_view.base_size >= ordinary_layout.base.level_data_extent_bytes);
+    CHECK(ordinary_view.mip_size >= ordinary_layout.mips_total_extent_bytes);
+  };
+  expect_ordinary_fetch("packed_mips", [](auto& fetch) { fetch.packed_mips = false; });
+  reject_fetch("cube", [](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch("stacked", [](auto& fetch) { fetch.stacked = true; });
+  reject_fetch("base_address", [](auto& fetch) { fetch.base_address = 0; });
+  reject_fetch("mip_min_level", [](auto& fetch) { fetch.mip_min_level = 1; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+}
+
+TEST_CASE("Prepared unsigned BC2 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc2Fetch{0x01000002, 0x168C6053, 0x0007E03F,
+                                                      0x00A80D10, 0x00000183, 0x168BEA18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc2Fetch.data(), sizeof(kSelectedBc2Fetch));
+  }
+
+  const auto selected_fetch = registers.GetTextureFetch(2);
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x2000);
+  CHECK(legacy.memory.mip_size == 0x4000);
+  CHECK(layout.base.level_data_extent_bytes == 0x1F00);
+  CHECK(layout.mips_total_extent_bytes == 0x4680);
+  CHECK(layout.packed_level == 2);
+  CHECK(layout.mip_offsets_bytes[2] == 0x4000);
+  CHECK(layout.mips[2].array_slice_data_extent_bytes == 0x680);
+  CHECK(layout.mips[2].level_data_extent_bytes == 0x680);
+  CHECK(key.base_page << 12 == 0x168C6000);
+  CHECK(key.mip_page << 12 == 0x168BE000);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT2_3));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 6);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x2000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x4680);
+  CHECK(prepared_view.swizzled_signs == 0);
+  CHECK_FALSE(prepared_view.memory_version.identity);
+  CHECK_FALSE(prepared_view.memory_version.generation);
+  CHECK_FALSE(prepared_view.memory_version.check);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  REQUIRE(result.textures.size() == 8);
+
+  size_t required_unsigned_count = 0;
+  size_t optional_signed_count = 0;
+  for (const auto& view : result.textures) {
+    if (!view.is_signed && view.required) {
+      ++required_unsigned_count;
+      CHECK(view.available);
+      CHECK(view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT2_3));
+      CHECK(view.base_size == 0x2000);
+      CHECK(view.mip_size == 0x4680);
+      CHECK(view.width == 64);
+      CHECK(view.height == 64);
+      CHECK(view.pitch == 4);
+      CHECK(view.mip_max_level == 6);
+      CHECK(view.fetch_words.size() == 6);
+      CHECK(view.swizzled_signs == 0);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+      CHECK_FALSE(view.memory_version.check);
+    } else if (view.is_signed && !view.required) {
+      ++optional_signed_count;
+      CHECK_FALSE(view.available);
+      CHECK(view.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+      CHECK_FALSE(view.memory_version.identity);
+      CHECK_FALSE(view.memory_version.generation);
+      CHECK_FALSE(view.memory_version.check);
+    }
+  }
+  CHECK(required_unsigned_count == 4);
+  CHECK(optional_signed_count == 4);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t base_address = key.base_page << 12;
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0x4000;
+  const uint32_t tail_end = mip_address + 0x4680;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0x4000));
+  CHECK(overlaps_tail(mip_address, 0x4680));
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto required =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(required != rejected_result.textures.end());
+    CHECK_FALSE(required->available);
+    CHECK(required->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(required->base_address == base_address);
+    CHECK(required->base_size == 0x2000);
+    CHECK(required->mip_address == mip_address);
+    CHECK(required->mip_size == 0x4680);
+  };
+
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= address == mip_address && size == 0x4680;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= address == mip_address && size == 0x4680;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= address == mip_address && size == 0x4680;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](auto mutate) {
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch([](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
+  reject_fetch([](auto& fetch) { fetch.size_2d.width = 127; });
+  reject_fetch([](auto& fetch) { fetch.size_2d.height = 127; });
+  reject_fetch([](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch([](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch([](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch([](auto& fetch) { fetch.tiled = true; });
+  reject_fetch([](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch([](auto& fetch) { fetch.stacked = true; });
+  reject_fetch([](auto& fetch) { fetch.mip_min_level = 1; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 5; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 7; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+}
+
+TEST_CASE("Prepared unsigned 128x128 BC2 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc2Fetch{0x01000002, 0x15AA7053, 0x000FE07F,
+                                                      0x00A80D10, 0x000001C3, 0x15A9BA18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc2Fetch.data(), sizeof(kSelectedBc2Fetch));
+  }
+
+  const auto selected_fetch = registers.GetTextureFetch(2);
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x4000);
+  CHECK(legacy.memory.mip_size == 0x8000);
+  CHECK(layout.base.level_data_extent_bytes == 0x4000);
+  CHECK(layout.mips_total_extent_bytes == 0x8680);
+  CHECK(layout.packed_level == 3);
+  CHECK(layout.mips[1].array_slice_stride_bytes == 0x4000);
+  CHECK(layout.mips[2].array_slice_stride_bytes == 0x4000);
+  CHECK(layout.mips[1].level_data_extent_bytes == 0x1F00);
+  CHECK(layout.mips[2].level_data_extent_bytes == 0xE80);
+  CHECK(layout.mips[3].row_pitch_bytes == 0x200);
+  CHECK(layout.mips[3].x_extent_blocks == 8);
+  CHECK(layout.mips[3].y_extent_blocks == 4);
+  CHECK(layout.mips[3].array_slice_data_extent_bytes == 0x680);
+  CHECK(layout.mips[3].level_data_extent_bytes == 0x680);
+  CHECK(layout.mip_offsets_bytes[1] == 0);
+  CHECK(layout.mip_offsets_bytes[2] == 0x4000);
+  CHECK(layout.mip_offsets_bytes[3] == 0x8000);
+  constexpr std::array<uint32_t, 8> kExpectedMipOffsets{0,      0,      0x4000, 0x8040,
+                                                        0x8020, 0x8010, 0x8400, 0x8200};
+  constexpr uint32_t kBytesPerBlock = 16;
+  for (uint32_t level = 3; level < kExpectedMipOffsets.size(); ++level) {
+    uint32_t x_blocks = 0;
+    uint32_t y_blocks = 0;
+    uint32_t z_blocks = 0;
+    REQUIRE(texture_util::GetPackedMipOffset(128, 128, 1, xenos::TextureFormat::k_DXT2_3, level,
+                                             x_blocks, y_blocks, z_blocks));
+    CHECK(z_blocks == 0);
+    CHECK(layout.mip_offsets_bytes[3] + y_blocks * layout.mips[3].row_pitch_bytes +
+              x_blocks * kBytesPerBlock ==
+          kExpectedMipOffsets[level]);
+  }
+  CHECK(key.base_page << 12 == 0x15AA7000);
+  CHECK(key.mip_page << 12 == 0x15A9B000);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT2_3));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == 128);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 7);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x4000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x8680);
+  CHECK(prepared_view.swizzled_signs == 0);
+  CHECK_FALSE(prepared_view.memory_version.identity);
+  CHECK_FALSE(prepared_view.memory_version.generation);
+  CHECK_FALSE(prepared_view.memory_version.check);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  const uint32_t base_address = key.base_page << 12;
+  const uint32_t mip_address = key.mip_page << 12;
+  bool base_guarded = false;
+  bool mip_guarded = false;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [&](uint32_t address, uint32_t size) {
+                  base_guarded |= address == base_address && size == 0x4000;
+                  mip_guarded |= address == mip_address && size == 0x8680;
+                  return true;
+                },
+                draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  CHECK(base_guarded);
+  CHECK(mip_guarded);
+  const auto required =
+      std::find_if(result.textures.begin(), result.textures.end(),
+                   [](const auto& view) { return !view.is_signed && view.required; });
+  REQUIRE(required != result.textures.end());
+  CHECK(required->available);
+  CHECK(required->base_size == 0x4000);
+  CHECK(required->mip_size == 0x8680);
+  CHECK(required->width == 128);
+  CHECK(required->height == 128);
+  CHECK(required->pitch == 4);
+  CHECK(required->mip_max_level == 7);
+  CHECK(required->fetch_words.size() == 6);
+  CHECK(required->swizzled_signs == 0);
+  CHECK_FALSE(required->memory_version.identity);
+  CHECK_FALSE(required->memory_version.generation);
+  CHECK_FALSE(required->memory_version.check);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t tail_address = mip_address + 0x8000;
+  const uint32_t tail_end = mip_address + 0x8680;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  CHECK_FALSE(overlaps_tail(mip_address, 0x8000));
+  CHECK(overlaps_tail(mip_address, 0x8680));
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto rejected =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(rejected != rejected_result.textures.end());
+    CHECK_FALSE(rejected->available);
+    CHECK(rejected->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(rejected->base_address == base_address);
+    CHECK(rejected->base_size == 0x4000);
+    CHECK(rejected->mip_address == mip_address);
+    CHECK(rejected->mip_size == 0x8680);
+  };
+
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= address == mip_address && size == 0x8680;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= address == mip_address && size == 0x8680;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= address == mip_address && size == 0x8680;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](auto mutate) {
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch([](auto& fetch) { fetch.size_2d.width = 126; });
+  reject_fetch([](auto& fetch) { fetch.size_2d.height = 126; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 6; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 8; });
+  reject_fetch([](auto& fetch) { fetch.pitch = 3; });
+  reject_fetch([](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
+  reject_fetch([](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch([](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch([](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch([](auto& fetch) { fetch.tiled = true; });
+  reject_fetch([](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch([](auto& fetch) { fetch.stacked = true; });
+  reject_fetch([](auto& fetch) { fetch.mip_min_level = 1; });
+  reject_fetch([](auto& fetch) { fetch.base_address = 0; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
+}
+
+TEST_CASE("Prepared unsigned rectangular BC2 admits its canonical packed mip footprint",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  const auto words = SampleUcode(false);
+  DxbcShader vertex(xenos::ShaderType::kVertex, 1, words.data(), words.size(), std::endian::native);
+  DxbcShader pixel(xenos::ShaderType::kPixel, 2, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  vertex.AnalyzeUcode(disassembly);
+  pixel.AnalyzeUcode(disassembly);
+
+  constexpr std::array<uint32_t, 6> kSelectedBc2Fetch{0x01000002, 0x168B6053, 0x001FE07F,
+                                                      0x00A80D10, 0x00000203, 0x168AAA18};
+  for (const uint32_t fetch_constant : {2U, 7U}) {
+    std::memcpy(&registers.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_constant * 6],
+                kSelectedBc2Fetch.data(), sizeof(kSelectedBc2Fetch));
+  }
+
+  const auto selected_fetch = registers.GetTextureFetch(2);
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(selected_fetch, &legacy));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(selected_fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  CHECK(legacy.memory.base_size == 0x8000);
+  CHECK(legacy.memory.mip_size == 0x8000);
+  CHECK(layout.base.level_data_extent_bytes == 0x8000);
+  CHECK(layout.mips_total_extent_bytes == 0x8E80);
+  CHECK(layout.packed_level == 3);
+  CHECK(layout.mip_offsets_bytes[3] == 0x8000);
+  CHECK(layout.mips[3].row_pitch_bytes == 0x200);
+  CHECK(layout.mips[3].x_extent_blocks == 8);
+  CHECK(layout.mips[3].y_extent_blocks == 8);
+  CHECK(layout.mips[3].array_slice_data_extent_bytes == 0xE80);
+  CHECK(layout.mips[3].level_data_extent_bytes == 0xE80);
+  CHECK(key.base_page << 12 == 0x168B6000);
+  CHECK(key.mip_page << 12 == 0x168AA000);
+
+  auto build = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                   std::function<bool(uint32_t, uint32_t)> gpu_written,
+                   std::function<bool(uint32_t, uint32_t)> readable,
+                   diagnostic::DrawCaptureFrameInputDrawView& draw,
+                   FrameInputDrawBuilderResult& result) {
+    FrameInputDrawBuilderInput input{
+        registers,
+        cache,
+        &vertex,
+        &pixel,
+        &vertex,
+        &pixel,
+        {},
+        std::move(dirty),
+        std::move(gpu_written),
+        std::move(readable),
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureGuestMemoryVersion{}; },
+        [](const Shader::PreparedSamplerBinding&, uint32_t& value) {
+          value = 0xF880;
+          return true;
+        },
+        [](uint32_t, uint32_t) { return diagnostic::DrawCaptureReason::kNone; },
+        0};
+    draw = {};
+    draw.index.present = false;
+    return FrameInputDrawBuilder::BuildPrepared(input, result, draw);
+  };
+
+  DrawCaptureFrameInputTextureView prepared_view;
+  REQUIRE(cache.PrepareFrameInputTexture(selected_fetch, prepared_view));
+  CHECK(prepared_view.available);
+  CHECK_FALSE(prepared_view.is_signed);
+  CHECK(prepared_view.required);
+  CHECK(prepared_view.format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT2_3));
+  CHECK(prepared_view.endianness == static_cast<uint32_t>(xenos::Endian::k8in16));
+  CHECK(prepared_view.width == selected_fetch.size_2d.width);
+  CHECK(prepared_view.height == selected_fetch.size_2d.height);
+  CHECK(prepared_view.pitch == selected_fetch.pitch << 5);
+  CHECK(prepared_view.mip_min_level == 0);
+  CHECK(prepared_view.mip_max_level == 8);
+  CHECK_FALSE(prepared_view.tiled);
+  CHECK(prepared_view.packed_mips);
+  CHECK(prepared_view.base_address == key.base_page << 12);
+  CHECK(prepared_view.base_size == 0x8000);
+  CHECK(prepared_view.mip_address == key.mip_page << 12);
+  CHECK(prepared_view.mip_size == 0x8E80);
+  CHECK(prepared_view.swizzled_signs == 0);
+  CHECK_FALSE(prepared_view.memory_version.identity);
+  CHECK_FALSE(prepared_view.memory_version.generation);
+  CHECK_FALSE(prepared_view.memory_version.check);
+
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  FrameInputDrawBuilderResult result;
+  REQUIRE(build([](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return false; },
+                [](uint32_t, uint32_t) { return true; }, draw, result));
+  REQUIRE(draw.cpu_data_complete);
+  CHECK(draw.unavailable_reason == diagnostic::DrawCaptureReason::kNone);
+  CHECK(result.texture_bindings_complete);
+  const auto required =
+      std::find_if(result.textures.begin(), result.textures.end(),
+                   [](const auto& view) { return !view.is_signed && view.required; });
+  REQUIRE(required != result.textures.end());
+  CHECK(required->available);
+  CHECK(required->format == static_cast<uint32_t>(xenos::TextureFormat::k_DXT2_3));
+  CHECK(required->base_size == 0x8000);
+  CHECK(required->mip_size == 0x8E80);
+  CHECK(required->width == 128);
+  CHECK(required->height == 256);
+  CHECK(required->pitch == 4);
+  CHECK(required->mip_max_level == 8);
+  CHECK(required->fetch_words.size() == 6);
+  CHECK(required->swizzled_signs == 0);
+  CHECK_FALSE(required->memory_version.identity);
+  CHECK_FALSE(required->memory_version.generation);
+  CHECK_FALSE(required->memory_version.check);
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+
+  const uint32_t base_address = key.base_page << 12;
+  const uint32_t mip_address = key.mip_page << 12;
+  const uint32_t tail_address = mip_address + 0x8000;
+  const uint32_t tail_end = mip_address + 0x8E80;
+  const auto overlaps_tail = [tail_address, tail_end](uint32_t address, uint32_t size) {
+    const uint64_t end = uint64_t(address) + size;
+    return end > tail_address && address < tail_end;
+  };
+  const auto expect_tail_rejection = [&](std::function<bool(uint32_t, uint32_t)> dirty,
+                                         std::function<bool(uint32_t, uint32_t)> gpu_written,
+                                         std::function<bool(uint32_t, uint32_t)> readable) {
+    diagnostic::DrawCaptureFrameInputDrawView rejected_draw;
+    FrameInputDrawBuilderResult rejected_result;
+    CHECK_FALSE(build(std::move(dirty), std::move(gpu_written), std::move(readable), rejected_draw,
+                      rejected_result));
+    CHECK_FALSE(rejected_draw.cpu_data_complete);
+    CHECK(rejected_draw.unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    const auto rejected =
+        std::find_if(rejected_result.textures.begin(), rejected_result.textures.end(),
+                     [](const auto& view) { return !view.is_signed && view.required; });
+    REQUIRE(rejected != rejected_result.textures.end());
+    CHECK_FALSE(rejected->available);
+    CHECK(rejected->unavailable_reason == diagnostic::DrawCaptureReason::kTextureSource);
+    CHECK(rejected->base_address == base_address);
+    CHECK(rejected->base_size == 0x8000);
+    CHECK(rejected->mip_address == mip_address);
+    CHECK(rejected->mip_size == 0x8E80);
+  };
+
+  bool dirty_tail_seen = false;
+  bool dirty_tail_size_valid = true;
+  expect_tail_rejection(
+      [&dirty_tail_seen, &dirty_tail_size_valid, &overlaps_tail, mip_address](uint32_t address,
+                                                                              uint32_t size) {
+        if (overlaps_tail(address, size)) {
+          dirty_tail_seen = true;
+          dirty_tail_size_valid &= address == mip_address && size == 0x8E80;
+          return true;
+        }
+        return false;
+      },
+      [](uint32_t, uint32_t) { return false; }, [](uint32_t, uint32_t) { return true; });
+  CHECK(dirty_tail_seen);
+  CHECK(dirty_tail_size_valid);
+
+  bool gpu_tail_seen = false;
+  bool gpu_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [&gpu_tail_seen, &gpu_tail_size_valid, &overlaps_tail, mip_address](
+                            uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            gpu_tail_seen = true;
+                            gpu_tail_size_valid &= address == mip_address && size == 0x8E80;
+                            return true;
+                          }
+                          return false;
+                        },
+                        [](uint32_t, uint32_t) { return true; });
+  CHECK(gpu_tail_seen);
+  CHECK(gpu_tail_size_valid);
+
+  bool unreadable_tail_seen = false;
+  bool unreadable_tail_size_valid = true;
+  expect_tail_rejection([](uint32_t, uint32_t) { return false; },
+                        [](uint32_t, uint32_t) { return false; },
+                        [&unreadable_tail_seen, &unreadable_tail_size_valid, &overlaps_tail,
+                         mip_address](uint32_t address, uint32_t size) {
+                          if (overlaps_tail(address, size)) {
+                            unreadable_tail_seen = true;
+                            unreadable_tail_size_valid &= address == mip_address && size == 0x8E80;
+                            return false;
+                          }
+                          return true;
+                        });
+  CHECK(unreadable_tail_seen);
+  CHECK(unreadable_tail_size_valid);
+
+  const auto reject_fetch = [&](auto mutate) {
+    auto near_miss = selected_fetch;
+    mutate(near_miss);
+    DrawCaptureFrameInputTextureView view;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
+    CHECK_FALSE(view.available);
+  };
+  reject_fetch([](auto& fetch) {
+    fetch.size_2d.width = 255;
+    fetch.size_2d.height = 127;
+  });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 7; });
+  reject_fetch([](auto& fetch) { fetch.mip_max_level = 9; });
+  reject_fetch([](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT1; });
+  reject_fetch([](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
+  reject_fetch([](auto& fetch) { fetch.swizzle = 0x680; });
+  reject_fetch([](auto& fetch) { fetch.sign_y = xenos::TextureSign::kSigned; });
+  reject_fetch([](auto& fetch) { fetch.tiled = true; });
+  reject_fetch([](auto& fetch) { fetch.dimension = xenos::DataDimension::kCube; });
+  reject_fetch([](auto& fetch) { fetch.stacked = true; });
+  reject_fetch([](auto& fetch) { fetch.mip_min_level = 1; });
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(selected_fetch, signed_view));
 }
 #endif
 
@@ -246,6 +2989,77 @@ TEST_CASE("Prepared texture ranges cover canonical ordinary mip storage", "[grap
   CHECK(unsigned_view.mip_size == layout.mips_total_extent_bytes);
   CHECK_FALSE(unsigned_view.memory_version.IsCurrent());
   CHECK(cache.create_count == 0);
+}
+
+TEST_CASE("Prepared signed RG16 float view uses the complete tiled base extent",
+          "[graphics][prepared][native]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.size_2d.width = 1279;
+  fetch.size_2d.height = 719;
+  fetch.pitch = 40;
+  fetch.base_address = 16;
+  fetch.format = xenos::TextureFormat::k_16_16_FLOAT;
+  fetch.tiled = true;
+  // Captured dword_3 encodes R,G,1,1 (0xB48), which becomes the D3D12
+  // component mapping 0x1B48 after the builder's validation bit.
+  fetch.swizzle = 0xB48;
+  fetch.sign_x = fetch.sign_y = fetch.sign_z = fetch.sign_w = xenos::TextureSign::kSigned;
+
+  DrawCaptureFrameInputTextureView signed_view;
+  signed_view.is_signed = true;
+  REQUIRE(cache.PrepareFrameInputTexture(fetch, signed_view));
+  TestTextureCache::TextureKey key;
+  TestTextureCache::BindingInfoFromFetchConstant(fetch, key, nullptr);
+  const auto layout = key.GetGuestLayout();
+  TextureInfo legacy;
+  REQUIRE(TextureInfo::Prepare(fetch, &legacy));
+  CHECK(legacy.memory.base_size < layout.base.level_data_extent_bytes);
+  CHECK(signed_view.base_address == key.base_page << 12);
+  CHECK(signed_view.base_size == layout.base.level_data_extent_bytes);
+  CHECK(signed_view.base_size == 0x398000);
+  CHECK(signed_view.swizzled_signs == 0x55);
+  CHECK(signed_view.required);
+
+  // The same undercovered layout remains rejected when the binding is not the
+  // exact selected signed form.
+  DrawCaptureFrameInputTextureView unsigned_view;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, unsigned_view));
+  fetch.sign_y = xenos::TextureSign::kUnsigned;
+  DrawCaptureFrameInputTextureView mixed_sign_view;
+  mixed_sign_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, mixed_sign_view));
+  fetch.sign_y = xenos::TextureSign::kSigned;
+
+  for (const auto bad_sign : {xenos::TextureSign::kUnsigned, xenos::TextureSign::kUnsignedBiased}) {
+    fetch.sign_z = bad_sign;
+    DrawCaptureFrameInputTextureView z_sign_view;
+    z_sign_view.is_signed = true;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, z_sign_view));
+    fetch.sign_z = xenos::TextureSign::kSigned;
+
+    fetch.sign_w = bad_sign;
+    DrawCaptureFrameInputTextureView w_sign_view;
+    w_sign_view.is_signed = true;
+    CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, w_sign_view));
+    fetch.sign_w = xenos::TextureSign::kSigned;
+  }
+
+  fetch.packed_mips = true;
+  DrawCaptureFrameInputTextureView packed_view;
+  packed_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, packed_view));
+  fetch.packed_mips = false;
+  fetch.size_2d.width = 1278;
+  DrawCaptureFrameInputTextureView width_mismatch_view;
+  width_mismatch_view.is_signed = true;
+  CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, width_mismatch_view));
 }
 
 TEST_CASE("Prepared fetch metadata rejects malformed and uncovered layouts",
@@ -340,6 +3154,28 @@ struct ResolveFixture {
       copy.source_geometry.memory = {&geometry, &d3d12::FrameInputCopyGeometry::Read};
     }
     return copy;
+  }
+
+  void ConfigureMainClear() {
+    const std::array<float, 6> vertices{-0.5F, -0.5F, 639.5F, -0.5F, 639.5F, 719.5F};
+    std::memcpy(memory.TranslatePhysical(address), vertices.data(), sizeof(vertices));
+    registers[XE_GPU_REG_RB_SURFACE_INFO] = 0x0A010280U;
+    registers[XE_GPU_REG_RB_COLOR_INFO] = 0;
+    registers[XE_GPU_REG_RB_DEPTH_INFO] = 0x530;
+    registers[XE_GPU_REG_RB_MODECONTROL] = 6;
+    registers[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = 0;
+    registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = 0;
+    registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = 640U | (720U << 16);
+    registers[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = 0;
+    registers[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = 0x20002000U;
+    registers[XE_GPU_REG_PA_SU_SC_MODE_CNTL] = 0x00010000U;
+    registers[XE_GPU_REG_RB_COPY_CONTROL] = 0x00100340U;
+    registers[XE_GPU_REG_RB_COPY_DEST_PITCH] = 0x02D00500U;
+    registers[XE_GPU_REG_RB_COPY_DEST_INFO] = 0x01000300U;
+    registers[XE_GPU_REG_RB_HIZ_CLEAR] = 0x00000FFFU;
+    registers[XE_GPU_REG_RB_DEPTH_CLEAR] = 0xFFFFFF00U;
+    registers[XE_GPU_REG_RB_COLOR_CLEAR] = 0;
+    registers[XE_GPU_REG_RB_COLOR_CLEAR_LO] = 0;
   }
 };
 
@@ -439,6 +3275,53 @@ TEST_CASE("Prepared resolve rejects unsupported effects and unowned geometry",
   fixture.registers[XE_GPU_REG_RB_SURFACE_INFO] = 64;
   fixture.registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = 0;
   CHECK_FALSE(fixture.Plan().cpu_data_complete);
+}
+
+TEST_CASE("Prepared main clear admits only the selected color zero form", "[graphics][prepared]") {
+  ResolveFixture fixture;
+  fixture.ConfigureMainClear();
+  const auto accepted = fixture.Plan();
+  REQUIRE(accepted.cpu_data_complete);
+  CHECK_FALSE(accepted.original_succeeded);
+  CHECK(accepted.written_address == 0);
+  CHECK(accepted.written_length == 0);
+
+  for (const auto mutation :
+       {0x231CU, 0x231DU, 0x231EU, 0x231FU, 0x2001U, 0x231BU, 0x2080U, 0x2081U, 0x2082U, 0x2205U}) {
+    fixture.ConfigureMainClear();
+    fixture.registers[mutation] ^= 1U;
+    CHECK_FALSE(fixture.Plan().cpu_data_complete);
+  }
+  fixture.ConfigureMainClear();
+  fixture.registers[XE_GPU_REG_RB_COPY_CONTROL] = 0x00100341U;
+  CHECK_FALSE(fixture.Plan().cpu_data_complete);
+}
+
+TEST_CASE("Prepared main no-clear right half keeps the ordinary boundary", "[graphics][prepared]") {
+  ResolveFixture fixture;
+  fixture.ConfigureMainClear();
+  fixture.registers[XE_GPU_REG_RB_COPY_CONTROL] = 0x00100040U;
+  fixture.registers[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = 0x00007D80U;
+  fixture.registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = 640U;
+  fixture.registers[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = 1280U | (720U << 16);
+  fixture.registers[XE_GPU_REG_PA_SU_SC_MODE_CNTL] = 0x00010000U;
+  const std::array<float, 6> vertices{639.5F, -0.5F, 1279.5F, -0.5F, 1279.5F, 719.5F};
+  std::memcpy(fixture.memory.TranslatePhysical(fixture.address), vertices.data(), sizeof(vertices));
+  fixture.registers[XE_GPU_REG_RB_COPY_DEST_BASE] += 0x14000U;
+  const auto copy = fixture.Plan();
+  REQUIRE(copy.cpu_data_complete);
+  draw_util::ResolveInfo original;
+  REQUIRE(
+      draw_util::GetResolveInfo(fixture.registers, fixture.memory, 1, 1, false, false, original));
+  CHECK(copy.source_x == original.coordinate_info.edram_offset_x_div_8 * 8);
+  CHECK(copy.source_y == original.coordinate_info.edram_offset_y_div_8 * 8);
+  CHECK(copy.source_width == original.coordinate_info.width_div_8 * 8);
+  CHECK(copy.source_height == original.height_div_8 * 8);
+  CHECK(copy.planned_address == original.copy_dest_extent_start);
+  CHECK(copy.planned_length == original.copy_dest_extent_length);
+  CHECK_FALSE(copy.original_succeeded);
+  CHECK(copy.written_address == 0);
+  CHECK(copy.written_length == 0);
 }
 
 TEST_CASE("Prepared resolve rejects clear-only formats while legacy views retain rectangles",

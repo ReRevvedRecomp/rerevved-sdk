@@ -71,19 +71,78 @@ original submission setup. It retains `kUnfinished` and
 `original_host_issued == false`. Analyzed ordinary nonstacked 2D samples can be
 complete using immutable raw shader metadata and the current CPU fetch state.
 Unsigned and signed companion bindings retain DXBC descriptor order; each
-stage/fetch must have one effective sampler interpretation. Unsupported query
-or dimension demand, inaccessible or GPU-owned required textures, memexport,
-and invalid geometry remain incomplete. The legacy texture ranges must cover
-the canonical cache layout; uncovered packed-mip and mip-only layouts remain
-unavailable. Preparation creates no host texture, upload, descriptor or texture
-watch. Missing texture versions use the guarded reader. A subsequent `OnDraw`
-keeps the event ID and actual original result. Both views are synchronous.
+stage/fetch must have one effective sampler interpretation. Requiredness for
+an unused signed companion is classified from validated shader analysis and
+fetch swizzled signs before payload preparation. Its payload may be unavailable
+with its actual reason without making the draw incomplete; validation, sampler
+agreement and all required CPU-read, dirty and GPU-write guards still apply.
+An optional companion failure reads no payload bytes and creates no memory
+version, resource, native owner or completion state. Unsupported query or
+dimension demand, inaccessible or GPU-owned required textures, memexport, and
+invalid geometry remain incomplete. The legacy texture ranges must cover the
+canonical cache layout, except for the selected unsigned linear BC1 and BC2
+forms. BC1 admits these exact nonstacked 2D forms with `k_DXT1`, `k8in16`, raw
+swizzle `0x688`: 64x64 with pitch 4 and packed mips 0..6, with a separate base
+range of `0x1000` bytes (canonical base data extent `0xF80`) and canonical
+packed-mip range of `0x2340` bytes with its tail at offset `0x2000` (row pitch
+256 and 8x4 block extent); 128x128 with pitch 4 and packed mips 0..7, with a
+separate base range of `0x2000` bytes and canonical packed-mip range of
+`0x4340` bytes; and 256x256 with pitch 8 and packed mips 0..8, with a separate
+base range of `0x8000` bytes and canonical packed-mip range of `0x6340` bytes;
+and 512x512
+with pitch 16 and packed mips 0..9, with a separate base range of `0x20000`
+bytes and canonical packed-mip range of `0xE340` bytes, with the packed tail
+starting at offset `0xE000` (row pitch 256 and 8x4 block extent); and 256x128
+with pitch 8 and packed mips 0..8, with a separate base range of `0x4000`
+bytes and canonical packed-mip range of `0x4740` bytes, with the packed tail
+starting at offset `0x4000` (row pitch 256 and 8x8 block extent). BC2 admits
+these exact nonstacked 2D forms with `k_DXT2_3`, pitch 4, `k8in16`, raw swizzle
+`0x688`: 64x64 with packed mips 0..6, a separate base range of `0x2000` bytes
+and canonical packed-mip range of `0x4680` bytes with its tail at offset
+`0x4000`; and 128x256 with packed mips 0..8, a separate base range of
+`0x8000` bytes and canonical packed-mip range of `0x8E80` bytes with its tail
+at offset `0x8000` (row pitch 512 and 8x8 block extent); and 128x128 with
+packed mips 0..7, a separate base range of `0x4000` bytes and canonical
+packed-mip range of `0x8680` bytes with its tail at offset `0x8000` (row pitch
+512 and 8x4 block extent). The consumer owns the guarded copy and the ordinary
+cache metadata remains unchanged. Other
+uncovered packed-mip and mip-only layouts remain unavailable. Preparation
+creates no host texture, upload, descriptor or texture watch. Missing texture
+versions use the guarded reader. A subsequent `OnDraw` keeps the event ID and
+actual original result. Both views are synchronous.
+
+A required native-source texture is reported as `kTextureUnresolved`, with
+no CPU payload or memory version. The retained unsigned, single-level Rgba8
+form and one signed tiled RG16 float form have exact range owners. The float
+form is nonstacked 2D, 1280x720, pitch 40 fetch units, raw signs `0x55`,
+swizzle `0xB48`, and one unpacked level. Its Prepared view uses the canonical
+`0x398000` tiled extent, including padding and the final guard. Ordinary cache
+metadata and full-range watches are unchanged. Its unused unsigned companion
+retains descriptor order but creates no second required native dependency.
+Unsigned or mixed-sign float demand remains required and unsupported.
+
+Only that exact signed owner may bypass its resolve's dirty interval. Unknown
+dirty state, CPU overwrites, partial aliases, failed originals and retired or
+replaced owners remain rejected. A successful original resolve retains
+prospective native-source ownership; it does not establish native completion
+or completed guest CPU readback. Consumers must bind the range to their own
+ordered producer and actual completion owner.
 
 `WantsPreparedCopies` similarly opts in before registration to `OnCopyPrepared`
 before original submission setup. A complete view requires a nonzero normal
-resolve plan with guarded CPU geometry and no clear request. Readback, clear-only,
-clear-plus-copy, array destinations, no-effect and unsupported inputs remain incomplete. Planning
-and the prepared geometry reader share one immutable CPU vertex snapshot.
+resolve plan with guarded CPU geometry. The bounded color-0 Rgba8 main resolve
+also admits the selected color/depth clear form: surface `0x0A010280`, depth
+`0x530`, mode `6`, copy control `0x00100340`, destination pitch
+`0x02D00500`, destination info `0x01000300`, HIZ clear `0xFFF`, depth clear
+`0xFFFFFF00`, zero color-clear words, and the selected left resolve geometry.
+That geometry is `[-0.5,-0.5,639.5,-0.5,639.5,719.5]` in guest float order.
+The paired no-clear right resolve keeps the captured guest rectangle
+`[639.5,-0.5,1279.5,-0.5,1279.5,719.5]` with window offset `0x7D80`, window
+scissor `640..1280`, and vertex-window-offset mode enabled; `GetResolveInfo`
+therefore derives the same source half for original and prepared planning.
+Other clear words and forms, readback, array destinations, no-effect and
+unsupported inputs remain incomplete. Planning and the prepared geometry reader
+share one immutable CPU vertex snapshot.
 `planned_address` and `planned_length` are prospective; they never mark guest
 memory dirty, promote a version or establish native GPU completion. Prepared
 copies retain `original_succeeded == false` and zero `written_*`. The later
@@ -136,7 +195,9 @@ completion, version promotion, guest writes or presentation. Actual native
 completion and consumer-copy retirement remain the consumer's responsibility.
 Original GPU work, ring progress, trace lifetime and original fences continue.
 This terminal adapter covers D3D12; Vulkan has the common hook but no equivalent
-frame-input terminal adapter. Rebuild the SDK and consumers for API floor 0.25.0.
+frame-input terminal adapter. The bounded clear admission is internal planner
+behavior and does not add public API or ABI surface. Rebuild the SDK and
+consumers for API floor 0.25.0.
 
 The common CPU command processor also exposes an optional packet-admission
 callback for consumers that must bound a command subset before decoding. The
