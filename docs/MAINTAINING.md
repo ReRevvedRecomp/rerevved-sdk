@@ -80,10 +80,11 @@ An optional companion failure reads no payload bytes and creates no memory
 version, resource, native owner or completion state. Unsupported query or
 dimension demand, inaccessible or GPU-owned required textures, memexport, and
 invalid geometry remain incomplete. The legacy texture ranges must cover the
-canonical cache layout, except for the selected unsigned linear BC1 and BC2
-forms. The exact packed tuples below are unsigned, linear, nonstacked 2D,
-with `k8in16`, raw swizzle `0x688`, and minimum LOD 0. Pitch is in
-32-texel fetch units; each row permits only its listed maximum LOD.
+canonical cache layout, except for the selected unsigned linear BC1, BC2,
+RGBA8 and R8 forms described below. The BC packed tuples are unsigned,
+linear, nonstacked 2D, with `k8in16`, raw swizzle `0x688`, and minimum LOD 0.
+Pitch is in 32-texel fetch units; each row permits only its listed maximum
+LOD.
 
 | Format | Width x height | Pitch | Maximum LOD |
 |---|---|---|---|
@@ -116,6 +117,28 @@ uncovered packed-mip and mip-only layouts remain unavailable. Preparation
 creates no host texture, upload, descriptor or texture watch. Missing texture
 versions use the guarded reader. A subsequent `OnDraw` keeps the event ID and
 actual original result. Both views are synchronous.
+
+Prepared also extends the exact unsigned, linear, nonstacked 2D packed R8
+(`k_8`) 512x512/pitch16 LOD0..9 form with endian `kNone`, swizzle `0x124`,
+and a nonzero mip page. Its legacy mip extent is 122880 bytes; the canonical
+126752-byte extent includes the 3872-byte tail at 122880.
+The RGBA8 (`k_8_8_8_8`) 256x4 and 256x1 packed forms use pitch8,
+`k8in32`, swizzle `0x60A`, declared LOD0..8 and a zero mip page. Their
+Prepared base extents are 20480 and 17408 bytes, respectively, instead of
+the legacy 4096 and 1024 bytes. LOD0 starts at byte offset 16384 in both
+base tails. These exceptions require unsigned raw signs, normalized numbers,
+zero exponent adjustment, zero stack depth and no forced BC alpha.
+
+A zero mip page clamps the effective range to LOD0 through
+[`GetSubresourcesFromFetchConstant`](../src/graphics/pipeline/texture/util.cpp)
+(line 77); the cache key stores that normalized maximum in
+[`BindingInfoFromFetchConstant`](../src/graphics/pipeline/texture/cache.cpp).
+Prepared preserves this normalization. The RGBA8 8x8/pitch2 packed form
+with declared LOD0..3 is already covered by its 2048-byte legacy base range;
+its effective LOD0 starts at byte offset 64 and its canonical extent is 1888.
+The unsigned RGBA8 tiled single levels 32x32/pitch1, 64x64/pitch2,
+64x128/pitch2, 128x64/pitch4 and 128x128/pitch4 also pass the ordinary
+coverage guard. No additional admission exception applies to these forms.
 
 A required native-source texture is reported as `kTextureUnresolved`, with
 no CPU payload or memory version. The retained unsigned, single-level Rgba8

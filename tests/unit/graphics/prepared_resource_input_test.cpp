@@ -3531,4 +3531,186 @@ TEST_CASE("Prepared unsigned linear BC matrix preserves exact range admission",
   CHECK(cache.load_count == 0);
 }
 
+TEST_CASE("Prepared RGBA8/R8 matrix keeps exact range and LOD normalization",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  struct Form {
+    std::array<uint32_t, 6> words;
+    uint32_t legacy_base, base, legacy_mips, mips, max_level, lod0_offset;
+    bool extended;
+  };
+  constexpr Form forms[] = {
+      {{0x00800002, 0x1BB79086, 0x0000E007, 0x00000C14, 0x000000C0, 0x00000A00},
+       2048,
+       2048,
+       0,
+       0,
+       0,
+       64,
+       false},
+      {{0x04000002, 0x1B195002, 0x003FE1FF, 0x00000248, 0x00000240, 0x1B175A00},
+       262144,
+       262144,
+       122880,
+       126752,
+       9,
+       0,
+       true},
+      {{0x02000002, 0x1B10D086, 0x000060FF, 0x00000C14, 0x00000200, 0x00000A00},
+       4096,
+       20480,
+       0,
+       0,
+       0,
+       16384,
+       true},
+      {{0x02000002, 0x1B105086, 0x000000FF, 0x00000C14, 0x00000200, 0x00000A00},
+       1024,
+       17408,
+       0,
+       0,
+       0,
+       16384,
+       true},
+      {{0x80400002, 0x1BC8D086, 0x0003E01F, 0x00000C14, 0, 0x00000200},
+       4096,
+       4096,
+       0,
+       0,
+       0,
+       0,
+       false},
+      {{0x81000002, 0x1BCAD086, 0x0007E07F, 0x00000C14, 0, 0x00000200},
+       32768,
+       32768,
+       0,
+       0,
+       0,
+       0,
+       false},
+      {{0x80800002, 0x164DE086, 0x0007E03F, 0x00000C14, 0, 0x00000200},
+       16384,
+       16384,
+       0,
+       0,
+       0,
+       0,
+       false},
+      {{0x81000002, 0x155BE086, 0x000FE07F, 0x00000C14, 0, 0x00000200},
+       65536,
+       65536,
+       0,
+       0,
+       0,
+       0,
+       false},
+      {{0x80800002, 0x1BD2E086, 0x000FE03F, 0x00000C14, 0, 0x00000200},
+       32768,
+       32768,
+       0,
+       0,
+       0,
+       0,
+       false}};
+  for (const auto& form : forms) {
+    CAPTURE(form.words);
+    xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch, form.words.data(), sizeof(fetch));
+    TextureInfo legacy;
+    REQUIRE(TextureInfo::Prepare(fetch, &legacy));
+    CHECK(legacy.memory.base_size == form.legacy_base);
+    CHECK(legacy.memory.mip_size == form.legacy_mips);
+    TestTextureCache::TextureKey key;
+    TestTextureCache::BindingInfoFromFetchConstant(fetch, key, nullptr);
+    const auto layout = key.GetGuestLayout();
+    CHECK(key.mip_max_level == form.max_level);
+    CHECK(legacy.mip_max_level == form.max_level);
+    DrawCaptureFrameInputTextureView view;
+    REQUIRE(cache.PrepareFrameInputTexture(fetch, view));
+    CHECK(view.available);
+    CHECK(view.base_size == form.base);
+    CHECK(view.mip_size == form.mips);
+    CHECK(view.mip_max_level == form.max_level);
+    CHECK(view.base_address == legacy.memory.base_address);
+    CHECK(view.mip_address == legacy.memory.mip_address);
+    CHECK(view.base_size >= layout.base.level_data_extent_bytes);
+    CHECK(layout.mips_total_extent_bytes == form.mips);
+    if (fetch.packed_mips && layout.packed_level == 0) {
+      uint32_t x, y, z;
+      REQUIRE(texture_util::GetPackedMipOffset(fetch.size_2d.width + 1, fetch.size_2d.height + 1, 1,
+                                               fetch.format, 0, x, y, z));
+      CHECK(x * FormatInfo::Get(fetch.format)->bytes_per_block() +
+                y * layout.base.row_pitch_bytes ==
+            form.lod0_offset);
+      CHECK(fetch.mip_address == 0);
+      CHECK(fetch.mip_max_level > view.mip_max_level);
+    }
+    const auto reject = [&](auto mutate) {
+      auto neighbor = fetch;
+      mutate(neighbor);
+      DrawCaptureFrameInputTextureView rejected;
+      CHECK_FALSE(cache.PrepareFrameInputTexture(neighbor, rejected));
+      CHECK_FALSE(rejected.available);
+    };
+    reject([](auto& f) { f.pitch = 0; });
+    reject([](auto& f) { f.mip_min_level = 1; });
+    reject([](auto& f) { f.stacked = true; });
+    if (form.extended) {
+      reject([](auto& f) { ++f.pitch; });
+      reject([](auto& f) { --f.mip_max_level; });
+      reject([](auto& f) { f.tiled = true; });
+      reject([](auto& f) { f.sign_y = xenos::TextureSign::kSigned; });
+      reject([](auto& f) {
+        f.endianness =
+            f.endianness == xenos::Endian::kNone ? xenos::Endian::k8in32 : xenos::Endian::kNone;
+      });
+      reject([](auto& f) {
+        f.format = f.format == xenos::TextureFormat::k_8 ? xenos::TextureFormat::k_8_8
+                                                         : xenos::TextureFormat::k_16_16;
+      });
+      reject([](auto& f) { f.swizzle ^= 1; });
+      reject([](auto& f) { f.num_format = 1; });
+      reject([](auto& f) { f.exp_adjust = 1; });
+      reject([](auto& f) { f.force_bc_w_to_max = 1; });
+      reject([](auto& f) { f.size_2d.stack_depth = 1; });
+      reject([](auto& f) { --f.size_2d.width; });
+      // 256x4 -> 256x8, 256x1 -> 256x2, 512x512 -> 512x256.
+      reject([](auto& f) {
+        f.size_2d.height = f.size_2d.height == 3 ? 7 : f.size_2d.height == 0 ? 1 : 255;
+      });
+      reject([](auto& f) { f.dimension = xenos::DataDimension::kCube; });
+      if (fetch.format == xenos::TextureFormat::k_8_8_8_8) {
+        reject([](auto& f) { f.mip_address = 0x1000000 >> 12; });
+      } else {
+        // Removing the mip page keeps the existing ordinary LOD0 admission.
+        auto clamped = fetch;
+        clamped.mip_address = 0;
+        TextureInfo clamped_legacy;
+        REQUIRE(TextureInfo::Prepare(clamped, &clamped_legacy));
+        DrawCaptureFrameInputTextureView clamped_view;
+        REQUIRE(cache.PrepareFrameInputTexture(clamped, clamped_view));
+        CHECK(clamped_view.mip_max_level == 0);
+        CHECK(clamped_view.mip_size == clamped_legacy.memory.mip_size);
+      }
+      DrawCaptureFrameInputTextureView signed_view;
+      signed_view.is_signed = true;
+      CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, signed_view));
+      // The ordinary complete single-level neighbor still needs no exception.
+      auto ordinary = fetch;
+      ordinary.packed_mips = false;
+      ordinary.mip_max_level = 0;
+      ordinary.mip_address = 0;
+      TextureInfo ordinary_legacy;
+      REQUIRE(TextureInfo::Prepare(ordinary, &ordinary_legacy));
+      DrawCaptureFrameInputTextureView ordinary_view;
+      REQUIRE(cache.PrepareFrameInputTexture(ordinary, ordinary_view));
+      CHECK(ordinary_view.base_size == ordinary_legacy.memory.base_size);
+    }
+  }
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+}
 }  // namespace

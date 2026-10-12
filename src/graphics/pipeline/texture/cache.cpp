@@ -222,6 +222,30 @@ bool IsPreparedUnsignedBc2Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
          fetch.sign_w == xenos::TextureSign::kUnsigned;
 }
 
+// Correct only the exact unsigned CPU forms whose legacy ranges omit a tail.
+// A zero mip page retains the reference's effective LOD0 normalization.
+bool IsPreparedUnsignedRgba8R8Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                     const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                     uint8_t signs) {
+  const bool r8 = fetch.format == xenos::TextureFormat::k_8 && fetch.size_2d.width == 511 &&
+                  fetch.size_2d.height == 511 && fetch.pitch == 16 && fetch.mip_max_level == 9 &&
+                  (fetch.mip_address & 0x1FFFF) != 0 && fetch.endianness == xenos::Endian::kNone &&
+                  fetch.swizzle == 0x124;
+  const bool rgba8 = fetch.format == xenos::TextureFormat::k_8_8_8_8 &&
+                     fetch.size_2d.width == 255 &&
+                     (fetch.size_2d.height == 3 || fetch.size_2d.height == 0) && fetch.pitch == 8 &&
+                     fetch.mip_max_level == 8 && fetch.mip_address == 0 &&
+                     fetch.endianness == xenos::Endian::k8in32 && fetch.swizzle == 0x60A;
+  return (r8 || rgba8) && !view.is_signed && signs == 0 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.stack_depth == 0 && !fetch.tiled && fetch.packed_mips &&
+         fetch.mip_min_level == 0 && !fetch.num_format && !fetch.exp_adjust &&
+         !fetch.force_bc_w_to_max && fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
 struct TextureLoadDumpFilter {
   uint32_t address;
   uint32_t width;
@@ -1484,6 +1508,7 @@ bool TextureCache::PrepareFrameInputTexture(
   const bool selected_signed_rg16 = IsPreparedSignedRg16Float(fetch, view, signs);
   const bool selected_unsigned_bc1 = IsPreparedUnsignedBc1Packed(fetch, view, signs);
   const bool selected_unsigned_bc2 = IsPreparedUnsignedBc2Packed(fetch, view, signs);
+  const bool selected_unsigned_rgba8_r8 = IsPreparedUnsignedRgba8R8Packed(fetch, view, signs);
   if (key.base_page && info.memory.base_address != key.base_page << 12) {
     return false;
   }
@@ -1492,14 +1517,15 @@ bool TextureCache::PrepareFrameInputTexture(
       return false;
     }
     if (info.memory.mip_size < layout.mips_total_extent_bytes) {
-      if (!selected_unsigned_bc1 && !selected_unsigned_bc2) {
+      if (!selected_unsigned_bc1 && !selected_unsigned_bc2 && !selected_unsigned_rgba8_r8) {
         return false;
       }
       info.memory.mip_size = layout.mips_total_extent_bytes;
     }
   }
   if (key.base_page && info.memory.base_size < layout.base.level_data_extent_bytes) {
-    if (!selected_signed_rg16 || !layout.base.level_data_extent_bytes) {
+    if ((!selected_signed_rg16 && !selected_unsigned_rgba8_r8) ||
+        !layout.base.level_data_extent_bytes) {
       return false;
     }
     info.memory.base_size = layout.base.level_data_extent_bytes;
