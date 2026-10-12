@@ -81,30 +81,36 @@ version, resource, native owner or completion state. Unsupported query or
 dimension demand, inaccessible or GPU-owned required textures, memexport, and
 invalid geometry remain incomplete. The legacy texture ranges must cover the
 canonical cache layout, except for the selected unsigned linear BC1 and BC2
-forms. BC1 admits these exact nonstacked 2D forms with `k_DXT1`, `k8in16`, raw
-swizzle `0x688`: 64x64 with pitch 4 and packed mips 0..6, with a separate base
-range of `0x1000` bytes (canonical base data extent `0xF80`) and canonical
-packed-mip range of `0x2340` bytes with its tail at offset `0x2000` (row pitch
-256 and 8x4 block extent); 128x128 with pitch 4 and packed mips 0..7, with a
-separate base range of `0x2000` bytes and canonical packed-mip range of
-`0x4340` bytes; and 256x256 with pitch 8 and packed mips 0..8, with a separate
-base range of `0x8000` bytes and canonical packed-mip range of `0x6340` bytes;
-and 512x512
-with pitch 16 and packed mips 0..9, with a separate base range of `0x20000`
-bytes and canonical packed-mip range of `0xE340` bytes, with the packed tail
-starting at offset `0xE000` (row pitch 256 and 8x4 block extent); and 256x128
-with pitch 8 and packed mips 0..8, with a separate base range of `0x4000`
-bytes and canonical packed-mip range of `0x4740` bytes, with the packed tail
-starting at offset `0x4000` (row pitch 256 and 8x8 block extent). BC2 admits
-these exact nonstacked 2D forms with `k_DXT2_3`, pitch 4, `k8in16`, raw swizzle
-`0x688`: 64x64 with packed mips 0..6, a separate base range of `0x2000` bytes
-and canonical packed-mip range of `0x4680` bytes with its tail at offset
-`0x4000`; and 128x256 with packed mips 0..8, a separate base range of
-`0x8000` bytes and canonical packed-mip range of `0x8E80` bytes with its tail
-at offset `0x8000` (row pitch 512 and 8x8 block extent); and 128x128 with
-packed mips 0..7, a separate base range of `0x4000` bytes and canonical
-packed-mip range of `0x8680` bytes with its tail at offset `0x8000` (row pitch
-512 and 8x4 block extent). The consumer owns the guarded copy and the ordinary
+forms. The exact packed tuples below are unsigned, linear, nonstacked 2D,
+with `k8in16`, raw swizzle `0x688`, and minimum LOD 0. Pitch is in
+32-texel fetch units; each row permits only its listed maximum LOD.
+
+| Format | Width x height | Pitch | Maximum LOD |
+|---|---|---|---|
+| BC1 (`k_DXT1`) | 64x64 | 4 | 6 |
+| BC1 (`k_DXT1`) | 128x128 | 4 | 7 |
+| BC1 (`k_DXT1`) | 256x256 | 8 | 8 |
+| BC1 (`k_DXT1`) | 256x128 | 8 | 8 |
+| BC1 (`k_DXT1`) | 512x512 | 16 | 9 |
+| BC1 (`k_DXT1`) | 32x32 | 4 | 5 |
+| BC1 (`k_DXT1`) | 512x256 | 16 | 9 |
+| BC1 (`k_DXT1`) | 1024x1024 | 32 | 10 |
+| BC2 (`k_DXT2_3`) | 64x64 | 4 | 6 |
+| BC2 (`k_DXT2_3`) | 128x256 | 4 | 8 |
+| BC2 (`k_DXT2_3`) | 128x128 | 4 | 7 |
+| BC2 (`k_DXT2_3`) | 128x64 | 4 | 7 |
+| BC2 (`k_DXT2_3`) | 256x128 | 8 | 8 |
+| BC2 (`k_DXT2_3`) | 256x256 | 8 | 8 |
+| BC2 (`k_DXT2_3`) | 512x256 | 16 | 9 |
+| BC2 (`k_DXT2_3`) | 512x512 | 16 | 9 |
+
+Prepared extends only these packed mip ranges to
+`texture_util::GetGuestTextureLayout`'s canonical extent. Single-level
+BC1 8x8/pitch4, 512x512/pitch16, 1024x1024/pitch32,
+2048x2048/pitch64, 4096x4096/pitch128 and BC2 256x256/pitch8
+already pass the ordinary range-coverage guard with LOD 0 and no packed mips;
+they receive no tuple exception. This metadata admission is not a format-wide
+pixel-conformance claim. The consumer owns the guarded copy and the ordinary
 cache metadata remains unchanged. Other
 uncovered packed-mip and mip-only layouts remain unavailable. Preparation
 creates no host texture, upload, descriptor or texture watch. Missing texture

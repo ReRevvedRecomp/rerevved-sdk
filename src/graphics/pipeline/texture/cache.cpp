@@ -179,49 +179,20 @@ bool IsPreparedSignedRg16Float(const xenos::xe_gpu_texture_fetch_t& fetch,
 bool IsPreparedUnsignedBc1Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
                                  const diagnostic::DrawCaptureFrameInputTextureView& view,
                                  uint8_t swizzled_signs) {
-  constexpr uint32_t k64Width = 64;
-  constexpr uint32_t k64Height = 64;
-  constexpr uint32_t k64Pitch = 4;
-  constexpr uint32_t k64MipMaxLevel = 6;
-  constexpr uint32_t k128Width = 128;
-  constexpr uint32_t k128Height = 128;
-  constexpr uint32_t k128Pitch = 4;
-  constexpr uint32_t k128MipMaxLevel = 7;
-  constexpr uint32_t k256Width = 256;
-  constexpr uint32_t k256Height = 256;
-  constexpr uint32_t k256Pitch = 8;
-  constexpr uint32_t k256MipMaxLevel = 8;
-  constexpr uint32_t k256RectHeight = 128;
-  constexpr uint32_t k512Width = 512;
-  constexpr uint32_t k512Height = 512;
-  constexpr uint32_t k512Pitch = 16;
-  constexpr uint32_t k512MipMaxLevel = 9;
-  constexpr uint32_t kSwizzle = 0x688;
-  constexpr uint8_t kAllUnsigned = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
-  const uint32_t width = fetch.size_2d.width + 1;
-  const uint32_t height = fetch.size_2d.height + 1;
-  const bool is_64_square_form = width == k64Width && height == k64Height &&
-                                 fetch.pitch == k64Pitch && fetch.mip_max_level == k64MipMaxLevel;
-  const bool is_128_square_form = width == k128Width && height == k128Height &&
-                                  fetch.pitch == k128Pitch &&
-                                  fetch.mip_max_level == k128MipMaxLevel;
-  const bool is_256_square_form = width == k256Width && height == k256Height &&
-                                  fetch.pitch == k256Pitch &&
-                                  fetch.mip_max_level == k256MipMaxLevel;
-  const bool is_256_rectangular_form = width == k256Width && height == k256RectHeight &&
-                                       fetch.pitch == k256Pitch &&
-                                       fetch.mip_max_level == k256MipMaxLevel;
-  const bool is_512_square_form = width == k512Width && height == k512Height &&
-                                  fetch.pitch == k512Pitch &&
-                                  fetch.mip_max_level == k512MipMaxLevel;
-  return !view.is_signed && swizzled_signs == kAllUnsigned &&
+  // Exact packed tuples only. Single-level ranges use the ordinary coverage guard.
+  constexpr uint32_t kForms[][4] = {
+      {64, 64, 4, 6},    {128, 128, 4, 7}, {256, 256, 8, 8},  {256, 128, 8, 8},
+      {512, 512, 16, 9}, {32, 32, 4, 5},   {512, 256, 16, 9}, {1024, 1024, 32, 10},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.size_2d.width + 1 == form[0] && fetch.size_2d.height + 1 == form[1] &&
+           fetch.pitch == form[2] && fetch.mip_max_level == form[3];
+  });
+  return selected && !view.is_signed && swizzled_signs == 0 &&
          fetch.format == xenos::TextureFormat::k_DXT1 &&
          fetch.endianness == xenos::Endian::k8in16 &&
          fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
-         fetch.swizzle == kSwizzle && !fetch.tiled && fetch.packed_mips &&
-         fetch.mip_min_level == 0 &&
-         (is_64_square_form || is_128_square_form || is_256_square_form ||
-          is_256_rectangular_form || is_512_square_form) &&
+         fetch.swizzle == 0x688 && !fetch.tiled && fetch.packed_mips && fetch.mip_min_level == 0 &&
          fetch.sign_x == xenos::TextureSign::kUnsigned &&
          fetch.sign_y == xenos::TextureSign::kUnsigned &&
          fetch.sign_z == xenos::TextureSign::kUnsigned &&
@@ -231,21 +202,20 @@ bool IsPreparedUnsignedBc1Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
 bool IsPreparedUnsignedBc2Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
                                  const diagnostic::DrawCaptureFrameInputTextureView& view,
                                  uint8_t swizzled_signs) {
-  constexpr uint32_t kPitch = 4;
-  constexpr uint32_t kSwizzle = 0x688;
-  constexpr uint8_t kAllUnsigned = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
-  const uint32_t width = fetch.size_2d.width + 1;
-  const uint32_t height = fetch.size_2d.height + 1;
-  const bool is_square_form = width == 64 && height == 64 && fetch.mip_max_level == 6;
-  const bool is_128_square_form = width == 128 && height == 128 && fetch.mip_max_level == 7;
-  const bool is_rectangular_form = width == 128 && height == 256 && fetch.mip_max_level == 8;
-  return !view.is_signed && swizzled_signs == kAllUnsigned &&
+  // Exact packed tuples only. Single-level ranges use the ordinary coverage guard.
+  constexpr uint32_t kForms[][4] = {
+      {64, 64, 4, 6},   {128, 128, 4, 7}, {128, 256, 4, 8},  {128, 64, 4, 7},
+      {256, 128, 8, 8}, {256, 256, 8, 8}, {512, 256, 16, 9}, {512, 512, 16, 9},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.size_2d.width + 1 == form[0] && fetch.size_2d.height + 1 == form[1] &&
+           fetch.pitch == form[2] && fetch.mip_max_level == form[3];
+  });
+  return selected && !view.is_signed && swizzled_signs == 0 &&
          fetch.format == xenos::TextureFormat::k_DXT2_3 &&
          fetch.endianness == xenos::Endian::k8in16 &&
          fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
-         fetch.pitch == kPitch && fetch.swizzle == kSwizzle && !fetch.tiled && fetch.packed_mips &&
-         fetch.mip_min_level == 0 &&
-         (is_square_form || is_128_square_form || is_rectangular_form) &&
+         fetch.swizzle == 0x688 && !fetch.tiled && fetch.packed_mips && fetch.mip_min_level == 0 &&
          fetch.sign_x == xenos::TextureSign::kUnsigned &&
          fetch.sign_y == xenos::TextureSign::kUnsigned &&
          fetch.sign_z == xenos::TextureSign::kUnsigned &&

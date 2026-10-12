@@ -1593,7 +1593,7 @@ TEST_CASE("Prepared unsigned 256x256 BC1 admits its canonical packed mip footpri
     CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
     CHECK_FALSE(view.available);
   };
-  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
   reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 127; });
   reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 63; });
   reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 4; });
@@ -1883,7 +1883,7 @@ TEST_CASE("Prepared unsigned 256x128 BC1 admits its canonical packed mip footpri
     CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
     CHECK_FALSE(view.available);
   };
-  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
   reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 127; });
   reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 63; });
   reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 4; });
@@ -2167,9 +2167,9 @@ TEST_CASE("Prepared unsigned 512x512 BC1 admits its canonical packed mip footpri
     CHECK_FALSE(cache.PrepareFrameInputTexture(near_miss, view));
     CHECK_FALSE(view.available);
   };
-  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT2_3; });
+  reject_fetch("format", [](auto& fetch) { fetch.format = xenos::TextureFormat::k_DXT4_5; });
   reject_fetch("width", [](auto& fetch) { fetch.size_2d.width = 255; });
-  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 255; });
+  reject_fetch("height", [](auto& fetch) { fetch.size_2d.height = 127; });
   reject_fetch("pitch", [](auto& fetch) { fetch.pitch = 8; });
   reject_fetch("mip_max_level", [](auto& fetch) { fetch.mip_max_level = 8; });
   reject_fetch("endianness", [](auto& fetch) { fetch.endianness = xenos::Endian::kNone; });
@@ -3436,4 +3436,99 @@ TEST_CASE("Prepared resolve rejects inaccessible and clipped-empty geometry",
   CHECK_FALSE(fixture.Plan().cpu_data_complete);
   CHECK_FALSE(fixture.Plan().source_rect_present);
 }
+
+TEST_CASE("Prepared unsigned linear BC matrix preserves exact range admission",
+          "[graphics][prepared]") {
+  auto& memory = rex::testing::GetTestMemory();
+  TestSharedMemory shared(memory);
+  RegisterFile registers;
+  TestTextureCache cache(registers, shared);
+  struct Form {
+    xenos::TextureFormat format;
+    uint32_t width, height, pitch, max_level;
+  };
+  constexpr Form kForms[] = {
+      {xenos::TextureFormat::k_DXT1, 8, 8, 4, 0},
+      {xenos::TextureFormat::k_DXT1, 32, 32, 4, 5},
+      {xenos::TextureFormat::k_DXT1, 512, 256, 16, 9},
+      {xenos::TextureFormat::k_DXT1, 512, 512, 16, 0},
+      {xenos::TextureFormat::k_DXT1, 1024, 1024, 32, 0},
+      {xenos::TextureFormat::k_DXT1, 1024, 1024, 32, 10},
+      {xenos::TextureFormat::k_DXT1, 2048, 2048, 64, 0},
+      {xenos::TextureFormat::k_DXT1, 4096, 4096, 128, 0},
+      {xenos::TextureFormat::k_DXT2_3, 128, 64, 4, 7},
+      {xenos::TextureFormat::k_DXT2_3, 256, 128, 8, 8},
+      {xenos::TextureFormat::k_DXT2_3, 256, 256, 8, 0},
+      {xenos::TextureFormat::k_DXT2_3, 256, 256, 8, 8},
+      {xenos::TextureFormat::k_DXT2_3, 512, 256, 16, 9},
+      {xenos::TextureFormat::k_DXT2_3, 512, 512, 16, 9},
+  };
+  for (const auto& form : kForms) {
+    CAPTURE(form.width, form.height, form.pitch, form.max_level);
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    fetch.type = xenos::FetchConstantType::kTexture;
+    fetch.dimension = xenos::DataDimension::k2DOrStacked;
+    fetch.format = form.format;
+    fetch.size_2d.width = form.width - 1;
+    fetch.size_2d.height = form.height - 1;
+    fetch.pitch = form.pitch;
+    fetch.base_address = 0x10000 >> 12;
+    fetch.mip_address = form.max_level ? 0x1000000 >> 12 : 0;
+    fetch.endianness = xenos::Endian::k8in16;
+    fetch.swizzle = 0x688;
+    fetch.packed_mips = form.max_level != 0;
+    fetch.mip_max_level = form.max_level;
+    TextureInfo legacy;
+    REQUIRE(TextureInfo::Prepare(fetch, &legacy));
+    TestTextureCache::TextureKey key;
+    TestTextureCache::BindingInfoFromFetchConstant(fetch, key, nullptr);
+    const auto layout = key.GetGuestLayout();
+    DrawCaptureFrameInputTextureView view;
+    REQUIRE(cache.PrepareFrameInputTexture(fetch, view));
+    CHECK(view.available);
+    CHECK(view.base_size == legacy.memory.base_size);
+    CHECK(view.base_size >= layout.base.level_data_extent_bytes);
+    if (form.max_level) {
+      CHECK(legacy.memory.mip_size < layout.mips_total_extent_bytes);
+      CHECK(view.mip_size == layout.mips_total_extent_bytes);
+      const auto reject = [&](auto mutate) {
+        auto neighbor = fetch;
+        mutate(neighbor);
+        DrawCaptureFrameInputTextureView rejected;
+        CHECK_FALSE(cache.PrepareFrameInputTexture(neighbor, rejected));
+        CHECK_FALSE(rejected.available);
+      };
+      reject([](auto& f) { ++f.pitch; });
+      reject([](auto& f) { --f.mip_max_level; });
+      reject([](auto& f) { f.tiled = true; });
+      reject([](auto& f) { f.sign_y = xenos::TextureSign::kSigned; });
+      reject([](auto& f) { f.format = xenos::TextureFormat::k_DXT4_5; });
+      if (form.format == xenos::TextureFormat::k_DXT2_3 && form.width == 128 && form.height == 64) {
+        reject([](auto& f) { f.format = xenos::TextureFormat::k_DXT1; });
+      }
+      if (form.format == xenos::TextureFormat::k_DXT1 && form.width == 32 && form.height == 32) {
+        reject([](auto& f) { f.format = xenos::TextureFormat::k_DXT2_3; });
+      }
+      reject([](auto& f) { f.stacked = true; });
+      reject([](auto& f) { f.endianness = xenos::Endian::kNone; });
+      reject([](auto& f) { f.swizzle = 0x680; });
+      DrawCaptureFrameInputTextureView signed_view;
+      signed_view.is_signed = true;
+      CHECK_FALSE(cache.PrepareFrameInputTexture(fetch, signed_view));
+    } else {
+      // No predicate correction is needed: the complete ordinary base range
+      // covers even the 8x8/pitch4 form, and there is no mip bank to extend.
+      CHECK(view.mip_size == 0);
+      CHECK(layout.mips_total_extent_bytes == 0);
+      CHECK(legacy.memory.base_size >= layout.base.level_data_extent_bytes);
+      auto malformed = fetch;
+      malformed.pitch = 0;
+      DrawCaptureFrameInputTextureView rejected;
+      CHECK_FALSE(cache.PrepareFrameInputTexture(malformed, rejected));
+    }
+  }
+  CHECK(cache.create_count == 0);
+  CHECK(cache.load_count == 0);
+}
+
 }  // namespace
