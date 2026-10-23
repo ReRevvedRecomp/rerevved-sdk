@@ -15,10 +15,12 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/draw_capture_mailbox.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -130,6 +132,16 @@ class TextureCache {
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
 
+  diagnostic::DrawCaptureGuestMemoryVersion GetActiveTextureGuestMemoryVersion(
+      uint32_t fetch_constant_index, bool is_signed) const;
+
+  // Read-only metadata from the current fetch, independent of RequestTextures.
+  // Only ordinary nonstacked 2D layouts whose legacy view covers the canonical
+  // cache ranges are admitted. This creates no texture, upload, descriptor or
+  // watch; the caller must prove readability and CPU ownership of required data.
+  bool PrepareFrameInputTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                diagnostic::DrawCaptureFrameInputTextureView& view) const;
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
@@ -214,11 +226,19 @@ class TextureCache {
 
     uint64_t GetHostMemoryUsage() const { return host_memory_usage_; }
 
+    // The instance distinguishes cache recreation for the same guest key. The
+    // generation changes when watched guest data invalidates the instance.
+    uint64_t instance_id() const { return instance_id_; }
+    uint64_t content_generation() const {
+      return content_generation_.load(std::memory_order_acquire);
+    }
+
     uint64_t last_usage_submission_index() const { return last_usage_submission_index_; }
     uint64_t last_usage_time() const { return last_usage_time_; }
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
+    diagnostic::DrawCaptureGuestMemoryVersion GetGuestMemoryVersion() const;
 
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;
@@ -226,7 +246,10 @@ class TextureCache {
     bool mips_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return mips_outdated_;
     }
-    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock, bool base,
+                              bool mips);
+    void RestoreOutdatedAfterLoadFailure(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                         bool base, bool mips);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
@@ -262,6 +285,8 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    uint64_t instance_id_ = 0;
+    std::atomic<uint64_t> content_generation_{1};
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -606,6 +631,21 @@ class TextureCache {
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
+
+  struct TextureLoadDumpConfig {
+    std::string directory;
+    uint32_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pitch = 0;
+    uint32_t tiled = 0;
+    uint32_t format = 0;
+    uint32_t endian = 0;
+    bool any_address = false;
+    bool exact = true;
+    bool enabled = false;
+  } texture_load_dump_config_;
+  bool texture_load_dump_attempted_ = false;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

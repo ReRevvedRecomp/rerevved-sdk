@@ -10,21 +10,31 @@
  */
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
+#include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+
+#include "prepared_cube.h"
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
@@ -71,14 +81,24 @@ REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
-                     "Draw resolution scale for both X and Y axes (same as setting "
-                     "draw_resolution_scale_x and draw_resolution_scale_y)")
+REXCVAR_DEFINE_INT32(resolution_scale, 1, "Display",
+                     "Resolution scale. Draw resolution scale for both X and Y axes (same as "
+                     "setting draw_resolution_scale_x and draw_resolution_scale_y)")
     .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .audience(rex::cvar::Audience::kPlayer);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+
+REXCVAR_DEFINE_STRING(texture_load_dump, "", "GPU",
+                      "One-shot directory for a filtered texture-load DDS and metadata")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(texture_load_dump_filter, "", "GPU",
+                      "Texture-load filter: hex_address, or "
+                      "hex_address|*:width:height:pitch:tiled:format:endian")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
@@ -126,6 +146,402 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+bool IsPreparedCubeFetch(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  if (fetch.type != xenos::FetchConstantType::kTexture ||
+      fetch.dimension != xenos::DataDimension::kCube || fetch.stacked ||
+      fetch.size_2d.stack_depth != 5 || fetch.tiled || !fetch.packed_mips ||
+      fetch.mip_min_level != 0 || fetch.exp_adjust || fetch.force_bc_w_to_max ||
+      !fetch.base_address || !fetch.mip_address || fetch.base_address == fetch.mip_address) {
+    return false;
+  }
+  const bool small = fetch.size_2d.width == 63 && fetch.size_2d.height == 63 && fetch.pitch == 2 &&
+                     fetch.mip_max_level == 6;
+  const bool bc3 = fetch.size_2d.width == 127 && fetch.size_2d.height == 127 && fetch.pitch == 4 &&
+                   fetch.mip_max_level == 7 && fetch.format == xenos::TextureFormat::k_DXT4_5 &&
+                   fetch.endianness == xenos::Endian::k8in16 && fetch.swizzle == 0x688 &&
+                   !fetch.num_format && !(fetch.dword_0 & 0x3FC);
+  const bool rgba8 = fetch.format == xenos::TextureFormat::k_8_8_8_8 &&
+                     fetch.endianness == xenos::Endian::k8in32 && fetch.swizzle == 0xA0A &&
+                     !fetch.num_format && fetch.sign_x == xenos::TextureSign::kUnsigned &&
+                     fetch.sign_y == xenos::TextureSign::kUnsigned &&
+                     fetch.sign_z == xenos::TextureSign::kUnsigned &&
+                     fetch.sign_w == xenos::TextureSign::kUnsigned;
+  const bool rgba16f = fetch.format == xenos::TextureFormat::k_16_16_16_16_FLOAT &&
+                       fetch.endianness == xenos::Endian::k8in16 && fetch.swizzle == 0x688 &&
+                       fetch.num_format == 1 && fetch.sign_x == xenos::TextureSign::kSigned &&
+                       fetch.sign_y == xenos::TextureSign::kSigned &&
+                       fetch.sign_z == xenos::TextureSign::kSigned &&
+                       fetch.sign_w == xenos::TextureSign::kSigned;
+  return (small && (rgba8 || rgba16f)) || bc3;
+}
+
+namespace {
+
+std::atomic<uint64_t> next_texture_instance_id{1};
+
+// Prepared native resolves use complete tiled allocations, including
+// padding/guard tiles, for this captured float form. Keep the correction in the
+// read-only Prepared view; ordinary metadata uses TextureGuestLayout.
+bool IsPreparedSignedRg16Float(const xenos::xe_gpu_texture_fetch_t& fetch,
+                               const diagnostic::DrawCaptureFrameInputTextureView& view,
+                               uint8_t swizzled_signs) {
+  // This captured producer shape includes tiled padding and the guard tile. Tie
+  // correction to its complete source-backed descriptor; do not admit another
+  // single-level RG16 fetch by coincidence.
+  constexpr uint32_t kWidth = 1280;
+  constexpr uint32_t kHeight = 720;
+  constexpr uint32_t kPitch = 40;
+  constexpr uint32_t kSwizzle = 0xB48;
+  constexpr uint8_t kAllSigned = uint8_t(xenos::TextureSign::kSigned) * uint8_t(0b01010101);
+  return view.is_signed && swizzled_signs == kAllSigned &&
+         fetch.format == xenos::TextureFormat::k_16_16_FLOAT &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.width + 1 == kWidth && fetch.size_2d.height + 1 == kHeight &&
+         fetch.pitch == kPitch && fetch.swizzle == kSwizzle && fetch.tiled && !fetch.packed_mips &&
+         fetch.mip_min_level == 0 && fetch.mip_max_level == 0 &&
+         fetch.sign_x == xenos::TextureSign::kSigned &&
+         fetch.sign_y == xenos::TextureSign::kSigned &&
+         fetch.sign_z == xenos::TextureSign::kSigned && fetch.sign_w == xenos::TextureSign::kSigned;
+}
+
+// Exact tiled CPU-writer forms whose legacy visible ranges omit tile storage.
+bool IsPreparedUnsignedTiledBc(const xenos::xe_gpu_texture_fetch_t& fetch,
+                               const diagnostic::DrawCaptureFrameInputTextureView& view,
+                               uint8_t signs) {
+  struct Form {
+    xenos::TextureFormat format;
+    uint32_t width, height, pitch, max_level;
+    bool packed;
+  };
+  constexpr Form kForms[] = {
+      {xenos::TextureFormat::k_DXT1, 128, 64, 4, 7, true},
+      {xenos::TextureFormat::k_DXT1, 256, 128, 8, 8, true},
+      {xenos::TextureFormat::k_DXT2_3, 128, 64, 4, 7, true},
+      {xenos::TextureFormat::k_DXT2_3, 32, 64, 4, 0, false},
+      {xenos::TextureFormat::k_DXT4_5, 128, 128, 4, 7, true},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.format == form.format && fetch.size_2d.width + 1 == form.width &&
+           fetch.size_2d.height + 1 == form.height && fetch.pitch == form.pitch &&
+           fetch.mip_max_level == form.max_level && fetch.packed_mips == form.packed &&
+           (form.max_level ? (fetch.mip_address & 0x1FFFF) != 0 : fetch.mip_address == 0);
+  });
+  return selected && !view.is_signed && signs == 0 && fetch.tiled &&
+         fetch.endianness == xenos::Endian::kNone && fetch.swizzle == 0x688 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.stack_depth == 0 && fetch.mip_min_level == 0 && !fetch.num_format &&
+         !fetch.exp_adjust && !fetch.force_bc_w_to_max &&
+         fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+bool IsPreparedUnsignedBc1Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                 const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                 uint8_t swizzled_signs) {
+  // Exact packed tuples only. Single-level ranges use the ordinary coverage guard.
+  constexpr uint32_t kForms[][4] = {
+      {64, 64, 4, 6},    {128, 128, 4, 7}, {256, 256, 8, 8},  {256, 128, 8, 8},
+      {512, 512, 16, 9}, {32, 32, 4, 5},   {512, 256, 16, 9}, {1024, 1024, 32, 10},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.size_2d.width + 1 == form[0] && fetch.size_2d.height + 1 == form[1] &&
+           fetch.pitch == form[2] && fetch.mip_max_level == form[3];
+  });
+  return selected && !view.is_signed && swizzled_signs == 0 &&
+         fetch.format == xenos::TextureFormat::k_DXT1 &&
+         fetch.endianness == xenos::Endian::k8in16 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.swizzle == 0x688 && !fetch.tiled && fetch.packed_mips && fetch.mip_min_level == 0 &&
+         fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+bool IsPreparedUnsignedBc2Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                 const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                 uint8_t swizzled_signs) {
+  // Exact packed tuples only. Single-level ranges use the ordinary coverage guard.
+  constexpr uint32_t kForms[][4] = {
+      {64, 64, 4, 6},   {128, 128, 4, 7}, {128, 256, 4, 8},  {128, 64, 4, 7},
+      {256, 128, 8, 8}, {256, 256, 8, 8}, {512, 256, 16, 9}, {512, 512, 16, 9},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.size_2d.width + 1 == form[0] && fetch.size_2d.height + 1 == form[1] &&
+           fetch.pitch == form[2] && fetch.mip_max_level == form[3];
+  });
+  return selected && !view.is_signed && swizzled_signs == 0 &&
+         fetch.format == xenos::TextureFormat::k_DXT2_3 &&
+         fetch.endianness == xenos::Endian::k8in16 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.swizzle == 0x688 && !fetch.tiled && fetch.packed_mips && fetch.mip_min_level == 0 &&
+         fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+bool IsPreparedUnsignedBc3Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                 const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                 uint8_t swizzled_signs) {
+  // Exact packed tuples only. Single-level ranges use the ordinary coverage guard.
+  constexpr uint32_t kForms[][4] = {
+      {64, 64, 4, 6},   {128, 128, 4, 7},  {256, 128, 8, 8},
+      {256, 256, 8, 8}, {512, 256, 16, 9}, {512, 512, 16, 9},
+  };
+  const bool selected = std::any_of(std::begin(kForms), std::end(kForms), [&](const auto& form) {
+    return fetch.size_2d.width + 1 == form[0] && fetch.size_2d.height + 1 == form[1] &&
+           fetch.pitch == form[2] && fetch.mip_max_level == form[3];
+  });
+  return selected && !view.is_signed && swizzled_signs == 0 &&
+         fetch.format == xenos::TextureFormat::k_DXT4_5 &&
+         fetch.endianness == xenos::Endian::k8in16 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.stack_depth == 0 && !fetch.num_format && !fetch.exp_adjust &&
+         !fetch.force_bc_w_to_max && fetch.swizzle == 0x688 && !fetch.tiled && fetch.packed_mips &&
+         fetch.mip_min_level == 0 && fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+// Correct only the exact unsigned CPU forms whose legacy ranges omit a tail.
+// A zero mip page retains the reference's effective LOD0 normalization.
+bool IsPreparedUnsignedRgba8R8Packed(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                     const diagnostic::DrawCaptureFrameInputTextureView& view,
+                                     uint8_t signs) {
+  const bool r8 = fetch.format == xenos::TextureFormat::k_8 && fetch.size_2d.width == 511 &&
+                  fetch.size_2d.height == 511 && fetch.pitch == 16 && fetch.mip_max_level == 9 &&
+                  (fetch.mip_address & 0x1FFFF) != 0 && fetch.endianness == xenos::Endian::kNone &&
+                  fetch.swizzle == 0x124;
+  const bool rgba8 = fetch.format == xenos::TextureFormat::k_8_8_8_8 &&
+                     fetch.size_2d.width == 255 &&
+                     (fetch.size_2d.height == 3 || fetch.size_2d.height == 0) && fetch.pitch == 8 &&
+                     fetch.mip_max_level == 8 && fetch.mip_address == 0 &&
+                     fetch.endianness == xenos::Endian::k8in32 && fetch.swizzle == 0x60A;
+  return (r8 || rgba8) && !view.is_signed && signs == 0 &&
+         fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+         fetch.size_2d.stack_depth == 0 && !fetch.tiled && fetch.packed_mips &&
+         fetch.mip_min_level == 0 && !fetch.num_format && !fetch.exp_adjust &&
+         !fetch.force_bc_w_to_max && fetch.sign_x == xenos::TextureSign::kUnsigned &&
+         fetch.sign_y == xenos::TextureSign::kUnsigned &&
+         fetch.sign_z == xenos::TextureSign::kUnsigned &&
+         fetch.sign_w == xenos::TextureSign::kUnsigned;
+}
+
+struct TextureLoadDumpFilter {
+  uint32_t address;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pitch;
+  uint32_t tiled;
+  uint32_t format;
+  uint32_t endian;
+};
+
+bool ParseTextureLoadDumpFilter(const std::string& value, TextureLoadDumpFilter& filter_out,
+                                bool& exact_out, bool& any_address_out) {
+  if (value.find(':') == std::string::npos) {
+    auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), filter_out.address, 16);
+    exact_out = false;
+    any_address_out = false;
+    return !value.empty() && error == std::errc() && end == value.data() + value.size();
+  }
+
+  uint32_t* fields[] = {&filter_out.address, &filter_out.width, &filter_out.height,
+                        &filter_out.pitch,   &filter_out.tiled, &filter_out.format,
+                        &filter_out.endian};
+  std::string_view remaining = value;
+  for (size_t i = 0; i < std::size(fields); ++i) {
+    size_t separator = remaining.find(':');
+    std::string_view field = remaining.substr(0, separator);
+    if (field.empty() || (i + 1 != std::size(fields)) != (separator != std::string_view::npos)) {
+      return false;
+    }
+    if (i == 0 && field == "*") {
+      any_address_out = true;
+      if (separator != std::string_view::npos) {
+        remaining.remove_prefix(separator + 1);
+      }
+      continue;
+    }
+    auto [end, error] =
+        std::from_chars(field.data(), field.data() + field.size(), *fields[i], i == 0 ? 16 : 10);
+    if (error != std::errc() || end != field.data() + field.size()) {
+      return false;
+    }
+    if (separator != std::string_view::npos) {
+      remaining.remove_prefix(separator + 1);
+    }
+  }
+  exact_out = true;
+  return true;
+}
+
+#pragma pack(push, 1)
+// Narrow DDS output adapted from:
+// https://github.com/birabittoh/rexglue-sdk/commit/164b2229eaae9e4d38d3c7dc9a74c38498d3b6b9
+struct DdsPixelFormat {
+  uint32_t size = 32;
+  uint32_t flags = 0x41;
+  uint32_t four_cc = 0;
+  uint32_t rgb_bit_count = 32;
+  uint32_t r_bit_mask = 0x000000FF;
+  uint32_t g_bit_mask = 0x0000FF00;
+  uint32_t b_bit_mask = 0x00FF0000;
+  uint32_t a_bit_mask = 0xFF000000;
+};
+
+struct DdsHeader {
+  uint32_t magic = 0x20534444;
+  uint32_t size = 124;
+  uint32_t flags = 0x100F;
+  uint32_t height = 0;
+  uint32_t width = 0;
+  uint32_t pitch = 0;
+  uint32_t depth = 0;
+  uint32_t mip_map_count = 1;
+  uint32_t reserved[11] = {};
+  DdsPixelFormat pixel_format;
+  uint32_t caps = 0x1000;
+  uint32_t caps2 = 0;
+  uint32_t caps3 = 0;
+  uint32_t caps4 = 0;
+  uint32_t reserved2 = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(DdsHeader) == 128);
+
+bool DumpTextureLoad(const TextureLoadDumpFilter& filter, const std::filesystem::path& directory,
+                     const uint8_t* source, uint32_t source_size) {
+  if (!source || !source_size || filter.format != uint32_t(xenos::TextureFormat::k_8_8_8_8)) {
+    return false;
+  }
+
+  const FormatInfo* format_info = FormatInfo::Get(xenos::TextureFormat::k_8_8_8_8);
+  uint32_t pitch_blocks = filter.pitch / format_info->block_width;
+  uint32_t width_blocks = filter.width / format_info->block_width;
+  uint32_t height_blocks = filter.height / format_info->block_height;
+  uint32_t output_pitch = width_blocks * format_info->bytes_per_block();
+  std::vector<uint8_t> output(size_t(output_pitch) * height_blocks);
+  xenos::Endian endian = xenos::Endian(filter.endian);
+  if (filter.tiled) {
+    texture_conversion::UntileInfo untile_info{};
+    untile_info.width = width_blocks;
+    untile_info.height = height_blocks;
+    untile_info.input_pitch = pitch_blocks;
+    untile_info.output_pitch = width_blocks;
+    untile_info.input_format_info = format_info;
+    untile_info.output_format_info = format_info;
+    untile_info.copy_callback = [endian](void* output_block, const void* input_block,
+                                         size_t length) {
+      texture_conversion::CopySwapBlock(endian, output_block, input_block, length);
+    };
+    texture_conversion::Untile(output.data(), source, &untile_info);
+  } else {
+    uint32_t input_pitch = pitch_blocks * format_info->bytes_per_block();
+    for (uint32_t y = 0; y < height_blocks; ++y) {
+      texture_conversion::CopySwapBlock(endian, output.data() + size_t(y) * output_pitch,
+                                        source + size_t(y) * input_pitch, output_pitch);
+    }
+  }
+
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    return false;
+  }
+  std::string stem =
+      fmt::format("texture_{:08x}_{}x{}_p{}_t{}_f{}_e{}", filter.address, filter.width,
+                  filter.height, filter.pitch, filter.tiled, filter.format, filter.endian);
+  std::filesystem::path dds_path = directory / stem;
+  dds_path.replace_extension(".dds");
+  std::filesystem::path metadata_path = directory / stem;
+  metadata_path.replace_extension(".txt");
+  std::filesystem::path dds_temporary_path = dds_path;
+  dds_temporary_path += ".tmp";
+  std::filesystem::path metadata_temporary_path = metadata_path;
+  metadata_temporary_path += ".tmp";
+  auto remove_temporary_file = [](const std::filesystem::path& path) {
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+    if (remove_error) {
+      REXGPU_ERROR("Failed to clean up diagnostic temporary file {}: {}", rex::path_to_utf8(path),
+                   remove_error.message());
+      return false;
+    }
+    return true;
+  };
+  auto remove_temporary_pair = [&]() {
+    bool dds_removed = remove_temporary_file(dds_temporary_path);
+    bool metadata_removed = remove_temporary_file(metadata_temporary_path);
+    return dds_removed && metadata_removed;
+  };
+  if (!remove_temporary_pair()) {
+    return false;
+  }
+
+  DdsHeader dds_header;
+  dds_header.width = filter.width;
+  dds_header.height = filter.height;
+  dds_header.pitch = output_pitch;
+  std::ofstream dds(dds_temporary_path, std::ios::binary | std::ios::trunc);
+  dds.write(reinterpret_cast<const char*>(&dds_header), sizeof(dds_header));
+  dds.write(reinterpret_cast<const char*>(output.data()), output.size());
+  dds.close();
+  if (!dds) {
+    remove_temporary_pair();
+    return false;
+  }
+
+  size_t source_nonzero = 0;
+  for (uint32_t i = 0; i < source_size; ++i) {
+    source_nonzero += source[i] != 0;
+  }
+  size_t output_nonzero = 0;
+  for (uint8_t byte : output) {
+    output_nonzero += byte != 0;
+  }
+  std::ofstream metadata(metadata_temporary_path, std::ios::trunc);
+  metadata << "address=0x" << std::hex << filter.address << std::dec << '\n'
+           << "width=" << filter.width << '\n'
+           << "height=" << filter.height << '\n'
+           << "pitch=" << filter.pitch << '\n'
+           << "tiled=" << filter.tiled << '\n'
+           << "format=" << filter.format << '\n'
+           << "endian=" << filter.endian << '\n'
+           << "source_bytes=" << source_size << '\n'
+           << "source_nonzero_bytes=" << source_nonzero << '\n'
+           << "decoded_bytes=" << output.size() << '\n'
+           << "decoded_nonzero_bytes=" << output_nonzero << '\n';
+  metadata.close();
+  if (!metadata) {
+    remove_temporary_pair();
+    return false;
+  }
+
+  const diagnostic::ArtifactPairPublicationResult publication = diagnostic::PublishArtifactPair(
+      dds_temporary_path, metadata_temporary_path, dds_path, metadata_path);
+  if (publication.cleanup_error) {
+    REXGPU_ERROR("Failed to clean up diagnostic artifact temporary files: {}",
+                 publication.cleanup_error.message());
+  }
+  if (!publication.succeeded()) {
+    REXGPU_ERROR("Failed to publish diagnostic artifact pair: {}",
+                 publication.publication_error.message());
+    return false;
+  }
+
+  REXGPU_INFO("Dumped first matching texture load to {} ({} of {} source bytes nonzero)",
+              rex::path_to_utf8(dds_path), source_nonzero, source_size);
+  return true;
+}
+
+}  // namespace
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -214,6 +630,37 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
   assert_true(draw_resolution_scale_y >= 1);
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
+
+  texture_load_dump_config_.directory = REXCVAR_GET(texture_load_dump);
+  std::string texture_load_dump_filter = REXCVAR_GET(texture_load_dump_filter);
+  if (!texture_load_dump_config_.directory.empty() || !texture_load_dump_filter.empty()) {
+    TextureLoadDumpFilter parsed_filter{};
+    bool exact_filter = true;
+    bool any_address = false;
+    if (texture_load_dump_config_.directory.empty() ||
+        !ParseTextureLoadDumpFilter(texture_load_dump_filter, parsed_filter, exact_filter,
+                                    any_address)) {
+      texture_load_dump_attempted_ = true;
+      REXGPU_ERROR("Invalid texture load dump configuration");
+    } else {
+      texture_load_dump_config_.address = parsed_filter.address;
+      texture_load_dump_config_.width = parsed_filter.width;
+      texture_load_dump_config_.height = parsed_filter.height;
+      texture_load_dump_config_.pitch = parsed_filter.pitch;
+      texture_load_dump_config_.tiled = parsed_filter.tiled;
+      texture_load_dump_config_.format = parsed_filter.format;
+      texture_load_dump_config_.endian = parsed_filter.endian;
+      texture_load_dump_config_.any_address = any_address;
+      texture_load_dump_config_.exact = exact_filter;
+      texture_load_dump_config_.enabled = true;
+      if (any_address) {
+        REXGPU_INFO("Armed one-shot shape-only texture load dump");
+      } else {
+        REXGPU_INFO("Armed one-shot {} texture load dump for 0x{:08X}",
+                    exact_filter ? "exact" : "address-only", parsed_filter.address);
+      }
+    }
+  }
 
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
@@ -394,6 +841,10 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_load_out.load_mips = mips_outdated;
   pending_range_count_out = 0;
 
+  // Watch before requesting shared memory so a guest write after the request
+  // has inspected or uploaded the range still marks this texture outdated.
+  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire(), base_outdated, mips_outdated);
+
   TextureKey texture_key = texture.key();
   if (base_outdated) {
     PendingSharedMemoryRange pending_range;
@@ -420,6 +871,11 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
+  auto restore_outdated = [&]() {
+    texture.RestoreOutdatedAfterLoadFailure(global_critical_region_.Acquire(),
+                                            pending_load.load_base, pending_load.load_mips);
+    return false;
+  };
   if (texture_key.scaled_resolve) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
@@ -427,24 +883,47 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     // GPU won't be trying to access unmapped memory.
     if (pending_load.load_base && !EnsureScaledResolveMemoryCommitted(
                                       texture_key.base_page << 12, texture.GetGuestBaseSize(), 4)) {
-      return false;
+      return restore_outdated();
     }
     if (pending_load.load_mips && !EnsureScaledResolveMemoryCommitted(
                                       texture_key.mip_page << 12, texture.GetGuestMipsSize(), 4)) {
-      return false;
+      return restore_outdated();
     }
   }
 
   if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
-    return false;
+    return restore_outdated();
   }
 
-  // Mark the ranges as uploaded and watch them. This is needed for scaled
-  // resolves as well to detect when the CPU wants to reuse the memory for a
-  // regular texture or a vertex buffer, and thus the scaled resolve version is
-  // not up to date anymore.
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  if (texture_load_dump_config_.enabled && !texture_load_dump_attempted_ &&
+      pending_load.load_base && !texture_key.scaled_resolve &&
+      (texture_load_dump_config_.any_address ||
+       (uint32_t(texture_key.base_page) << 12) == texture_load_dump_config_.address) &&
+      (!texture_load_dump_config_.exact ||
+       (texture_key.GetWidth() == texture_load_dump_config_.width &&
+        texture_key.GetHeight() == texture_load_dump_config_.height &&
+        (uint32_t(texture_key.pitch) << 5) == texture_load_dump_config_.pitch &&
+        texture_key.tiled == texture_load_dump_config_.tiled &&
+        uint32_t(texture_key.format) == texture_load_dump_config_.format &&
+        uint32_t(texture_key.endianness) == texture_load_dump_config_.endian))) {
+    TextureLoadDumpFilter dump_filter{
+        uint32_t(texture_key.base_page) << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+        uint32_t(texture_key.pitch) << 5,      texture_key.tiled,      uint32_t(texture_key.format),
+        uint32_t(texture_key.endianness),
+    };
+    REXGPU_INFO("Matched one-shot texture load dump: 0x{:08X}:{}:{}:{}:{}:{}:{}",
+                dump_filter.address, dump_filter.width, dump_filter.height, dump_filter.pitch,
+                dump_filter.tiled, dump_filter.format, dump_filter.endian);
+    const uint8_t* source = shared_memory().TranslatePhysical(texture_key.base_page << 12);
+    if (DumpTextureLoad(dump_filter, rex::to_path(texture_load_dump_config_.directory), source,
+                        texture.GetGuestBaseSize())) {
+      texture_load_dump_attempted_ = true;
+    } else {
+      REXGPU_ERROR("Failed to dump the first matching texture load");
+    }
+  }
+
   texture.LogAction("Loaded");
 
   return true;
@@ -584,6 +1063,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   } else {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
       if (pending_load.texture != nullptr) {
+        pending_load.texture->RestoreOutdatedAfterLoadFailure(
+            global_critical_region_.Acquire(), pending_load.load_base, pending_load.load_mips);
+      }
+    }
+    for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+      if (pending_load.texture != nullptr) {
         LoadTextureData(*pending_load.texture);
       }
     }
@@ -644,7 +1129,9 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
       last_usage_time_(texture_cache.current_submission_time_),
       used_previous_(track_usage ? texture_cache.texture_used_last_ : nullptr),
       used_next_(nullptr),
-      in_usage_list_(track_usage) {
+      in_usage_list_(track_usage),
+      force_load_3d_tiling_(false),
+      instance_id_(next_texture_instance_id.fetch_add(1, std::memory_order_relaxed)) {
   if (track_usage) {
     if (texture_cache.texture_used_last_) {
       texture_cache.texture_used_last_->used_next_ = this;
@@ -686,22 +1173,89 @@ TextureCache::Texture::~Texture() {
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
 }
 
+diagnostic::DrawCaptureGuestMemoryVersion TextureCache::GetActiveTextureGuestMemoryVersion(
+    uint32_t fetch_constant_index, bool is_signed) const {
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    return {};
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || binding->key.scaled_resolve) {
+    return {};
+  }
+  const Texture* texture = is_signed && IsSignedVersionSeparateForFormat(binding->key)
+                               ? binding->texture_signed
+                               : binding->texture;
+  return texture ? texture->GetGuestMemoryVersion() : diagnostic::DrawCaptureGuestMemoryVersion{};
+}
+
+diagnostic::DrawCaptureGuestMemoryVersion TextureCache::Texture::GetGuestMemoryVersion() const {
+  if (key().scaled_resolve || force_load_3d_tiling()) {
+    return {};
+  }
+  diagnostic::DrawCaptureGuestMemoryVersion version;
+  version.identity = instance_id();
+  version.generation = content_generation();
+  version.base_address = key().base_page << 12;
+  version.base_size = GetGuestBaseSize();
+  version.mip_address = key().mip_page << 12;
+  version.mip_size = GetGuestMipsSize();
+  version.context = this;
+  version.check = [](const void* context, uint64_t generation) noexcept {
+    const auto& texture = *static_cast<const Texture*>(context);
+    // An invalidated watch is not rearmed until upload. Repeated writes in
+    // that interval need not increment the generation, so also check its mask.
+    return texture.content_generation() == generation && !texture.outdated_mask() &&
+           texture.content_generation() == generation;
+  };
+  return version;
+}
+
 void TextureCache::Texture::MakeUpToDateAndWatch(
-    const std::unique_lock<std::recursive_mutex>& global_lock) {
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool base,
+    bool mips) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
+  if (base && base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
   }
-  if (mips_outdated_) {
+  if (mips && mips_outdated_) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+  }
+}
+
+void TextureCache::Texture::RestoreOutdatedAfterLoadFailure(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool base,
+    bool mips) {
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  uint32_t restored_mask = 0;
+  if (base) {
+    if (base_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(base_watch_handle_);
+      base_watch_handle_ = nullptr;
+    }
+    base_outdated_ = true;
+    restored_mask |= kOutdatedBitBase;
+  }
+  if (mips) {
+    if (mips_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(mips_watch_handle_);
+      mips_watch_handle_ = nullptr;
+    }
+    mips_outdated_ = true;
+    restored_mask |= kOutdatedBitMips;
+  }
+  outdated_mask_.fetch_or(restored_mask, std::memory_order_release);
+  // Removing a watch allows writes with no callback. Retire tokens before a
+  // retry rearms this instance. Publish the dirty mask before the new version.
+  if (restored_mask) {
+    content_generation_.fetch_add(1, std::memory_order_acq_rel);
   }
 }
 
@@ -745,6 +1299,8 @@ void TextureCache::Texture::WatchCallback(
     base_watch_handle_ = nullptr;
     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
   }
+  // A reader observing this generation must also observe the dirty mask.
+  content_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
@@ -893,6 +1449,8 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
   }
   if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count)) {
+    texture.RestoreOutdatedAfterLoadFailure(global_critical_region_.Acquire(),
+                                            pending_load.load_base, pending_load.load_mips);
     return false;
   }
 
@@ -989,6 +1547,110 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
   }
+}
+
+bool TextureCache::PrepareFrameInputTexture(
+    const xenos::xe_gpu_texture_fetch_t& fetch,
+    diagnostic::DrawCaptureFrameInputTextureView& view) const {
+  view.native_source_generation = 0;
+  view.available = false;
+  view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+  if (fetch.type != xenos::FetchConstantType::kTexture) {
+    return false;
+  }
+  const bool selected_cube = IsPreparedCubeFetch(fetch);
+  if ((fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked) && !selected_cube) {
+    view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureDimension;
+    return false;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(fetch.format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (!format_info->block_width || !format_info->block_height || !bytes_per_block ||
+      (bytes_per_block & (bytes_per_block - 1))) {
+    view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureFormat;
+    return false;
+  }
+  // Validate before the legacy assert-based metadata helpers. Mip-only and
+  // malformed pitch/LOD layouts are outside this CPU preparation subset.
+  const uint32_t width = fetch.size_2d.width + 1;
+  const uint32_t height = fetch.size_2d.height + 1;
+  if (!fetch.base_address || !fetch.pitch || (fetch.pitch << 5) < width ||
+      fetch.mip_min_level != 0 || fetch.mip_max_level > rex::log2_floor(std::max(width, height))) {
+    return false;
+  }
+  TextureKey key;
+  uint8_t signs;
+  BindingInfoFromFetchConstant(fetch, key, &signs);
+  if (!key.is_valid) {
+    return false;
+  }
+  TextureInfo info;
+  if (!TextureInfo::Prepare(fetch, &info)) {
+    return false;
+  }
+  const auto layout = key.GetGuestLayout();
+  // TextureInfo can omit bytes from a source-backed Prepared range. Expose
+  // canonical layout only for selected forms; leave ordinary cache metadata and
+  // other undercovered forms unchanged.
+  const bool selected_signed_rg16 = IsPreparedSignedRg16Float(fetch, view, signs);
+  const bool selected_tiled_bc = IsPreparedUnsignedTiledBc(fetch, view, signs);
+  const bool selected_unsigned_bc1 = IsPreparedUnsignedBc1Packed(fetch, view, signs);
+  const bool selected_unsigned_bc2 = IsPreparedUnsignedBc2Packed(fetch, view, signs);
+  const bool selected_unsigned_bc3 = IsPreparedUnsignedBc3Packed(fetch, view, signs);
+  const bool selected_unsigned_rgba8_r8 = IsPreparedUnsignedRgba8R8Packed(fetch, view, signs);
+  if (key.base_page && info.memory.base_address != key.base_page << 12) {
+    return false;
+  }
+  if (layout.mips_total_extent_bytes) {
+    if (info.memory.mip_address != key.mip_page << 12) {
+      return false;
+    }
+    if (info.memory.mip_size < layout.mips_total_extent_bytes) {
+      if (!selected_unsigned_bc1 && !selected_unsigned_bc2 && !selected_unsigned_bc3 &&
+          !selected_unsigned_rgba8_r8 && !selected_cube && !selected_tiled_bc) {
+        return false;
+      }
+      info.memory.mip_size = layout.mips_total_extent_bytes;
+    }
+  }
+  if (key.base_page && info.memory.base_size < layout.base.level_data_extent_bytes) {
+    if ((!selected_signed_rg16 && !selected_unsigned_rgba8_r8 && !selected_tiled_bc) ||
+        !layout.base.level_data_extent_bytes) {
+      return false;
+    }
+    info.memory.base_size = layout.base.level_data_extent_bytes;
+  }
+  const auto range_valid = [](uint32_t address, uint32_t size) {
+    return address <= SharedMemory::kBufferSize &&
+           uint64_t(size) <= uint64_t(SharedMemory::kBufferSize) - address;
+  };
+  if ((!info.memory.base_size && !info.memory.mip_size) ||
+      !range_valid(info.memory.base_address, info.memory.base_size) ||
+      !range_valid(info.memory.mip_address, info.memory.mip_size)) {
+    return false;
+  }
+  view.format = static_cast<uint32_t>(info.format);
+  view.endianness = static_cast<uint32_t>(info.endianness);
+  view.dimension = static_cast<uint32_t>(info.dimension);
+  view.width = info.width;
+  view.height = info.height;
+  view.depth = info.depth;
+  view.pitch = info.pitch;
+  view.mip_min_level = info.mip_min_level;
+  view.mip_max_level = info.mip_max_level;
+  view.tiled = info.is_tiled;
+  view.packed_mips = info.has_packed_mips;
+  view.base_address = info.memory.base_address;
+  view.base_size = info.memory.base_size;
+  view.mip_address = info.memory.mip_address;
+  view.mip_size = info.memory.mip_size;
+  view.swizzled_signs = signs;
+  view.component_mapping = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
+  view.required = view.is_signed ? texture_util::IsAnySignSigned(signs)
+                                 : texture_util::IsAnySignNotSigned(signs);
+  view.available = true;
+  view.unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+  return true;
 }
 
 void TextureCache::ResetTextureBindings(bool from_destructor) {
