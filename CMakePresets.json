@@ -35,8 +35,8 @@
             "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang",
-                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_COMPILER": "clang-22",
+                "CMAKE_CXX_COMPILER": "clang++-22",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
                 "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
                 "CMAKE_CXX_STANDARD": "23",
@@ -243,6 +243,22 @@
             "name": "win-amd64-release",
             "configurePreset": "win-amd64",
             "configuration": "Release"
+        },
+        {
+            "name": "win-amd64-local-fast",
+            "configurePreset": "win-amd64",
+            "configuration": "Release",
+            "filter": {
+                "include": {
+                    "label": "^(unit|mod_script|mod_plugin|guest_memory_section)$"
+                },
+                "exclude": {
+                    "label": "^network$"
+                }
+            },
+            "execution": {
+                "jobs": 4
+            }
         },
         {
             "name": "win-amd64-relwithdebinfo",

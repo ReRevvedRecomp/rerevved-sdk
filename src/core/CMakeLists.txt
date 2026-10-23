@@ -2,11 +2,13 @@
 # Foundation types, data structures, and threading primitives
 
 add_library(rexcore OBJECT
+    draw_capture_mailbox.cpp
     arena.cpp
     bit_map.cpp
     bit_stream.cpp
     byte_stream.cpp
     clock.cpp
+    crash_report.cpp
     cvar.cpp
     exception_handler.cpp
     filesystem.cpp
@@ -16,13 +18,28 @@ add_library(rexcore OBJECT
     memory.cpp
     mutex.cpp
     ring_buffer.cpp
+    relay_protocol.cpp
+    relay_invite.cpp
+    live_invite.cpp
+    sha256.cpp
     string_buffer.cpp
     threading.cpp
     timer_queue.cpp
     utf8.cpp
     vec128.cpp
+    xenos_fence_trace.cpp
 )
 add_library(rex::core ALIAS rexcore)
+
+# Server implementation is internal to the CLI and tests, never the title runtime.
+add_library(rexrelay_server STATIC relay_core.cpp relay_transport.cpp)
+# The runtime owns the codec and crypto symbols without copying rexcore object state.
+target_link_libraries(rexrelay_server PUBLIC rexruntime)
+target_include_directories(rexrelay_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
+if(WIN32)
+    target_compile_definitions(rexrelay_server PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(rexrelay_server PRIVATE ws2_32)
+endif()
 
 if(APPLE)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the
@@ -53,6 +70,8 @@ if(WIN32)
         threading_win.cpp
     )
     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    # dbghelp writes the crash report minidump.
+    target_link_libraries(rexcore PRIVATE bcrypt dbghelp ws2_32)
 elseif(UNIX)
     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
     # is selected inside them with #if defined(__APPLE__).
@@ -74,6 +93,8 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
+    # system_posix.cpp opens folders and URLs through SDL_OpenURL.
+    target_link_libraries(rexcore PRIVATE SDL3::SDL3)
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).

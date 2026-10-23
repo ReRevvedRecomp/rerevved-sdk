@@ -8,10 +8,18 @@ else()
 endif()
 
 project(ReXGlue
-    VERSION 0.10.0
+    VERSION 0.11.0
     LANGUAGES ${REXGLUE_LANGUAGES}
     DESCRIPTION "Xbox 360 Recompilation SDK"
 )
+if(WIN32)
+    add_compile_definitions(
+        _CRT_DECLARE_NONSTDC_NAMES=1
+        fileno=_fileno
+        isatty=_isatty
+        itoa=_itoa
+    )
+endif()
 # Floor only: bump MAJOR.MINOR for API changes. Patch is derived from git tags
 # in cmake/rex_version.cmake. See docs/RELEASING.md.
 
@@ -19,6 +27,8 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+option(REXGLUE_BUILD_PPC_TESTS   "Build PPC instruction tests" ${REXGLUE_BUILD_TESTS})
+option(REXGLUE_NETWORK_TESTS     "Register unit tests that bind non-loopback addresses (may raise firewall prompts)" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
@@ -137,6 +147,8 @@ add_compile_options(
     $<$<CONFIG:RELEASE>:-O3>
     $<$<CONFIG:RELEASE>:-DNDEBUG>
     -fno-char8_t
+    # Embed source-relative paths in __FILE__ and debug info, not the build host's.
+    -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=
 )
 
 # Platform detection (supports AMD64 and ARM64)
@@ -189,6 +201,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
     FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+rex_resolve_git_provenance(REXGLUE_GIT_REVISION REXGLUE_GIT_DIRTY)
 
 # Strip the -id trailer (if any) for the numeric-only version.
 string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")
@@ -256,6 +269,7 @@ add_subdirectory(src/filesystem)
 add_subdirectory(src/ui)
 add_subdirectory(src/input)
 add_subdirectory(src/audio)
+add_subdirectory(src/discord)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)

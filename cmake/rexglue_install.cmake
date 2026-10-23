@@ -20,6 +20,10 @@ set(REXGLUE_INSTALL_TARGETS
     libavcodec libavutil
 )
 
+if(TARGET rex_trace_dump)
+    list(APPEND REXGLUE_INSTALL_TARGETS rex_trace_dump)
+endif()
+
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
