@@ -11,6 +11,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -21,18 +22,43 @@
 #include <rex/kernel/crt/heap.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
+#include <rex/system/asset_overlay_catalog.h>
+#include <rex/system/asset_overlay_loadout.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/mod_loadout.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#include "../kernel/xboxkrnl/video_routing.h"
+
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
-REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+std::string& FLAGS_user_data_root_storage_() {
+  static std::string storage;
+  return storage;
+}
+static auto _cvar_reg_user_data_root =
+    rex::cvar::FlagRegistrar({"user_data_root",
+                              rex::cvar::FlagType::String,
+                              "Runtime",
+                              "Override user data path",
+                              [](std::string_view v) {
+                                FLAGS_user_data_root_storage_() = std::string(v);
+                                return true;
+                              },
+                              []() { return FLAGS_user_data_root_storage_(); },
+                              [](std::string_view) {},
+                              rex::cvar::Lifecycle::kInitOnly,
+                              {},
+                              "",
+                              false},
+                             rex::cvar::Audience::kAdvanced, rex::cvar::Persistence::kSessionOnly);
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_STRING(mods_data_root, "", "Mods", "Mod folder; defaults to <executable>/mods");
 
 namespace rex {
 
@@ -48,8 +74,24 @@ Runtime::Runtime(const std::filesystem::path& game_data_root,
                  const std::filesystem::path& update_data_root,
                  const std::filesystem::path& cache_root,
                  const std::filesystem::path& metadata_root)
+    : Runtime(game_data_root, user_data_root.empty() ? game_data_root : user_data_root,
+              user_data_root.empty() ? game_data_root : user_data_root, update_data_root,
+              cache_root, metadata_root) {}
+
+Runtime::Runtime(const std::filesystem::path& game_data_root,
+                 const std::filesystem::path& base_user_data_root,
+                 const std::filesystem::path& active_user_data_root,
+                 const std::filesystem::path& update_data_root,
+                 const std::filesystem::path& cache_root,
+                 const std::filesystem::path& metadata_root)
     : game_data_root_(game_data_root),
-      user_data_root_(user_data_root.empty() ? game_data_root : user_data_root),
+      base_user_data_root_(
+          base_user_data_root.empty()
+              ? (active_user_data_root.empty() ? game_data_root : active_user_data_root)
+              : base_user_data_root),
+      user_data_root_(active_user_data_root.empty()
+                          ? (base_user_data_root.empty() ? game_data_root : base_user_data_root)
+                          : active_user_data_root),
       update_data_root_(update_data_root),
       cache_root_(cache_root),
       metadata_root_(metadata_root) {}
@@ -113,6 +155,11 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   thread::EnableAffinityConfiguration();
 
   tool_mode_ = config.tool_mode;
+  game_version_ = std::move(config.game_version);
+  // A delegate set before Setup must not end up routing exports away from graphics.
+  if (detached_video_delegate() && (tool_mode_ || config.graphics)) {
+    return fail(X_STATUS_NOT_SUPPORTED, "detached video delegate set with graphics or tool mode");
+  }
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -164,6 +211,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
         REXSYS_DEBUG("Audio system initialized");
       }
     }
+  }
+
+  mod_script_host_ = std::move(config.mod_script_host);
+  // Tool mode analyzes title binaries without starting the host mod lifecycle.
+  if (!tool_mode_) {
+    ResolveModLoadout();
+    ResolveAssetOverlayLoadout();
   }
 
   // Set up VFS: game_data_root as game:/d:, update_data_root as update:
@@ -277,18 +331,221 @@ void Runtime::Shutdown() {
     input_system_->Shutdown();
     input_system_.reset();
   }
+  // Clear before the kernel goes away; calls already in flight hold their own
+  // reference, and the delegate is released outside the lock.
+  SetDetachedVideoDelegate(nullptr);
   kernel_state_.reset();
   function_dispatcher_.reset();
   export_resolver_.reset();
   file_system_.reset();
   memory_.reset();
+  mod_catalog_ = {};
+  mod_script_host_.reset();
+  active_mods_info_.clear();
+  active_mod_states_.clear();
+  failed_mod_messages_.clear();
+  mod_order_file_exists_ = false;
+  mod_order_ids_.clear();
+  mod_loadout_diagnostics_.clear();
+  mod_order_file_invalid_ = false;
+  restart_required_ = false;
+  asset_overlay_catalog_ = {};
+  asset_order_file_exists_ = false;
+  active_asset_overlays_.clear();
+  asset_order_ids_.clear();
+  asset_loadout_diagnostics_.clear();
+  asset_order_file_invalid_ = false;
+  asset_overlay_restart_required_ = false;
+  game_version_.clear();
 
   rex::perf::Profiler::Shutdown();
   setup_complete_ = false;
 }
 
+X_STATUS Runtime::SetDetachedVideoDelegate(
+    std::shared_ptr<system::IDetachedVideoDelegate> video_delegate) {
+  std::shared_ptr<system::IDetachedVideoDelegate> released;
+  X_STATUS status;
+  {
+    std::lock_guard<std::mutex> lock(detached_video_delegate_mutex_);
+    status = kernel::xboxkrnl::CheckDetachedVideoDelegateChange(
+        tool_mode_, graphics_system_ != nullptr, detached_video_delegate_ != nullptr,
+        video_delegate != nullptr);
+    if (XSUCCEEDED(status)) {
+      released = std::exchange(detached_video_delegate_, std::move(video_delegate));
+    }
+  }
+  // Logged after unlocking so a log sink may query the delegate.
+  if (XFAILED(status)) {
+    REXSYS_ERROR("Runtime::SetDetachedVideoDelegate rejected (status {:08X})", status);
+  }
+  return status;
+}
+
+std::shared_ptr<system::IDetachedVideoDelegate> Runtime::detached_video_delegate() const {
+  std::lock_guard<std::mutex> lock(detached_video_delegate_mutex_);
+  return detached_video_delegate_;
+}
+
 uint8_t* Runtime::virtual_membase() const {
   return memory_ ? memory_->virtual_membase() : nullptr;
+}
+
+namespace {
+
+std::filesystem::path ResolvedModsRoot() {
+  std::string configured_root = REXCVAR_GET(mods_data_root);
+  return configured_root.empty()
+             ? rex::filesystem::GetExecutableFolder() / "mods"
+             : std::filesystem::absolute(std::filesystem::path(configured_root));
+}
+
+std::filesystem::path ResolvedAssetOverlaysRoot() {
+  return rex::filesystem::GetExecutableFolder() / "asset-overrides";
+}
+
+}  // namespace
+
+void Runtime::ResolveModLoadout() {
+  const auto mods_root = ResolvedModsRoot();
+  mod_catalog_ =
+      system::DiscoverModCatalog(mods_root, game_version_, system::kModPluginAbiVersion,
+                                 mod_script_host_ ? mod_script_host_->contracts()
+                                                  : std::span<const system::ModScriptContract>{});
+
+  const auto order_file = system::ReadModLoadout(user_data_root_);
+  mod_order_file_exists_ = order_file.exists;
+  const auto selection = system::SelectModLoadout(mod_catalog_, order_file);
+  mod_loadout_diagnostics_ = selection.diagnostics;
+  mod_order_file_invalid_ = mod_order_file_exists_ && !selection.IsValid();
+  mod_order_ids_.clear();
+  active_mods_info_.clear();
+  for (const auto& package : mod_catalog_.packages) {
+    mod_catalog_.SetDesired(package.id, false);
+  }
+  if (selection.IsValid()) {
+    mod_order_ids_ = selection.requested_ids;
+    active_mods_info_ = selection.packages;
+    for (size_t order = 0; order < selection.requested_ids.size(); ++order) {
+      mod_catalog_.SetDesired(selection.requested_ids[order], true, order);
+    }
+    return;
+  }
+
+  // A catalog or selection error is shown to F1 and blocks the complete
+  // desired set. The game continues with no native plugins to load.
+  for (const auto& diagnostic : mod_loadout_diagnostics_) {
+    REXSYS_ERROR("Mod selection: {}", diagnostic.message);
+  }
+}
+
+system::ModLoadoutSelection Runtime::ValidateModLoadout(std::span<const std::string> ids) const {
+  return system::ValidateModLoadout(mod_catalog_, ids, user_data_root_ / system::kModOrderFileName);
+}
+
+system::ModLoadoutApplyResult Runtime::ApplyModLoadout(std::span<const std::string> ids,
+                                                       bool replace_invalid_current) {
+  auto result =
+      system::ApplyModLoadout(user_data_root_, mod_catalog_, ids, replace_invalid_current);
+  if (!result.succeeded()) {
+    return result;
+  }
+
+  mod_order_file_exists_ = system::ReadModLoadout(user_data_root_).exists;
+  mod_order_ids_.assign(ids.begin(), ids.end());
+  mod_loadout_diagnostics_.clear();
+  mod_order_file_invalid_ = false;
+  for (const auto& package : mod_catalog_.packages) {
+    mod_catalog_.SetDesired(package.id, false);
+  }
+  for (size_t order = 0; order < mod_order_ids_.size(); ++order) {
+    mod_catalog_.SetDesired(mod_order_ids_[order], true, order);
+  }
+  restart_required_ = true;
+  return result;
+}
+
+void Runtime::RescanModCatalog() {
+  mod_catalog_ =
+      system::DiscoverModCatalog(ResolvedModsRoot(), game_version_, system::kModPluginAbiVersion,
+                                 mod_script_host_ ? mod_script_host_->contracts()
+                                                  : std::span<const system::ModScriptContract>{});
+  const auto order_file = system::ReadModLoadout(user_data_root_);
+  mod_order_file_exists_ = order_file.exists;
+  const auto persisted = system::SelectModLoadout(mod_catalog_, order_file);
+  mod_loadout_diagnostics_ = persisted.diagnostics;
+  mod_order_file_invalid_ = mod_order_file_exists_ && !persisted.IsValid();
+  if (persisted.IsValid()) {
+    mod_order_ids_ = persisted.requested_ids;
+  } else {
+    mod_order_ids_.clear();
+  }
+  for (size_t order = 0; order < mod_order_ids_.size(); ++order) {
+    mod_catalog_.SetDesired(mod_order_ids_[order], true, order);
+  }
+  for (const auto& active_mod : active_mod_states_) {
+    mod_catalog_.SetActive(active_mod.id, true, active_mod.order);
+  }
+  for (const auto& [id, message] : failed_mod_messages_) {
+    mod_catalog_.MarkLoadFailed(id, message);
+  }
+}
+
+void Runtime::ResolveAssetOverlayLoadout() {
+  asset_overlay_catalog_ = system::DiscoverAssetOverlayCatalog(ResolvedAssetOverlaysRoot());
+  const auto order_file =
+      system::ReadAssetOverlayLoadout(user_data_root_, ResolvedAssetOverlaysRoot());
+  asset_order_file_exists_ = order_file.exists;
+  const auto selection = system::SelectAssetOverlayLoadout(asset_overlay_catalog_, order_file);
+  asset_loadout_diagnostics_ = selection.diagnostics;
+  asset_order_file_invalid_ = asset_order_file_exists_ && !selection.IsValid();
+  asset_order_ids_.clear();
+  active_asset_overlays_.clear();
+  if (selection.IsValid()) {
+    asset_order_ids_ = selection.requested_ids;
+    active_asset_overlays_ = selection.packages;
+    return;
+  }
+  for (const auto& diagnostic : asset_loadout_diagnostics_) {
+    REXSYS_ERROR("Asset overlay selection: {}", diagnostic.message);
+  }
+}
+
+system::AssetOverlayLoadoutSelection Runtime::ValidateAssetOverlayLoadout(
+    std::span<const std::string> ids) const {
+  return system::ValidateAssetOverlayLoadout(asset_overlay_catalog_, ids,
+                                             user_data_root_ / system::kAssetOverlayOrderFileName);
+}
+
+system::AssetOverlayLoadoutApplyResult Runtime::ApplyAssetOverlayLoadout(
+    std::span<const std::string> ids, bool replace_invalid_current) {
+  auto result = system::ApplyAssetOverlayLoadout(user_data_root_, asset_overlay_catalog_, ids,
+                                                 replace_invalid_current);
+  if (!result.succeeded()) {
+    return result;
+  }
+  asset_order_file_exists_ =
+      system::ReadAssetOverlayLoadout(user_data_root_, ResolvedAssetOverlaysRoot()).exists;
+  asset_order_ids_.assign(ids.begin(), ids.end());
+  asset_loadout_diagnostics_.clear();
+  asset_order_file_invalid_ = false;
+  asset_overlay_restart_required_ = true;
+  return result;
+}
+
+void Runtime::RescanAssetOverlayCatalog() {
+  asset_overlay_catalog_ = system::DiscoverAssetOverlayCatalog(ResolvedAssetOverlaysRoot());
+  const auto order_file =
+      system::ReadAssetOverlayLoadout(user_data_root_, ResolvedAssetOverlaysRoot());
+  asset_order_file_exists_ = order_file.exists;
+  const auto persisted = system::SelectAssetOverlayLoadout(asset_overlay_catalog_, order_file);
+  asset_loadout_diagnostics_ = persisted.diagnostics;
+  asset_order_file_invalid_ = asset_order_file_exists_ && !persisted.IsValid();
+  if (persisted.IsValid()) {
+    asset_order_ids_ = persisted.requested_ids;
+  } else {
+    asset_order_ids_.clear();
+  }
 }
 
 bool Runtime::SetupVfs() {

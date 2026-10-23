@@ -24,8 +24,12 @@ bool InitializeAndroidSystemForApplicationContext();
 void ShutdownAndroidSystem();
 #endif
 
+// Open a URL or folder in the desktop shell and log a warning on failure.
+// Windows opens them on a background thread; elsewhere SDL_OpenURL runs on
+// the calling thread, which must be the main thread.
 // The URL must include the protocol.
 void LaunchWebBrowser(const std::string_view url);
+// A path to an existing file opens its containing folder.
 void LaunchFileExplorer(const std::filesystem::path& path);
 
 enum class SimpleMessageBoxType {

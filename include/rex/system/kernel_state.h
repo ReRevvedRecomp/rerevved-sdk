@@ -291,6 +291,9 @@ class KernelState {
 
   void RegisterNotifyListener(XNotifyListener* listener);
   void UnregisterNotifyListener(XNotifyListener* listener);
+  // True while a listener whose mask shares a bit with `mask` still has an
+  // open guest handle. Registered listeners stay listed after the guest closes them.
+  bool HasOpenNotifyListener(uint64_t mask);
   void BroadcastNotification(XNotificationID id, uint32_t data);
 
   util::NativeList* dpc_list() { return &dpc_list_; }

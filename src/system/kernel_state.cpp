@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -43,6 +44,11 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 
+namespace rex::kernel::xam::live {
+void Arm();
+void Shutdown();
+}  // namespace rex::kernel::xam::live
+
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
@@ -68,17 +74,23 @@ KernelState::KernelState(Runtime* emulator)
   user_profile_ = std::make_unique<xam::UserProfile>();
   user_profile_->set_kernel_state(this);
 
-  auto user_data_root = emulator_->user_data_root();
-  if (!user_data_root.empty()) {
-    user_data_root = std::filesystem::absolute(user_data_root);
+  auto base_user_data_root = emulator_->base_user_data_root();
+  auto active_user_data_root = emulator_->user_data_root();
+  if (!base_user_data_root.empty()) {
+    base_user_data_root = std::filesystem::absolute(base_user_data_root);
   }
-  content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+  if (!active_user_data_root.empty()) {
+    active_user_data_root = std::filesystem::absolute(active_user_data_root);
+  }
+  content_manager_ =
+      std::make_unique<xam::ContentManager>(this, base_user_data_root, active_user_data_root);
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
     rex::FatalError("Double initialization of KernelState");
   }
   shared_kernel_state_ = this;
+  kernel::xam::live::Arm();
 
   // Allocate KernelGuestGlobals early so xboxkrnl module can wire exports.
   kernel_guest_globals_ = memory_->SystemHeapAlloc(sizeof(KernelGuestGlobals));
@@ -161,6 +173,9 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+  // Live sessions complete guest requests from their own thread; stop it while
+  // the kernel objects and guest memory it writes still exist.
+  kernel::xam::live::Shutdown();
   app_manager_.reset();
 
   // Stop the dispatch thread before touching the object table
@@ -1118,6 +1133,15 @@ void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
   }
 }
 
+bool KernelState::HasOpenNotifyListener(uint64_t mask) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& listener : notify_listeners_) {
+    if ((listener->mask() & mask) && !listener->handles().empty())
+      return true;
+  }
+  return false;
+}
+
 void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
   std::vector<object_ref<XNotifyListener>> snapshot;
   {
@@ -1138,10 +1162,17 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetResult(ptr, result);
+  // A guest polling the result word may free or reuse the overlapped as soon as
+  // it changes, so read the notification fields first and store the result last.
+  const X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  const uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
+  const X_HANDLE thread_handle = XOverlappedGetContext(ptr);
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
-  X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  // Release store of the big-endian result word. The guest polls it with a plain
+  // volatile load, which pairs with this store only under x86-64 TSO.
+  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(ptr))
+      .store(rex::byte_swap(static_cast<uint32_t>(result)), std::memory_order_release);
   if (event_handle) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
@@ -1149,12 +1180,10 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
       ev->Set(0, false);
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
+  if (routine) {
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
       thread->EnqueueApc(routine, result, length, overlapped_ptr);
     }
   }

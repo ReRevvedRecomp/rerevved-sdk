@@ -142,6 +142,10 @@ class ContentPackage {
 class ContentManager {
  public:
   ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path);
+  // Uses base_root_path for shared XUID-zero marketplace content and
+  // active_root_path for all profile-local content.
+  ContentManager(KernelState* kernel_state, const std::filesystem::path& base_root_path,
+                 const std::filesystem::path& active_root_path);
   ~ContentManager();
 
   std::vector<XCONTENT_AGGREGATE_DATA> ListContent(uint32_t device_id, uint64_t xuid,
@@ -178,11 +182,13 @@ class ContentManager {
   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
 
   // Installs an STFS content package from an arbitrary host path.
-  // Extracts the package into root_path_/0000000000000000/{title_id}/00000002/{filename}/
+  // Extracts the package into the shared base root's
+  // 0000000000000000/{title_id}/00000002/{filename}/
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
  private:
+  const std::filesystem::path& ResolveContentRoot(XContentType content_type) const;
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
@@ -197,7 +203,8 @@ class ContentManager {
                                                    string::string_key_case::Hash>::iterator it);
 
   KernelState* kernel_state_;
-  std::filesystem::path root_path_;
+  std::filesystem::path base_root_path_;
+  std::filesystem::path active_root_path_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
