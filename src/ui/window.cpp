@@ -31,10 +31,20 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
     .range(0, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(window_size, "", "UI/Window",
+                      "Window size. Size of the window when not fullscreen")
+    .allowed({"", "1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160", "maximized"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .audience(rex::cvar::Audience::kPlayer);
+
+REXCVAR_DEFINE_BOOL(window_hidden, false, "UI/Window", "Keep the window hidden at startup")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // kHotReload (default): Window::SetFullscreen can be applied live, so the
 // change callback registered in ReXApp::SetupPresentation keeps the window
 // in sync whenever this cvar is changed at runtime.
-REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
+REXCVAR_DEFINE_BOOL(fullscreen, true, "Display", "Fullscreen. Start the window in fullscreen mode")
+    .audience(rex::cvar::Audience::kPlayer);
 
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "

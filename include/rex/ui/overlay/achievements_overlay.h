@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #pragma once
+#include <functional>
 
 #include <rex/system/achievement_manager.h>
 #include <rex/ui/imgui_dialog.h>
@@ -26,7 +27,8 @@ class ImmediateTexture;
 class AchievementsOverlayDialog : public ImGuiDialog {
  public:
   AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* immediate_drawer,
-                            rex::Runtime* runtime, rex::system::AchievementManager* achievements);
+                            rex::Runtime* runtime, rex::system::AchievementManager* achievements,
+                            std::function<void()> close_callback = {});
   ~AchievementsOverlayDialog() override;
 
  protected:
@@ -38,6 +40,7 @@ class AchievementsOverlayDialog : public ImGuiDialog {
 
   rex::system::AchievementManager* achievements_ = nullptr;
   AchievementIconCache icon_cache_;
+  std::function<void()> close_callback_;
 };
 
 }  // namespace rex::ui

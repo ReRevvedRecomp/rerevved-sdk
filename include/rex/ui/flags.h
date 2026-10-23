@@ -28,6 +28,7 @@ REXCVAR_DECLARE(bool, present_allow_overscan_cutoff);
 REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
+REXCVAR_DECLARE(std::string, window_size);
 REXCVAR_DECLARE(bool, fullscreen);
 REXCVAR_DECLARE(int32_t, monitor);
 REXCVAR_DECLARE(std::string, video_driver);

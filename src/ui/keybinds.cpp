@@ -167,15 +167,25 @@ struct BindEntry {
 
 static std::mutex g_binds_mutex;
 static std::deque<BindEntry> g_binds;
+static std::unordered_map<std::string, std::string> g_bind_defaults;
+
+void SetBindDefault(std::string_view name, std::string_view default_key) {
+  std::lock_guard lock(g_binds_mutex);
+  g_bind_defaults[std::string(name)] = std::string(default_key);
+}
 
 void RegisterBind(std::string_view name, std::string_view default_key, std::string_view description,
                   std::function<void()> callback) {
   std::lock_guard lock(g_binds_mutex);
 
+  const auto app_default = g_bind_defaults.find(std::string(name));
+  const std::string key =
+      app_default != g_bind_defaults.end() ? app_default->second : std::string(default_key);
+
   /* Store the bind entry (owns the key string that the CVAR references). */
   auto& entry = g_binds.emplace_back();
   entry.name = std::string(name);
-  entry.current_key = std::string(default_key);
+  entry.current_key = key;
   entry.callback = std::move(callback);
 
   /* Capture a pointer to the entry's key string for the CVAR getter/setter.
@@ -184,18 +194,19 @@ void RegisterBind(std::string_view name, std::string_view default_key, std::stri
   std::string* key_ptr = &entry.current_key;
 
   rex::cvar::RegisterFlag({
-      .name = std::string(name),
-      .type = rex::cvar::FlagType::String,
-      .category = "Input/Keybinds/System",
-      .description = std::string(description),
-      .setter = [key_ptr](std::string_view v) -> bool {
-        *key_ptr = std::string(v);
-        return true;
-      },
-      .getter = [key_ptr]() -> std::string { return *key_ptr; },
-      .lifecycle = rex::cvar::Lifecycle::kHotReload,
-      .default_value = std::string(default_key),
-  });
+                              .name = std::string(name),
+                              .type = rex::cvar::FlagType::String,
+                              .category = "Input/Keybinds/System",
+                              .description = std::string(description),
+                              .setter = [key_ptr](std::string_view v) -> bool {
+                                *key_ptr = std::string(v);
+                                return true;
+                              },
+                              .getter = [key_ptr]() -> std::string { return *key_ptr; },
+                              .lifecycle = rex::cvar::Lifecycle::kHotReload,
+                              .default_value = key,
+                          },
+                          rex::cvar::Audience::kPlayer, rex::cvar::Persistence::kConfig);
 }
 
 void UnregisterBind(std::string_view name) {
