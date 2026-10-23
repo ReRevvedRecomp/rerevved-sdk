@@ -23,6 +23,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "live_sessions.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -51,11 +53,29 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
   be<uint32_t> unk_1;
 };
 
+// False for a non-null overlapped the guest cannot fully write; nothing may
+// dispatch, complete or read through it.
+static bool UsableOverlapped(uint32_t overlapped_ptr, const char* call) {
+  if (!overlapped_ptr || live::OverlappedWritable(*REX_KERNEL_STATE()->memory(), overlapped_ptr))
+    return true;
+  REXKRNL_WARN("{}: overlapped {:08X} is not writable guest memory", call, overlapped_ptr);
+  XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+  return false;
+}
+
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+  if (!UsableOverlapped(overlapped_ptr, "XMsgStartIORequestEx"))
+    return X_ERROR_INVALID_PARAMETER;
+  live::DispatchScope dispatch(overlapped_ptr);
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
                                                                         buffer_length);
+  if (dispatch.deferred()) {
+    // The handler marked the overlapped pending and completes it later.
+    XThread::SetLastError(0);
+    return X_ERROR_IO_PENDING;
+  }
   if (result == X_E_NOTFOUND) {
     REXKRNL_ERROR("XMsgStartIORequestEx: app {:08X} undefined", app);
     result = X_E_INVALIDARG;
@@ -85,6 +105,12 @@ u32 XMsgStartIORequest_entry(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> ove
 }
 
 u32 XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait) {
+  if (!overlapped_ptr.guest_address() ||
+      !UsableOverlapped(overlapped_ptr.guest_address(), "XMsgCancelIORequest"))
+    return X_ERROR_INVALID_PARAMETER;
+  // A deferred Live search must stop before the guest frees its result buffer.
+  if (auto sessions = live::ActiveService())
+    sessions->Cancel(overlapped_ptr.guest_address());
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -98,6 +124,9 @@ u32 XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait
 
 u32 XMsgCompleteIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 result,
                                 u32 extended_error, u32 length) {
+  if (!overlapped_ptr.guest_address() ||
+      !UsableOverlapped(overlapped_ptr.guest_address(), "XMsgCompleteIORequest"))
+    return X_ERROR_INVALID_PARAMETER;
   REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr.guest_address(), result,
                                                     extended_error, length);
   return X_ERROR_SUCCESS;
@@ -105,6 +134,9 @@ u32 XMsgCompleteIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 re
 
 u32 XamGetOverlappedResult_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mapped_u32 length_ptr,
                                  u32 unknown) {
+  if (!overlapped_ptr.guest_address() ||
+      !UsableOverlapped(overlapped_ptr.guest_address(), "XamGetOverlappedResult"))
+    return X_ERROR_INVALID_PARAMETER;
   uint32_t result;
   if (overlapped_ptr->result != X_ERROR_IO_PENDING) {
     result = overlapped_ptr->result;

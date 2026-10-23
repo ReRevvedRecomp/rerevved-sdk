@@ -17,6 +17,8 @@
 #include <rex/system/xnotifylistener.h>
 #include <rex/system/xtypes.h>
 
+#include "live_sessions.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -32,6 +34,8 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
 
   auto listener = object_ref<XNotifyListener>(new XNotifyListener(REX_KERNEL_STATE()));
   listener->Initialize(mask, max_version);
+  // A pending Live invite is announced once a listener for its area exists.
+  live::NotifyListenerCreated(mask);
 
   // Handle ref is incremented, so return that.
   uint32_t handle = listener->handle();
