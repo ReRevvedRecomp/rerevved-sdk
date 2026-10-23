@@ -31,9 +31,11 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "Display",
+                      "Anti-aliasing. Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .audience(rex::cvar::Audience::kPlayer);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -364,6 +366,23 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   }
 }
 
+bool GraphicsSystem::PauseAndResetGpuWritePointer() {
+  if (!command_processor_) {
+    return false;
+  }
+  const bool resume = !command_processor_->is_paused();
+  if (resume) {
+    command_processor_->Pause();
+  }
+  command_processor_->UpdateWritePointer(0);
+  return resume;
+}
+
+void GraphicsSystem::ResumeGpu() {
+  if (command_processor_) {
+    command_processor_->Resume();
+  }
+}
 void GraphicsSystem::Pause() {
   paused_ = true;
   command_processor_->Pause();

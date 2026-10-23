@@ -777,8 +777,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
             // 0xFFFF if 0xFFFF is not used as a real index, or with 0xFFFFFFFF
             // if it is.
             // Example of 16-bit reset index replacement: 415607D4.
-            // Not specifying the primitive type in the cache key because not
-            // replacing it, only the reset index in a type-independent way.
+            // Cache keys omit primitive type because reset replacement is
+            // type-independent.
             CacheTransaction cache_transaction(
                 *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
                                 guest_index_endian, guest_primitive_reset_enabled));
@@ -823,8 +823,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           // actually used, thus exactly 0xFFFFFFFF must be sent to the host for
           // it in a true index buffer), no indirection is done, but
           // pre-swapping and pre-masking is done here.
-          // Not specifying the primitive type in the cache key because not
-          // replacing it, only the reset index in a type-independent way.
+          // Cache keys omit primitive type because reset replacement is
+          // type-independent.
           CacheTransaction cache_transaction(
               *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
                               guest_index_endian, guest_primitive_reset_enabled));

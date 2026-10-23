@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -1238,6 +1239,22 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                          resolve_info.copy_dest_extent_length);
       }
       if (copy_dest_committed) {
+        static uint32_t diagnostic_resolve_capture_count = 0;
+        std::filesystem::path diagnostic_capture_base =
+            command_processor_.GetSwapTextureCapturePath();
+        bool diagnostic_capture = !draw_resolution_scaled && !diagnostic_capture_base.empty() &&
+                                  diagnostic_resolve_capture_count < 2;
+        uint32_t diagnostic_capture_index = diagnostic_resolve_capture_count;
+        if (diagnostic_capture) {
+          ++diagnostic_resolve_capture_count;
+        }
+        auto diagnostic_capture_path = [&](const char* suffix) {
+          std::filesystem::path path = diagnostic_capture_base;
+          path.replace_extension(".resolve" + std::to_string(diagnostic_capture_index) + "." +
+                                 suffix);
+          return path;
+        };
+
         // Write the descriptors and transition the resources.
         // Full shared memory without resolution scaling, range of the scaled
         // resolve buffer with scaling because only at least 128 * 2^20 R32
@@ -1286,6 +1303,37 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+          if (diagnostic_capture) {
+            uint32_t edram_capture_size =
+                xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+            ID3D12Resource* edram_capture = command_processor_.RequestDiagnosticBufferCapture(
+                diagnostic_capture_path("edram.bin"), edram_capture_size);
+            if (edram_capture) {
+              TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+              command_processor_.SubmitBarriers();
+              command_list.D3DCopyBufferRegion(edram_capture, 0, edram_buffer_, 0,
+                                               edram_capture_size);
+              TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            const uint32_t* constant_dwords =
+                reinterpret_cast<const uint32_t*>(&copy_shader_constants);
+            std::fprintf(
+                stderr,
+                "resolve%u: shader=%u source_raw=%u source_bpe_log2=%u dest_bpe_log2=%u "
+                "groups=%ux%u dest=%08X extent=%08X+%08X bindless=%u descriptors=%llX/%llX "
+                "constants=",
+                diagnostic_capture_index, uint32_t(copy_shader), copy_shader_info.source_is_raw,
+                copy_shader_info.source_bpe_log2, copy_shader_info.dest_bpe_log2,
+                copy_group_count_x, copy_group_count_y, copy_shader_constants.dest_base,
+                resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+                bindless_resources_used_, uint64_t(descriptor_source.second.ptr),
+                uint64_t(descriptor_dest.second.ptr));
+            for (size_t i = 0; i < sizeof(copy_shader_constants) / sizeof(uint32_t); ++i) {
+              std::fprintf(stderr, "%s%08X", i ? "," : "", constant_dwords[i]);
+            }
+            std::fprintf(stderr, "\n");
+          }
+
           // Submit the resolve.
           command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
@@ -1307,6 +1355,19 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
           } else {
             shared_memory.MarkUAVWritesCommitNeeded();
+            if (diagnostic_capture) {
+              ID3D12Resource* dest_capture = command_processor_.RequestDiagnosticBufferCapture(
+                  diagnostic_capture_path("dest.bin"), resolve_info.copy_dest_extent_length);
+              if (dest_capture) {
+                shared_memory.UseAsCopySource();
+                command_processor_.SubmitBarriers();
+                command_list.D3DCopyBufferRegion(dest_capture, 0, shared_memory.GetBuffer(),
+                                                 resolve_info.copy_dest_extent_start,
+                                                 resolve_info.copy_dest_extent_length);
+                shared_memory.UseForReading();
+                command_processor_.SubmitBarriers();
+              }
+            }
           }
 
           // Invalidate textures and mark the range as scaled if needed.
@@ -1751,6 +1812,37 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   }
   edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
   PixelShaderInterlockFullEdramBarrierPlaced();
+}
+
+bool D3D12RenderTargetCache::ScheduleEdramCapture(ID3D12Resource* destination, uint32_t size,
+                                                  bool mark_rov_write_tracking_after_copy) {
+  if (GetPath() != Path::kPixelShaderInterlock || !edram_buffer_ || !destination || !size ||
+      edram_buffer_state_ != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    return false;
+  }
+
+  const uint64_t scale = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
+  if (scale > UINT64_MAX / xenos::kEdramSizeBytes) {
+    return false;
+  }
+  const uint64_t capacity = uint64_t(xenos::kEdramSizeBytes) * scale;
+  if (!scale || size > capacity) {
+    return false;
+  }
+
+  // ROV writes need the same tracked interlock commit before a copy source
+  // transition as they do before another overlapping ROV use.
+  CommitEdramBufferUAVWrites(EdramBufferModificationStatus::kAsROV);
+  const D3D12_RESOURCE_STATES previous_state = edram_buffer_state_;
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(destination, 0, edram_buffer_, 0,
+                                                                  size);
+  TransitionEdramBuffer(previous_state);
+  if (mark_rov_write_tracking_after_copy) {
+    MarkEdramBufferModified(EdramBufferModificationStatus::kAsROV);
+  }
+  return true;
 }
 
 ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines(

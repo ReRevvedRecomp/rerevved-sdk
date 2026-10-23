@@ -578,7 +578,14 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2
 
 VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_system,
                                                system::KernelState* kernel_state)
-    : CommandProcessor(graphics_system, kernel_state),
+    : CommandProcessor(graphics_system,
+                       {graphics_system->memory(), kernel_state, graphics_system->register_file(),
+                        graphics_system,
+                        [](void* owner, uint32_t source, uint32_t cpu) {
+                          static_cast<VulkanGraphicsSystem*>(owner)->DispatchInterruptCallback(
+                              source, cpu);
+                          return true;
+                        }}),
       deferred_command_buffer_(*this),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
