@@ -13,6 +13,11 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include "../host_session_data.h"
+#include "../lan_system_link.h"
+#include "../live_sessions.h"
+#include "xgi_request.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -42,6 +47,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
+      if (auto sessions = live::ActiveService())
+        sessions->SetContext(user_index, context_id, context_value, live::Clock::now());
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -51,6 +58,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                     value_size, value_ptr);
+      if (auto sessions = live::ActiveService())
+        live::HandleProperty(*sessions, *memory_, user_index, property_id, value_size, value_ptr);
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
@@ -104,15 +113,22 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 8);
       uint32_t num_slots_private = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t user_xuid = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 16);
       uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
       uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
 
       REXKRNL_DEBUG(
           "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
           "{:08X})",
-          session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
+          session_ptr, flags, num_slots_public, num_slots_private, user_index, session_info_ptr,
           nonce_ptr);
+      // A host create fills the caller's XSESSION_INFO and nonce; a non-host
+      // create takes the host's info as input and leaves it untouched.
+      lan::CreateSession(lan::SystemLinkState(), *memory_, flags, num_slots_public,
+                         num_slots_private, user_index, session_info_ptr, nonce_ptr);
+      if (auto sessions = live::ActiveService())
+        live::AfterCreate(*sessions, lan::SystemLinkState(), *memory_, session_info_ptr);
+      host_data::OnSessionCreate(flags, lan::SystemLinkState().session_snapshot());
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -123,6 +139,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      if (auto sessions = live::ActiveService())
+        sessions->EndSession(live::Clock::now());
+      lan::SystemLinkState().DeleteSession();
+      host_data::OnSessionDelete();
 
       return X_E_SUCCESS;
     }
@@ -138,6 +158,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                     is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
+      lan::JoinSession(lan::SystemLinkState(), *memory_, user_count, private_slots_array);
+      if (auto sessions = live::ActiveService())
+        live::AfterJoin(*sessions, lan::SystemLinkState(), *memory_, buffer_ptr);
+      return X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      auto sessions = live::ActiveService();
+      if (!sessions)
+        break;
+      live::HandleLeave(*sessions, lan::SystemLinkState(), *memory_, buffer_ptr);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
@@ -148,6 +178,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XSessionStart({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      lan::SystemLinkState().SetSessionState(2);
 
       return X_STATUS_SUCCESS;
     }
@@ -160,6 +191,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XSessionEnd({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      lan::SystemLinkState().SetSessionState(3);
+      if (auto sessions = live::ActiveService())
+        sessions->EndSession(live::Clock::now());
 
       return X_E_SUCCESS;
     }
@@ -179,6 +213,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr);
+      if (auto sessions = live::ActiveService())
+        return live::HandleSearch(*sessions, *memory_, buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
@@ -191,6 +227,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XSessionModify({:08X}, {:08X}, {:08X}, {:08X})", obj_ptr, flags,
                     maxPublicSlots, maxPrivateSlots);
+      if (auto sessions = live::ActiveService())
+        live::HandleModify(*sessions, lan::SystemLinkState(), *memory_, buffer_ptr);
 
       return X_E_SUCCESS;
     }
@@ -213,6 +251,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr, num_users);
+      if (auto sessions = live::ActiveService())
+        return live::HandleSearch(*sessions, *memory_, buffer_ptr, buffer_length);
 
       return X_E_SUCCESS;
     }
@@ -220,14 +260,18 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(!buffer_length || buffer_length == 24);
 
       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t details_buffer_size = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t details_buffer_size_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t session_details_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
       uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 12);
       uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
       uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
 
+      if (lan::SystemLinkState().enabled()) {
+        return lan::FillSessionDetails(lan::SystemLinkState(), *memory_, details_buffer_size_ptr,
+                                       session_details_ptr);
+      }
       REXKRNL_DEBUG("XSessionGetDetails({:08X}, {}, {:08X}, {}, {}, {})", obj_ptr,
-                    details_buffer_size, session_details_ptr, reserved1, reserved2, reserved3);
+                    details_buffer_size_ptr, session_details_ptr, reserved1, reserved2, reserved3);
 
       return X_E_SUCCESS;
     }
@@ -274,20 +318,18 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001B: {
-      assert_true(!buffer_length || buffer_length == 32);
+      assert_true(!buffer_length || buffer_length == kSearchByIdRequestSize);
 
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_ids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
+      SearchByIdRequest request{};
+      if (!TryDecodeSearchByIdRequest(*memory_, buffer_ptr, buffer_length, request)) {
+        return X_E_SUCCESS;
+      }
 
-      REXKRNL_DEBUG("XSessionSearchByID({}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
+      REXKRNL_DEBUG("XSessionSearchByID({}, {:016X}, {}, {:08X})", request.user_index,
+                    request.session_id, request.results_buffer_size, request.search_results_ptr);
+      if (auto sessions = live::ActiveService())
+        return live::HandleSearchById(*sessions, *memory_, buffer_ptr, request.session_id,
+                                      request.results_buffer_size, request.search_results_ptr);
 
       return X_E_SUCCESS;
     }
@@ -333,15 +375,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0025: {
-      assert_true(!buffer_length || buffer_length == 20);
+      assert_true(!buffer_length || buffer_length == kWriteStatsRequestSize);
 
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
+      WriteStatsRequest request{};
+      if (!TryDecodeWriteStatsRequest(*memory_, buffer_ptr, buffer_length, request)) {
+        return X_E_SUCCESS;
+      }
 
-      REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
-                    views_ptr);
+      REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", request.session_ptr,
+                    request.xuid, request.num_views, request.views_ptr);
 
       return X_E_SUCCESS;
     }

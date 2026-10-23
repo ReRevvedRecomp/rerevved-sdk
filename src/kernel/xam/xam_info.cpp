@@ -12,6 +12,8 @@
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
+#include <rex/cvar.h>
+#include "system_link_config.h"
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
@@ -31,6 +33,7 @@
 namespace rex {
 namespace kernel {
 namespace xam {
+bool RelayRequested();
 using namespace rex::system;
 
 u32 XamFeatureEnabled_entry(u32 unk) {
@@ -152,6 +155,12 @@ u32 XamBuildXamResourceLocator_entry(mapped_wstring filename, mapped_void buffer
 }
 
 u32 XamGetSystemVersion_entry() {
+  // System Link reports retail dashboard 2.0.17559.0: titles gate
+  // XSession detail and migration calls on it, and their startup then takes
+  // the XNetStartupEx and WSAStartupEx paths, which forward to startup.
+  if (system_link::CurrentConfig().mode != system_link::Mode::kOff) {
+    return 0x20449700;
+  }
   // eh, just picking one. If we go too low we may break new games, but
   // this value seems to be used for conditionally loading symbols and if
   // we pretend to be old we have less to worry with implementing.

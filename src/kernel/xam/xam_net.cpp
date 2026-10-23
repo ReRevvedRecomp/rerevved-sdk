@@ -12,13 +12,20 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <span>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -33,10 +40,17 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "host_session_data.h"
+#include "lan_system_link.h"
+#include "live_sessions.h"
+#include "relay_system_link.h"
+#include "system_link_config.h"
+
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
+#include <ws2tcpip.h>                    // NOLINT(build/include_order)
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -44,11 +58,73 @@
 #include <sys/socket.h>
 #endif
 
+REXCVAR_DEFINE_STRING(system_link_local_address, "", "Online",
+                      "Selected local IPv4 address for direct LAN System Link")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT64(system_link_xuid, 0, "Online",
+                      "Local profile pseudonym used by direct LAN System Link")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(system_link_relay_address, "", "Online", "System Link relay IPv4 host:port")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(system_link_relay_room, "", "Online", "Private System Link relay room")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(system_link_relay_secret_file, "", "Online",
+                      "Path to the System Link relay shared-secret file")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(system_link_advertised_address, "", "Online",
+                      "Relay host:port to put in host invites instead of the connect address")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+bool RelayRequested() {
+  return system_link::CurrentMode() == system_link::Mode::kRelay;
+}
+
+namespace {
+
+lan::LanSystemLinkState& LanState() {
+  static lan::LanSystemLinkState state;
+  return state;
+}
+
+bool RelaySocket(uint32_t handle) {
+  return RelayRequested() && relay_link::SystemLinkClient().IsDatagramSocket(handle);
+}
+
+std::mutex xnet_lifecycle;
+// Titles keep sending on open sockets after an XNetCleanup and may call
+// XNetStartup (including the Ex forms) more often than cleanup, so the relay
+// association ends only at the last cleanup. Guarded by xnet_lifecycle.
+system_link::RelayStartup relay_startup;
+
+const char* SystemLinkMode() {
+  return RelayRequested() ? "relay" : "direct LAN";
+}
+
+void RecordSystemLinkSend(int count) {
+  if (count < 0 || !LanState().enabled())
+    return;
+  LanState().RecordSend(static_cast<size_t>(count));
+  auto stats = LanState().stats_snapshot();
+  if (stats.sent_packets == 1 || stats.sent_packets % 256 == 0)
+    REXKRNL_DEBUG("sendto: {} packets={} bytes={}", SystemLinkMode(), stats.sent_packets,
+                  stats.sent_bytes);
+}
+
+std::string Ipv4String(uint32_t raw_address) {
+  in_addr address{};
+  address.s_addr = raw_address;
+  char text[16]{};
+  return inet_ntop(AF_INET, &address, text, sizeof(text)) ? text : "<invalid>";
+}
+
+}  // namespace
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -69,6 +145,197 @@ typedef struct {
   uint8_t abEnet[6];              // Ethernet MAC address
   uint8_t abOnline[20];           // Online identification
 } XNADDR;
+
+namespace {
+
+lan::XnAddrSnapshot LoadXnAddr(const XNADDR& address) {
+  lan::XnAddrSnapshot snapshot{};
+  snapshot.ipv4 = address.ina.s_addr;
+  snapshot.online_ipv4 = address.inaOnline.s_addr;
+  snapshot.online_port = address.wPortOnline;
+  std::memcpy(snapshot.ethernet.data(), address.abEnet, snapshot.ethernet.size());
+  std::memcpy(snapshot.online.data(), address.abOnline, snapshot.online.size());
+  return snapshot;
+}
+
+void StoreXnAddr(const lan::XnAddrSnapshot& snapshot, XNADDR* address) {
+  address->ina.s_addr = snapshot.ipv4;
+  address->inaOnline.s_addr = snapshot.online_ipv4;
+  address->wPortOnline = snapshot.online_port;
+  std::memcpy(address->abEnet, snapshot.ethernet.data(), snapshot.ethernet.size());
+  std::memcpy(address->abOnline, snapshot.online.data(), snapshot.online.size());
+}
+
+void FillRandomBytes(uint8_t* data, size_t size) {
+  static std::mutex mutex;
+  static std::mt19937_64 engine = [] {
+    std::random_device device;
+    std::seed_seq seed{device(), device(), device(), device()};
+    return std::mt19937_64(seed);
+  }();
+  std::lock_guard lock(mutex);
+  for (size_t i = 0; i < size; ++i) {
+    data[i] = static_cast<uint8_t>(engine());
+  }
+}
+
+}  // namespace
+
+namespace lan {
+
+LanSystemLinkState& SystemLinkState() {
+  return LanState();
+}
+
+bool FillHostSessionInfo(const LanSystemLinkState& state, rex::memory::Memory& memory,
+                         uint32_t flags, uint32_t session_info_ptr, uint32_t nonce_ptr) {
+  if (!state.enabled() || !(flags & kSessionCreateHost) || !session_info_ptr) {
+    return false;
+  }
+  // Snapshot once; a concurrent cleanup leaves a zero address that no client
+  // could join.
+  const XnAddrSnapshot local = state.local_xnaddr();
+  if (!local.ipv4) {
+    return false;
+  }
+  if (!memory.LookupHeap(session_info_ptr) ||
+      !memory.LookupHeap(session_info_ptr + static_cast<uint32_t>(kSessionInfoSize) - 1) ||
+      (nonce_ptr &&
+       (!memory.LookupHeap(nonce_ptr) ||
+        !memory.LookupHeap(nonce_ptr + static_cast<uint32_t>(kSessionNonceSize) - 1)))) {
+    REXKRNL_WARN("XGISessionCreateImpl: LAN host fill skipped, bad guest pointer");
+    return false;
+  }
+
+  // XSESSION_INFO: XNKID at +0, XNADDR at +8, XNKEY at +44.
+  uint8_t info[kSessionInfoSize]{};
+  FillRandomBytes(info, 8);
+  // System-link XNKIDs have the top three bits of the first byte clear.
+  info[0] &= 0x1F;
+  XNADDR host_address{};
+  StoreXnAddr(local, &host_address);
+  static_assert(sizeof(XNADDR) == 36);
+  std::memcpy(info + 8, &host_address, sizeof(host_address));
+  FillRandomBytes(info + 44, 16);
+  std::memcpy(memory.TranslateVirtual(session_info_ptr), info, sizeof(info));
+
+  if (nonce_ptr) {
+    uint8_t nonce[kSessionNonceSize]{};
+    do {
+      FillRandomBytes(nonce, sizeof(nonce));
+    } while (std::all_of(nonce, nonce + sizeof(nonce), [](uint8_t b) { return b == 0; }));
+    std::memcpy(memory.TranslateVirtual(nonce_ptr), nonce, sizeof(nonce));
+  }
+
+  uint64_t session_id = 0;
+  for (int i = 0; i < 8; ++i) {
+    session_id = (session_id << 8) | info[i];
+  }
+  REXKRNL_DEBUG("XGISessionCreateImpl: {} host session id={:016X} host={}", SystemLinkMode(),
+                session_id, Ipv4String(local.ipv4));
+  return true;
+}
+
+namespace {
+
+bool IsSessionGuestRange(rex::memory::Memory& memory, uint32_t address, uint32_t size) {
+  return address && size && address <= std::numeric_limits<uint32_t>::max() - (size - 1) &&
+         memory.LookupHeap(address) && memory.LookupHeap(address + size - 1);
+}
+
+}  // namespace
+
+void CreateSession(LanSystemLinkState& state, rex::memory::Memory& memory, uint32_t flags,
+                   uint32_t public_slots, uint32_t private_slots, uint32_t user_index,
+                   uint32_t session_info_ptr, uint32_t nonce_ptr) {
+  if (!state.enabled()) {
+    return;
+  }
+  if (!IsSessionGuestRange(memory, session_info_ptr, kSessionInfoSize) ||
+      (nonce_ptr && !IsSessionGuestRange(memory, nonce_ptr, kSessionNonceSize))) {
+    state.DeleteSession();
+    return;
+  }
+  FillHostSessionInfo(state, memory, flags, session_info_ptr, nonce_ptr);
+  SessionSnapshot session{};
+  session.flags = flags;
+  session.max_public_slots = public_slots;
+  session.max_private_slots = private_slots;
+  session.user_index = user_index;
+  std::memcpy(session.info.data(), memory.TranslateVirtual(session_info_ptr), session.info.size());
+  if (nonce_ptr) {
+    std::memcpy(session.nonce.data(), memory.TranslateVirtual(nonce_ptr), session.nonce.size());
+  }
+  state.CreateSession(session);
+}
+
+void JoinSession(LanSystemLinkState& state, rex::memory::Memory& memory, uint32_t user_count,
+                 uint32_t private_slots_ptr) {
+  if (!state.enabled() || !state.session_snapshot().created || !user_count) {
+    return;
+  }
+  uint32_t private_members = 0;
+  if (private_slots_ptr) {
+    if (user_count > std::numeric_limits<uint32_t>::max() / sizeof(uint32_t) ||
+        !IsSessionGuestRange(memory, private_slots_ptr, user_count * sizeof(uint32_t))) {
+      return;
+    }
+    const auto* slots = memory.TranslateVirtual(private_slots_ptr);
+    for (uint32_t i = 0; i < user_count; ++i) {
+      if (memory::load_and_swap<uint32_t>(slots + i * sizeof(uint32_t))) {
+        ++private_members;
+      }
+    }
+  }
+  state.JoinSession(user_count - private_members, private_members);
+}
+
+uint32_t FillSessionDetails(const LanSystemLinkState& state, rex::memory::Memory& memory,
+                            uint32_t buffer_size_ptr, uint32_t details_ptr) {
+  if (!state.enabled()) {
+    return 0;
+  }
+  const auto session = state.session_snapshot();
+  const uint32_t occupied_public = session.joined_public + session.filled_public;
+  const uint32_t occupied_private = session.joined_private + session.filled_private;
+  const uint32_t available_public =
+      session.max_public_slots - std::min(session.max_public_slots, occupied_public);
+  const uint32_t available_private =
+      session.max_private_slots - std::min(session.max_private_slots, occupied_private);
+  REXKRNL_DEBUG(
+      "XSessionGetDetails: LAN created={} flags={:08X} public={}/{} private={}/{} joined={}/{}",
+      session.created, session.flags, available_public, session.max_public_slots, available_private,
+      session.max_private_slots, session.joined_public, session.joined_private);
+  if (!session.created) {
+    return 0;
+  }
+  if (!IsSessionGuestRange(memory, buffer_size_ptr, sizeof(uint32_t))) {
+    return 87;  // ERROR_INVALID_PARAMETER
+  }
+  auto* buffer_size = memory.TranslateVirtual(buffer_size_ptr);
+  if (memory::load_and_swap<uint32_t>(buffer_size) < kSessionDetailsSize) {
+    memory::store_and_swap<uint32_t>(buffer_size, kSessionDetailsSize);
+    return 122;  // ERROR_INSUFFICIENT_BUFFER
+  }
+  if (!IsSessionGuestRange(memory, details_ptr, kSessionDetailsSize)) {
+    return 87;  // ERROR_INVALID_PARAMETER
+  }
+  auto* details = memory.TranslateVirtual(details_ptr);
+  std::memset(details, 0, kSessionDetailsSize);
+  memory::store_and_swap<uint32_t>(details + 0, session.user_index);
+  memory::store_and_swap<uint32_t>(details + 12, session.flags);
+  memory::store_and_swap<uint32_t>(details + 16, session.max_public_slots);
+  memory::store_and_swap<uint32_t>(details + 20, session.max_private_slots);
+  memory::store_and_swap<uint32_t>(details + 24, available_public);
+  memory::store_and_swap<uint32_t>(details + 28, available_private);
+  memory::store_and_swap<uint32_t>(details + 32, occupied_public + occupied_private);
+  memory::store_and_swap<uint32_t>(details + 40, session.state);
+  std::memcpy(details + 44, session.nonce.data(), session.nonce.size());
+  std::memcpy(details + 52, session.info.data(), session.info.size());
+  return 0;
+}
+
+}  // namespace lan
 
 typedef struct {
   rex::be<int32_t> status;
@@ -183,9 +450,33 @@ struct XNetStartupParams {
 XNetStartupParams xnet_startup_params = {};
 
 u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
+  std::lock_guard lifecycle(xnet_lifecycle);
+  const auto config = system_link::CurrentConfig();
+  if (!config.error.empty()) {
+    REXKRNL_ERROR("XNetStartup: {}", config.error);
+    return X_ERROR_INVALID_PARAMETER;
+  }
   if (params) {
     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
+  }
+
+  if (RelayRequested()) {
+    auto& client = relay_link::SystemLinkClient();
+    client.SetProbeReplies(system_link::LiveSessionsActive());
+    const auto result = relay_startup.Start(config, client, LanState());
+    if (result)
+      return result;
+  } else if (config.mode == system_link::Mode::kLan) {
+    if (!LanState().Configure(config.local_address, config.xuid)) {
+      REXKRNL_ERROR(
+          "XNetStartup: direct LAN requires a selected IPv4 address and nonzero local XUID");
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    REXKRNL_DEBUG("XNetStartup: direct LAN address={} xuid={:016X}", config.local_address,
+                  config.xuid);
+  } else {
+    LanState().Reset();
   }
 
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
@@ -203,6 +494,7 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
 }
 
 u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) {
+  std::lock_guard lifecycle(xnet_lifecycle);
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
   // auto xnet = xam->xnet();
   // xam->set_xnet(nullptr);
@@ -210,6 +502,47 @@ u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) {
   // TODO: Shut down and delete.
   // delete xnet;
 
+  std::optional<relay_link::Stats> relay_stats;
+  if (RelayRequested()) {
+    relay_stats = relay_startup.Cleanup(relay_link::SystemLinkClient());
+    if (!relay_stats) {
+      REXKRNL_DEBUG("XNetCleanup: relay references={}", relay_startup.references());
+      return 0;
+    }
+  }
+  if (auto sessions = live::ActiveService())
+    sessions->Cleanup();
+  if (LanState().enabled()) {
+    auto stats = LanState().stats_snapshot();
+    auto qos = LanState().qos_snapshot();
+    REXKRNL_DEBUG(
+        "XNetCleanup: {} sent={} packets/{} bytes received={} packets/{} bytes "
+        "qos_enabled={} qos_bytes={}",
+        SystemLinkMode(), stats.sent_packets, stats.sent_bytes, stats.received_packets,
+        stats.received_bytes, qos.enabled, qos.payload.size());
+  }
+  if (relay_stats) {
+    const auto& stats = *relay_stats;
+    REXKRNL_DEBUG(
+        "XNetCleanup: relay state={} delivered={} unknown_port={} invalid_wire={} "
+        "invalid_envelope={} rejected_destination={} queue_full={} oversize={} "
+        "socket_errors={} connection_resets={} heartbeats={} discarded_pending={} "
+        "dropped_after_cleanup={} direct_attempts={} direct_established={} "
+        "direct_fallbacks={} direct_in={} direct_out={} direct_connect_timeouts={} "
+        "direct_probe_failures={} direct_bad_tag={} direct_malformed={} direct_unknown_peer={} "
+        "direct_stale_attempt={} direct_bad_mac={} direct_replay={} direct_fault_drops={} "
+        "direct_evicted={}",
+        static_cast<int>(stats.state), stats.delivered, stats.unknown_port, stats.invalid_wire,
+        stats.invalid_envelope, stats.rejected_destination, stats.queue_full, stats.oversize,
+        stats.socket_errors, stats.connection_resets, stats.heartbeats, stats.discarded_pending,
+        stats.dropped_after_cleanup, stats.direct_attempts, stats.direct_established,
+        stats.direct_fallbacks, stats.direct_in, stats.direct_out, stats.direct_connect_timeouts,
+        stats.direct_probe_failures, stats.direct_bad_tag, stats.direct_malformed,
+        stats.direct_unknown_peer, stats.direct_stale_attempt, stats.direct_bad_mac,
+        stats.direct_replay, stats.direct_fault_drops, stats.direct_evicted);
+  }
+  host_data::OnNetworkCleanup();
+  LanState().Reset();
   return 0;
 }
 
@@ -286,6 +619,26 @@ u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_p
   return ret;
 }
 
+// The Ex forms ignore the caller's XNet library version. Titles reach them
+// through the System Link system version; with System Link off, they return
+// the caller value in r3 without running startup.
+u32 NetDll_XNetStartupEx_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params, u32 version) {
+  if (system_link::CurrentConfig().mode == system_link::Mode::kOff) {
+    REXKRNL_WARN("__imp__NetDll_XNetStartupEx STUB");
+    return caller;
+  }
+  return NetDll_XNetStartup_entry(caller, params);
+}
+
+u32 NetDll_WSAStartupEx_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr,
+                              u32 library_version) {
+  if (system_link::CurrentConfig().mode == system_link::Mode::kOff) {
+    REXKRNL_WARN("__imp__NetDll_WSAStartupEx STUB");
+    return caller;
+  }
+  return NetDll_WSAStartup_entry(caller, version, data_ptr);
+}
+
 u32 NetDll_WSACleanup_entry(u32 caller) {
   // This does nothing. Xenia needs WSA running.
   return 0;
@@ -336,6 +689,10 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   uint32_t combined_buffer_size = 0;
   uint32_t combined_buffer_offset = 0;
   for (uint32_t i = 0; i < num_buffers; i++) {
+    if (RelaySocket(socket_handle) && buffers[i].len > relay::kMaxPayload - combined_buffer_size) {
+      XThread::SetLastError(relay_link::kMessageSize);
+      return -1;
+    }
     combined_buffer_size += buffers[i].len;
     combined_buffer_mem.resize(combined_buffer_size);
     uint8_t* combined_buffer = combined_buffer_mem.data();
@@ -345,6 +702,23 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
     combined_buffer_offset += buffers[i].len;
   }
 
+  if (RelaySocket(socket_handle)) {
+    if (!to_ptr || to_len < sizeof(XSOCKADDR_IN) || to_ptr->sin_family != XSocket::X_AF_INET) {
+      XThread::SetLastError(10022);
+      return -1;
+    }
+    auto result = relay_link::SystemLinkClient().Send(
+        socket->native_handle(), {htonl(static_cast<uint32_t>(to_ptr->sin_addr)), to_ptr->sin_port},
+        combined_buffer_mem);
+    if (!result) {
+      XThread::SetLastError(result.error());
+      return -1;
+    }
+    if (num_bytes_sent)
+      *num_bytes_sent = *result;
+    RecordSystemLinkSend(*result);
+    return 0;
+  }
   N_XSOCKADDR_IN native_to(to_ptr);
   socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
 
@@ -436,6 +810,22 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  if (RelayRequested()) {
+    lan::XnAddrSnapshot address{};
+    const auto status =
+        system_link::RelayTitleXnAddr(relay_link::SystemLinkClient(), LanState(), &address);
+    StoreXnAddr(address, addr_ptr);
+    REXKRNL_DEBUG("XNetGetTitleXnAddr: relay address={} status={}", Ipv4String(address.ipv4),
+                  status);
+    return status;
+  }
+  if (LanState().enabled()) {
+    StoreXnAddr(LanState().local_xnaddr(), addr_ptr);
+    REXKRNL_DEBUG("XNetGetTitleXnAddr: {} address={}", SystemLinkMode(),
+                  Ipv4String(LanState().local_ipv4()));
+    return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  }
+
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -480,6 +870,23 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
+  if (LanState().enabled()) {
+    if (!xn_addr || !in_addr) {
+      REXKRNL_DEBUG("XNetXnAddrToInAddr: {} invalid parameter (xnaddr={} inaddr={})",
+                    SystemLinkMode(), xn_addr ? "set" : "null", in_addr ? "set" : "null");
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    uint32_t converted = 0;
+    const lan::XnAddrSnapshot peer = LoadXnAddr(*xn_addr);
+    if (!LanState().XnAddrToInAddr(peer, &converted)) {
+      REXKRNL_DEBUG("XNetXnAddrToInAddr: {} conversion failed, ina={}", SystemLinkMode(),
+                    Ipv4String(peer.ipv4));
+      return X_ERROR_FUNCTION_FAILED;
+    }
+    std::memcpy(in_addr.host_address(), &converted, sizeof(converted));
+    REXKRNL_DEBUG("XNetXnAddrToInAddr: {} address={}", SystemLinkMode(), Ipv4String(converted));
+    return 0;
+  }
   return 1;
 }
 
@@ -487,6 +894,20 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
 // FIXME: Arguments may not be correct.
 u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
+  if (LanState().enabled()) {
+    if (!in_addr || !xn_addr) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    uint32_t converted = 0;
+    std::memcpy(&converted, in_addr.host_address(), sizeof(converted));
+    lan::XnAddrSnapshot snapshot{};
+    if (!LanState().InAddrToXnAddr(converted, &snapshot)) {
+      return X_ERROR_FUNCTION_FAILED;
+    }
+    StoreXnAddr(snapshot, xn_addr);
+    REXKRNL_DEBUG("XNetInAddrToXnAddr: {} address={}", SystemLinkMode(), Ipv4String(converted));
+    return 0;
+  }
   return 1;
 }
 
@@ -549,17 +970,51 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
   return 0;
 }
 
+// XNetQosLookup(cxna, apxna, apxnkid, apxnkey, cina, aina, adwServiceId, cProbes,
+// dwBitsPerSec, dwFlags, hEvent, ppxnqos) with the NetDll caller first. The
+// export runs this only while Live sessions are active.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 count, u32 addresses_ptr, u32 ids_ptr, u32 keys_ptr,
+                               u32 server_count, u32 servers_ptr, u32 service_ids_ptr, u32 probes,
+                               u32 bits_per_second, u32 flags, u32 event_handle, u32 result_ptr) {
+  auto sessions = live::ActiveService();
+  if (!sessions)
+    return X_ERROR_FUNCTION_FAILED;
+  return live::HandleQosLookup(*sessions, *REX_KERNEL_MEMORY(), count, addresses_ptr, ids_ptr,
+                               server_count, probes, event_handle, result_ptr);
+}
+
 u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   if (!qos) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  // Stop writing a lookup's results before its block is freed.
+  if (auto sessions = live::ActiveService())
+    sessions->ReleaseQos(qos.guest_address());
   REX_KERNEL_MEMORY()->SystemHeapFree(qos.guest_address());
   return 0;
 }
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
+  if (!LanState().enabled() && !RelayRequested()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if (data_size && !data) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto payload = data_size ? std::span<const uint8_t>(data.as<const uint8_t*>(), data_size)
+                           : std::span<const uint8_t>();
+  const auto result =
+      system_link::QosListen(LanState(), system_link::CurrentMode(), payload, r7, flags);
+  if (result == 0) {
+    if (auto sessions = live::ActiveService()) {
+      const auto qos = LanState().qos_snapshot();
+      sessions->SetQosListen(
+          qos.enabled ? std::span<const uint8_t>(qos.payload) : std::span<const uint8_t>(),
+          live::Clock::now());
+    }
+  }
+  return result;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
@@ -592,6 +1047,15 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
     return -1;
   }
 
+  auto kind = lan::SocketKind::kStream;
+  if (static_cast<uint32_t>(type) == XSocket::X_SOCK_DGRAM) {
+    kind = static_cast<uint32_t>(protocol) == XSocket::X_IPPROTO_VDP ? lan::SocketKind::kVdp
+                                                                     : lan::SocketKind::kDatagram;
+  }
+  LanState().RegisterSocket(socket->handle(), kind);
+  if (RelayRequested())
+    relay_link::SystemLinkClient().RegisterSocket(socket->handle(),
+                                                  kind != lan::SocketKind::kStream);
   return socket->handle();
 }
 
@@ -605,7 +1069,10 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
 
   // TODO: Absolutely delete this object. It is no longer valid after calling
   // closesocket.
+  relay_link::SystemLinkClient().Release(socket->native_handle());
+  relay_link::SystemLinkClient().ForgetSocket(socket_handle);
   socket->Close();
+  LanState().ForgetSocket(socket_handle);
   socket->ReleaseHandle();
   return 0;
 }
@@ -669,13 +1136,110 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     return -1;
   }
 
+  if (RelaySocket(socket_handle)) {
+    if (!name || namelen < sizeof(XSOCKADDR_IN) || name->sin_family != XSocket::X_AF_INET) {
+      XThread::SetLastError(10022);
+      return -1;
+    }
+    auto result = relay_link::SystemLinkClient().Bind(socket->native_handle(), name->sin_port);
+    if (!result) {
+      XThread::SetLastError(result.error());
+      return -1;
+    }
+    LanState().MarkBound(socket_handle);
+    REXKRNL_DEBUG("bind: relay socket={} address={} port={}", socket_handle,
+                  Ipv4String(relay_link::SystemLinkClient().ipv4()),
+                  relay_link::SystemLinkClient().GuestPort(socket->native_handle()));
+    return 0;
+  }
   N_XSOCKADDR_IN native_name(name);
+  const bool lan_enabled = LanState().enabled() && !RelayRequested();
+  bool took_port_claim = false;
+  if (lan_enabled) {
+    const uint32_t requested_address = htonl(static_cast<uint32_t>(name->sin_addr));
+    native_name.sin_addr = ntohl(LanState().SelectBindIpv4(requested_address));
+    const auto port = static_cast<uint16_t>(native_name.sin_port);
+    // Plain datagram ports receive limited broadcasts from every local
+    // instance, so one machine-wide owner keeps broadcast-addressed traffic
+    // unambiguous. VDP ports stay per address.
+    if (!requested_address && port &&
+        LanState().socket_kind(socket_handle) == lan::SocketKind::kDatagram) {
+      if (const int claim_error =
+              LanState().ClaimDatagramPort(socket_handle, port, &took_port_claim)) {
+        XThread::SetLastError(static_cast<uint32_t>(claim_error));
+        REXKRNL_DEBUG("bind: direct LAN socket={} port={} claimed elsewhere error={}",
+                      socket_handle, port, claim_error);
+        return -1;
+      }
+    }
+    REXKRNL_DEBUG("bind: direct LAN socket={} address={} port={}", socket_handle,
+                  Ipv4String(htonl(static_cast<uint32_t>(native_name.sin_addr))), port);
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+#if REX_PLATFORM_WIN32
+    const auto native_error = static_cast<uint32_t>(WSAGetLastError());
+#else
+    const auto native_error = xboxkrnl::xeRtlNtStatusToDosError(status);
+#endif
+    if (took_port_claim) {
+      LanState().ReleasePortClaim(socket_handle);
+    }
+    if (lan_enabled) {
+      XThread::SetLastError(native_error);
+      REXKRNL_ERROR("bind: direct LAN socket={} failed error={}", socket_handle, native_error);
+    } else {
+      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    }
     return -1;
   }
 
+  LanState().MarkBound(socket_handle);
+  return 0;
+}
+
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_len) {
+  if (!name || !name_len || *name_len < sizeof(XSOCKADDR_IN)) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  N_XSOCKADDR_IN native_name{};
+  uint32_t native_name_len = *name_len;
+  X_STATUS status = socket->GetSockName(&native_name, &native_name_len);
+  if (XFAILED(status)) {
+#if REX_PLATFORM_WIN32
+    XThread::SetLastError(static_cast<uint32_t>(WSAGetLastError()));
+#else
+    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+#endif
+    return -1;
+  }
+
+  if (RelaySocket(socket_handle)) {
+    native_name.sin_addr = ntohl(relay_link::SystemLinkClient().ipv4());
+    native_name.sin_port = relay_link::SystemLinkClient().GuestPort(socket->native_handle());
+  }
+  name->sin_family = native_name.sin_family;
+  name->sin_port = native_name.sin_port;
+  name->sin_addr = native_name.sin_addr;
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  *name_len = native_name_len;
+
+  if (LanState().enabled()) {
+    REXKRNL_DEBUG("getsockname: {} socket={} address={} port={}", SystemLinkMode(), socket_handle,
+                  Ipv4String(htonl(static_cast<uint32_t>(native_name.sin_addr))),
+                  static_cast<uint16_t>(native_name.sin_port));
+  }
   return 0;
 }
 
@@ -687,6 +1251,10 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
     return -1;
   }
 
+  if (RelaySocket(socket_handle)) {
+    XThread::SetLastError(10045);  // WSAEOPNOTSUPP: connected relay UDP is unsupported.
+    return -1;
+  }
   N_XSOCKADDR native_name(name);
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
@@ -844,6 +1412,30 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   return ret;
 }
 
+// Report physical-view receive length as min(received, buffer size); if
+// truncation fills the buffer before failure, report the full buffer rather
+// than datagram length.
+static void NotifyReceived(uint32_t physical, uint32_t buf_len, int ret, int error) {
+  if (physical == UINT32_MAX) {
+    return;
+  }
+  const uint32_t copied = ret > 0 ? std::min(uint32_t(ret), buf_len)
+                          : ret < 0 && error == relay_link::kMessageSize ? buf_len
+                                                                         : 0;
+  if (copied) {
+    REX_KERNEL_MEMORY()->NotifyPhysicalWrite(physical, copied);
+  }
+}
+
+// The native socket error of the last failed call, where the platform has one.
+static int LastReceiveError() {
+#if REX_PLATFORM_WIN32
+  return WSAGetLastError();
+#else
+  return 0;
+#endif
+}
+
 u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
@@ -852,7 +1444,24 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Recv(buf_ptr, buf_len, flags);
+  if (RelaySocket(socket_handle)) {
+    XThread::SetLastError(10045);  // Keep raw loopback envelopes inside recvfrom.
+    return -1;
+  }
+  uint32_t physical = UINT32_MAX;
+  auto* buffer =
+      REX_KERNEL_MEMORY()->TranslateForHostWrite(buf_ptr.guest_address(), buf_len, &physical);
+  const int ret = socket->Recv(buffer, buf_len, flags);
+  if (ret < 0) {
+    const int error = LastReceiveError();
+    NotifyReceived(physical, buf_len, ret, error);
+#if REX_PLATFORM_WIN32
+    WSASetLastError(error);
+#endif
+  } else {
+    NotifyReceived(physical, buf_len, ret, 0);
+  }
+  return ret;
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -869,8 +1478,43 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
     native_from = *from_ptr;
   }
   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
-  int ret =
-      socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
+  uint32_t physical = UINT32_MAX;
+  auto* buffer =
+      REX_KERNEL_MEMORY()->TranslateForHostWrite(buf_ptr.guest_address(), buf_len, &physical);
+  int ret;
+  if (RelaySocket(socket_handle)) {
+    auto result = relay_link::SystemLinkClient().ReceiveFrom(
+        socket->native_handle(), {buffer, static_cast<uint32_t>(buf_len)}, flags, native_from,
+        native_fromlen);
+    if (!result) {
+      NotifyReceived(physical, buf_len, -1, result.error());
+      XThread::SetLastError(result.error());
+      return -1;
+    }
+    ret = *result;
+    NotifyReceived(physical, buf_len, ret, 0);
+  } else {
+    ret = socket->RecvFrom(buffer, buf_len, flags, &native_from,
+                           fromlen_ptr ? &native_fromlen : nullptr);
+    if (ret < 0) {
+      const int error = LastReceiveError();
+      NotifyReceived(physical, buf_len, ret, error);
+#if REX_PLATFORM_WIN32
+      WSASetLastError(error);
+#endif
+    } else {
+      NotifyReceived(physical, buf_len, ret, 0);
+    }
+  }
+
+  if (ret >= 0 && LanState().enabled()) {
+    LanState().RecordReceive(static_cast<size_t>(ret));
+    auto stats = LanState().stats_snapshot();
+    if (stats.received_packets == 1 || (stats.received_packets % 256) == 0) {
+      REXKRNL_DEBUG("recvfrom: {} packets={} bytes={}", SystemLinkMode(), stats.received_packets,
+                    stats.received_bytes);
+    }
+  }
 
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
@@ -903,6 +1547,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
+  if (RelaySocket(socket_handle)) {
+    XThread::SetLastError(10045);  // A datagram must supply its virtual destination to sendto.
+    return -1;
+  }
   return socket->Send(buf_ptr, buf_len, flags);
 }
 
@@ -915,8 +1563,37 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
     return -1;
   }
 
+  if (RelaySocket(socket_handle)) {
+    if (!to_ptr || to_len < sizeof(XSOCKADDR_IN) || to_ptr->sin_family != XSocket::X_AF_INET) {
+      XThread::SetLastError(10022);
+      return -1;
+    }
+    auto result = relay_link::SystemLinkClient().Send(
+        socket->native_handle(), {htonl(static_cast<uint32_t>(to_ptr->sin_addr)), to_ptr->sin_port},
+        {static_cast<uint8_t*>(buf_ptr), static_cast<uint32_t>(buf_len)});
+    if (!result) {
+      XThread::SetLastError(result.error());
+      return -1;
+    }
+    RecordSystemLinkSend(*result);
+    return *result;
+  }
+  if (!RelayRequested() && LanState().NeedsBindBeforeSend(socket_handle)) {
+    if (lan::BindUnboundToLocalAddress(*socket, LanState().local_ipv4())) {
+      N_XSOCKADDR_IN bound{};
+      uint32_t bound_size = sizeof(bound);
+      socket->GetSockName(&bound, &bound_size);
+      REXKRNL_DEBUG("sendto: direct LAN socket={} bound address={} port={}", socket_handle,
+                    Ipv4String(htonl(static_cast<uint32_t>(bound.sin_addr))),
+                    static_cast<uint16_t>(bound.sin_port));
+    }
+    LanState().MarkBound(socket_handle);
+  }
+
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  RecordSystemLinkSend(ret);
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -938,10 +1615,12 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
 }  // namespace rex
 
 REX_EXPORT(__imp__NetDll_XNetStartup, rex::kernel::xam::NetDll_XNetStartup_entry)
+REX_EXPORT(__imp__NetDll_XNetStartupEx, rex::kernel::xam::NetDll_XNetStartupEx_entry)
 REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
 REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
 REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
 REX_EXPORT(__imp__NetDll_WSAStartup, rex::kernel::xam::NetDll_WSAStartup_entry)
+REX_EXPORT(__imp__NetDll_WSAStartupEx, rex::kernel::xam::NetDll_WSAStartupEx_entry)
 REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
 REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
 REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
@@ -968,6 +1647,18 @@ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease
 REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
 REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
 REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
+// Without Live sessions, return before argument translation to preserve every
+// guest register, including r3's upper word.
+extern "C" REX_FUNC(__imp__NetDll_XNetQosLookup) {
+  if (!rex::kernel::xam::live::ActiveService()) {
+    (void)base;
+    REXKRNL_WARN("{} STUB", "__imp__NetDll_XNetQosLookup");
+    return;
+  }
+  rex::ppc::HostToGuestFunction<rex::kernel::xam::NetDll_XNetQosLookup_entry>(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__NetDll_XNetQosLookup(
+    "__imp__NetDll_XNetQosLookup", &__imp__NetDll_XNetQosLookup);
 REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
 REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
 REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
@@ -975,6 +1666,7 @@ REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
 REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
 REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
 REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
 REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
 REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
@@ -1005,7 +1697,6 @@ REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
 REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
 REX_EXPORT_STUB(__imp__NetDll_WSARecv);
 REX_EXPORT_STUB(__imp__NetDll_WSASend);
-REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
 REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
@@ -1040,12 +1731,10 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
-REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
@@ -1098,5 +1787,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
 REX_EXPORT_STUB(__imp__NetDll_getsockopt);
