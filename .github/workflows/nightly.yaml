@@ -1,22 +1,20 @@
 name: Nightly rexglue-sdk
 
 on:
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
-  actions: write
 
 env:
-  DEV_BRANCH: development
+  DEV_BRANCH: main
   NIGHTLY_TAG_PREFIX: nightly-
   NIGHTLY_RETENTION: 10
   RELEASE_LIST_LIMIT: 1000
 
 jobs:
   check:
+    if: github.repository == 'rexglue/rexglue-sdk'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.compare.outputs.should_build }}
@@ -25,7 +23,7 @@ jobs:
       tag_name: ${{ steps.compare.outputs.tag_name }}
     steps:
       - name: Checkout dev branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.DEV_BRANCH }}
           fetch-depth: 1
@@ -53,7 +51,7 @@ jobs:
           fi
           echo "prev_nightly_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch — forcing build as ${tag_name}."
+            echo "Manual dispatch: forcing build as ${tag_name}."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           elif [ "${dev_sha}" = "${prev_sha}" ]; then
             echo "${DEV_BRANCH} unchanged since last nightly (${dev_sha}); skipping build."
@@ -123,7 +121,7 @@ jobs:
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.check.outputs.dev_sha }}
           fetch-depth: 0
@@ -141,6 +139,8 @@ jobs:
           PREV_SHA: ${{ needs.check.outputs.prev_nightly_sha }}
           TAG_NAME: ${{ needs.check.outputs.tag_name }}
         run: |
+          # DEV_SHA is supplied by the step environment.
+          # shellcheck disable=SC2153
           if [ -n "${PREV_SHA}" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
             commits=$(git log --no-merges --pretty='format:- %s (%h)' "${PREV_SHA}..${DEV_SHA}")
             range_header="Changes since previous nightly (\`${PREV_SHA:0:8}\`):"
