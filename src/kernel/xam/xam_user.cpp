@@ -382,8 +382,9 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // A Live sign-in carries the account's privileges; otherwise deny
+  // everything.
+  *out_value = REX_KERNEL_STATE()->user_profile()->signin_state() == 2 ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -725,6 +726,16 @@ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
   return X_ERROR_SUCCESS;
 }
 
+// There is no statistics service, so leaderboard reads fail as they do
+// without a Live connection rather than returning a handle to nothing.
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 by_rank, u64 pivot, u32 row_count,
+                                       u32 spec_count, u32 specs_ptr, u32 buffer_size_ptr,
+                                       u32 handle_ptr) {
+  REXKRNL_DEBUG("XamUserCreateStatsEnumerator({:08X}, {}, {:016X}, {}, {}) unavailable", title_id,
+                by_rank, pivot, row_count, spec_count);
+  return X_ERROR_FUNCTION_FAILED;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -756,12 +767,13 @@ REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_e
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
 REX_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
 REX_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 
 REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
