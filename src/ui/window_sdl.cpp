@@ -27,6 +27,7 @@
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
+#include <rex/ui/window_size.h>
 
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
@@ -40,13 +41,26 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 
+REXCVAR_DECLARE(bool, window_hidden);
+
 namespace rex::ui {
 
 namespace {
 
+// window_size ranks below an explicit window_width/window_height and above
+// the resolution preset. Only the startup window reads it; the guest video
+// mode derives from window_width and resolution alone.
+WindowSize ConfiguredWindowSize() {
+  return EffectiveWindowSize(REXCVAR_GET(window_size), REXCVAR_GET(window_width),
+                             REXCVAR_GET(window_height));
+}
+
 uint32_t ResolveWindowWidth(uint32_t requested_width) {
   if (REXCVAR_GET(window_width) > 0) {
     return uint32_t(REXCVAR_GET(window_width));
+  }
+  if (const WindowSize size = ConfiguredWindowSize(); size.kind == WindowSizeKind::kFixed) {
+    return size.width;
   }
   if (!rex::cvar::HasNonDefaultValue("window_width")) {
     if (rex::cvar::HasNonDefaultValue("video_mode_width") && REXCVAR_GET(video_mode_width) > 0) {
@@ -65,6 +79,9 @@ uint32_t ResolveWindowWidth(uint32_t requested_width) {
 uint32_t ResolveWindowHeight(uint32_t requested_height) {
   if (REXCVAR_GET(window_height) > 0) {
     return uint32_t(REXCVAR_GET(window_height));
+  }
+  if (const WindowSize size = ConfiguredWindowSize(); size.kind == WindowSizeKind::kFixed) {
+    return size.height;
   }
   if (!rex::cvar::HasNonDefaultValue("window_height")) {
     if (rex::cvar::HasNonDefaultValue("video_mode_height") && REXCVAR_GET(video_mode_height) > 0) {
@@ -170,9 +187,19 @@ bool WindowSDL::OpenImpl() {
     }
   }
 
+  // A window_size larger than the target display's usable area is shrunk to
+  // fit, keeping its aspect ratio. Fullscreen ignores the windowed size.
+  const WindowSize configured_size = ConfiguredWindowSize();
+  if (configured_size.kind == WindowSizeKind::kFixed && !IsFullscreen()) {
+    ClampWindowToDisplay(initial_width, initial_height);
+  }
+
   if (IsFullscreen()) {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     SDL_SetWindowFullscreen(sdl_window_, true);
+  } else if (configured_size.kind == WindowSizeKind::kMaximized) {
+    // The creation size stays as the restore size.
+    SDL_MaximizeWindow(sdl_window_);
   }
 #if REX_PLATFORM_MAC
   CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
@@ -183,7 +210,14 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
-  SDL_ShowWindow(sdl_window_);
+  if (!REXCVAR_GET(window_hidden)) {
+    SDL_ShowWindow(sdl_window_);
+  }
+  if (configured_size.kind == WindowSizeKind::kMaximized && !IsFullscreen() &&
+      !(SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_MAXIMIZED)) {
+    // Some backends defer a maximize requested while the window was hidden.
+    SDL_MaximizeWindow(sdl_window_);
+  }
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
@@ -199,6 +233,34 @@ bool WindowSDL::OpenImpl() {
     OnFocusUpdate(true, destruction_receiver);
   }
   return true;
+}
+
+void WindowSDL::ClampWindowToDisplay(int requested_width, int requested_height) {
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
+  SDL_Rect usable = {};
+  if (!display || !SDL_GetDisplayUsableBounds(display, &usable)) {
+    return;
+  }
+  // The usable area excludes taskbars but the frame sits inside it, so take
+  // the decoration off the available client size.
+  int border_top = 0;
+  int border_left = 0;
+  int border_bottom = 0;
+  int border_right = 0;
+  SDL_GetWindowBordersSize(sdl_window_, &border_top, &border_left, &border_bottom, &border_right);
+  const int max_width = usable.w - border_left - border_right;
+  const int max_height = usable.h - border_top - border_bottom;
+  const WindowSize fitted =
+      FitWindowSize({WindowSizeKind::kFixed, uint32_t(requested_width), uint32_t(requested_height)},
+                    max_width, max_height);
+  if (int(fitted.width) == requested_width && int(fitted.height) == requested_height) {
+    return;
+  }
+  REXLOG_INFO("window_size {}x{} exceeds the usable display area; using {}x{}", requested_width,
+              requested_height, fitted.width, fitted.height);
+  SDL_SetWindowSize(sdl_window_, int(fitted.width), int(fitted.height));
+  SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+                        SDL_WINDOWPOS_CENTERED_DISPLAY(display));
 }
 
 void WindowSDL::RequestCloseImpl() {
