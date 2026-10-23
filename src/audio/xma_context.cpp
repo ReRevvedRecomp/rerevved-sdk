@@ -109,6 +109,11 @@ bool XmaContext::Work() {
   }
 
   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+  // Output goes through the physical view, which no guest-view watch sees.
+  const auto output_written = [&] {
+    memory()->NotifyPhysicalWrite(data.output_buffer_ptr,
+                                  data.output_buffer_block_count * kOutputBytesPerBlock);
+  };
 
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
@@ -116,6 +121,7 @@ bool XmaContext::Work() {
       return true;
     }
     Consume(&output_rb, &data);
+    output_written();
     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
     StoreContextMerged(data, initial_data, context_ptr);
     return true;
@@ -140,6 +146,7 @@ bool XmaContext::Work() {
       break;
     }
   }
+  output_written();
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
@@ -190,12 +197,9 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 }
 
 void XmaContext::ResetDecoderState() {
-  // A freed or re-initialized context is a new logical stream, so the previous
-  // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
-  // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
+  // Free/reinit drops the MDCT tail before frame 0. ff_xmaframes_decoder has no
+  // flush callback, so avcodec_flush_buffers() leaves channel[].out; invalidate
+  // the format to reopen.
   if (av_context_) {
     av_context_->sample_rate = 0;
     av_context_->channels = 0;

@@ -191,12 +191,9 @@ class XmaContext {
   static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
   static const uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
 
-  // The bitstream declares a start padding that the hardware discards. FFmpeg's
-  // xmaframes decoder parses that field and drops it on the floor
-  // (wmaprodec.c decode_frame, "start skip"), emitting the padding as ordinary
-  // output, so its sample numbering runs this far ahead of the numbering the
-  // guest's loop offsets use. Measured at 192 on every wave checked. Left
-  // uncorrected it costs each loop wrap its final 192 samples.
+  // Hardware discards start padding; FFmpeg drops the field, not padding
+  // (wmaprodec.c decode_frame, "start skip"). All checked waves lead by 192
+  // samples; uncorrected loops lose their final 192 samples.
   static const uint32_t kDecoderStartPadding = 192;
   static_assert(kDecoderStartPadding < kSamplesPerFrame,
                 "start padding must fit inside one decoded frame");

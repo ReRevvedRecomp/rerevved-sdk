@@ -17,6 +17,7 @@
 #include <rex/audio/conversion.h>
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/output_state.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -24,7 +25,19 @@
 #include <rex/perf/counter.h>
 #include <SDL3/SDL.h>
 
-REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output")
+    .audience(rex::cvar::Audience::kPlayer);
+
+// Multiplies with the master gain from SetOutputGain, so a title or mod that
+// sets its own gain keeps it.
+REXCVAR_DEFINE_INT32(audio_volume, 100, "Audio", "Volume. Output volume in percent")
+    .range(0, 100)
+    .audience(rex::cvar::Audience::kPlayer);
+
+REXCVAR_DEFINE_BOOL(audio_play_in_background, true, "Audio",
+                    "Play sound in background. Keep audio playing while the game window is not "
+                    "focused")
+    .audience(rex::cvar::Audience::kPlayer);
 
 namespace rex::audio::sdl {
 
@@ -177,7 +190,9 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   // Snapshot once. A change mid-callback would split the frame across two mixes.
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
-  const float gain = GetOutputGain();
+  const float gain = ComposeOutputGain(GetOutputGain(), REXCVAR_GET(audio_volume));
+  const bool silent = ShouldSilenceOutput(REXCVAR_GET(audio_mute),
+                                          REXCVAR_GET(audio_play_in_background), IsOutputFocused());
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
@@ -195,7 +210,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     } else {
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
-      if (REXCVAR_GET(audio_mute)) {
+      if (silent) {
         std::memset(data, 0, len);
       } else {
         switch (driver->sdl_device_channels_) {

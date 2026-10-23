@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
 #include <rex/input/input_system.h>
 
 // The X_STATUS_* / X_ERROR_* macros cast through these unqualified, so
@@ -93,9 +94,18 @@ class FakeDriver final : public InputDriver {
     return X_ERROR_SUCCESS;
   }
 
-  X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION*) override {
-    return states_.count(id) ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) override {
+    if (!states_.count(id)) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    vibrations[id] = *vibration;
+    ++vibration_calls;
+    return vibration_result;
   }
+
+  std::map<DeviceId, X_INPUT_VIBRATION> vibrations;
+  size_t vibration_calls = 0;
+  X_RESULT vibration_result = X_ERROR_SUCCESS;
 
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t, X_INPUT_KEYSTROKE* out) override {
     if (states_.find(id) == states_.end()) {
@@ -123,6 +133,11 @@ std::unique_ptr<InputSystem> SharedSystem(FakeDriver** out_driver) {
   system->SetDeviceAssignment(std::make_unique<SharedAssignment>());
   return system;
 }
+
+struct RestoreVibration {
+  bool previous = REXCVAR_GET(input_vibration);
+  ~RestoreVibration() { REXCVAR_SET(input_vibration, previous); }
+};
 
 }  // namespace
 
@@ -235,4 +250,83 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+TEST_CASE("Vibration setting defaults to enabled for players", "[input]") {
+  const auto* entry = rex::cvar::GetFlagInfo("input_vibration");
+  REQUIRE(entry != nullptr);
+  CHECK(entry->type == rex::cvar::FlagType::Boolean);
+  CHECK(entry->default_value == "true");
+  CHECK(entry->category == "Input");
+  CHECK(entry->description == "Vibration. Send rumble to the controller.");
+  CHECK(entry->audience == rex::cvar::Audience::kPlayer);
+  CHECK(entry->lifecycle == rex::cvar::Lifecycle::kHotReload);
+  CHECK(entry->persistence == rex::cvar::Persistence::kConfig);
+}
+
+TEST_CASE("Vibration gate dispatches zeroes to every assigned driver", "[input]") {
+  RestoreVibration restore;
+  FakeDriver* first = nullptr;
+  auto system = SharedSystem(&first);
+  first->Add(1);
+  first->Add(2);
+  auto owned = std::make_unique<FakeDriver>();
+  FakeDriver* second = owned.get();
+  second->Add(3);
+  second->Add(4, true);
+  system->AddDriver(std::move(owned));
+
+  X_INPUT_VIBRATION request = {};
+  request.left_motor_speed = 1234;
+  request.right_motor_speed = 5678;
+  for (const bool enabled : {true, false, true}) {
+    REQUIRE(rex::cvar::SetFlagByName("input_vibration", enabled ? "true" : "false"));
+    REQUIRE(system->SetState(0, &request) == X_ERROR_SUCCESS);
+    for (const auto* driver : {first, second}) {
+      REQUIRE(driver->vibrations.size() == 2);
+      for (const auto& [id, vibration] : driver->vibrations) {
+        CHECK(static_cast<uint16_t>(vibration.left_motor_speed) == (enabled ? 1234 : 0));
+        CHECK(static_cast<uint16_t>(vibration.right_motor_speed) == (enabled ? 5678 : 0));
+      }
+    }
+    CHECK(static_cast<uint16_t>(request.left_motor_speed) == 1234);
+    CHECK(static_cast<uint16_t>(request.right_motor_speed) == 5678);
+  }
+  CHECK(first->vibration_calls == 6);
+  CHECK(second->vibration_calls == 6);
+}
+
+TEST_CASE("Vibration gate preserves driver results and disconnected users", "[input]") {
+  RestoreVibration restore;
+  REQUIRE(rex::cvar::SetFlagByName("input_vibration", "false"));
+  FakeDriver* first = nullptr;
+  auto system = SharedSystem(&first);
+  auto owned = std::make_unique<FakeDriver>();
+  FakeDriver* second = owned.get();
+  system->AddDriver(std::move(owned));
+  X_INPUT_VIBRATION request = {};
+
+  SECTION("no devices") {
+    CHECK(system->SetState(0, &request) == X_ERROR_DEVICE_NOT_CONNECTED);
+  }
+  SECTION("synthetic only") {
+    first->Add(1, true);
+    CHECK(system->SetState(0, &request) == X_ERROR_SUCCESS);
+  }
+  SECTION("synthetic success does not hide pad failure") {
+    first->Add(1);
+    first->vibration_result = X_ERROR_FUNCTION_FAILED;
+    second->Add(2, true);
+    CHECK(system->SetState(0, &request) == X_ERROR_FUNCTION_FAILED);
+  }
+  SECTION("one successful pad is enough") {
+    first->Add(1);
+    first->vibration_result = X_ERROR_FUNCTION_FAILED;
+    second->Add(2);
+    CHECK(system->SetState(0, &request) == X_ERROR_SUCCESS);
+  }
+  first->Add(10);
+  CHECK(system->SetState(1, &request) == X_ERROR_DEVICE_NOT_CONNECTED);
+  InputSystem unassigned(nullptr);
+  CHECK(unassigned.SetState(0, &request) == X_ERROR_DEVICE_NOT_CONNECTED);
 }

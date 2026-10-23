@@ -199,10 +199,9 @@ void AudioSystem::Shutdown() {
   worker_running_ = false;
   shutdown_event_->Set();
   if (worker_thread_) {
-    // The worker may be stuck inside a guest callback that is itself blocked on
-    // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
-    // resort. Give it a chance to unwind first: TerminateThread abandons any
-    // lock the thread holds, including the CRT heap lock.
+    // A worker may block in a guest callback (e.g. KeWaitForMultipleObjects),
+    // so wait before last-resort termination: TerminateThread abandons held
+    // locks, including the CRT heap lock.
     rex::thread::Thread* host_thread = worker_thread_->thread();
     bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
                                      rex::thread::WaitResult::kSuccess;

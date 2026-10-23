@@ -28,6 +28,8 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(input_vibration, true, "Input", "Vibration. Send rumble to the controller.")
+    .audience(rex::cvar::Audience::kPlayer);
 namespace rex::input {
 
 namespace {
@@ -106,10 +108,9 @@ void InputSystem::RefreshDevices() {
     changed = true;
   }
 
-  // Runs after the carry-forward pass so a new device cannot take an ordinal a
-  // live one is still holding. Lowest free rather than a growing counter,
-  // because a reconnected pad arrives as a new device and would otherwise walk
-  // off the end of the guest users.
+  // After carry-forward, assign a new device the lowest free ordinal so it
+  // cannot take one a live device holds; reconnects are new devices and a
+  // growing counter could exceed guest users.
   for (size_t i = 0; i < seen.size(); i++) {
     if (!fresh[i]) {
       continue;
@@ -260,6 +261,12 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
+
+  // Dispatch zeroes too, so disabling vibration stops an already running motor.
+  X_INPUT_VIBRATION silent = {};
+  if (!REXCVAR_GET(input_vibration)) {
+    vibration = &silent;
+  }
 
   // Every pad on this user belongs to the same player, so all of them buzz.
   // Only pads decide the result: synthetic devices accept any vibration and
