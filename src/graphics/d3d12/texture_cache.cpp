@@ -14,7 +14,9 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <new>
 #include <utility>
 
 #include <rex/assert.h>
@@ -31,6 +33,8 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+#include "frame_input_sampler.h"
 
 namespace rex::graphics::d3d12 {
 
@@ -766,6 +770,206 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
 }
 
+D3D12TextureCache::TextureCaptureResult D3D12TextureCache::GetActiveTextureCaptureIdentity(
+    const D3D12Shader::TextureBinding& host_shader_binding,
+    TextureCaptureIdentity& identity_out) const {
+  identity_out = {};
+  const uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
+  if (fetch_constant_index >= xenos::kTextureFetchConstantCount) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  if (!AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension) ||
+      (binding->key.dimension != xenos::DataDimension::k2DOrStacked &&
+       binding->key.dimension != xenos::DataDimension::kCube)) {
+    return TextureCaptureResult::kUnsupported;
+  }
+  if (binding->key.scaled_resolve) {
+    return TextureCaptureResult::kResolutionScale;
+  }
+
+  Texture* texture = nullptr;
+  if (host_shader_binding.is_signed) {
+    if (!texture_util::IsAnySignSigned(binding->swizzled_signs)) {
+      return TextureCaptureResult::kUnresolved;
+    }
+    texture =
+        IsSignedVersionSeparateForFormat(binding->key) ? binding->texture_signed : binding->texture;
+  } else {
+    if (!texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
+      return TextureCaptureResult::kUnresolved;
+    }
+    texture = binding->texture;
+  }
+  if (!texture) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
+  ID3D12Resource* source = d3d12_texture->resource();
+  if (!source) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      source_desc.DepthOrArraySize == 0 || source_desc.MipLevels == 0 ||
+      source_desc.Width > UINT32_MAX || source_desc.Height > UINT32_MAX) {
+    return TextureCaptureResult::kUnsupported;
+  }
+  identity_out.texture_instance_id = texture->instance_id();
+  identity_out.content_generation = texture->content_generation();
+  return TextureCaptureResult::kCaptured;
+}
+
+D3D12TextureCache::TextureCaptureResult D3D12TextureCache::ScheduleActiveTextureCapture(
+    const D3D12Shader::TextureBinding& host_shader_binding, TextureCaptureReadback& capture_out,
+    uint64_t max_readback_bytes) {
+  capture_out = {};
+  TextureCaptureIdentity identity;
+  const TextureCaptureResult identity_result =
+      GetActiveTextureCaptureIdentity(host_shader_binding, identity);
+  if (identity_result != TextureCaptureResult::kCaptured) {
+    return identity_result;
+  }
+  const uint32_t fetch_constant_index = host_shader_binding.fetch_constant;
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  Texture* texture = host_shader_binding.is_signed
+                         ? (IsSignedVersionSeparateForFormat(binding->key) ? binding->texture_signed
+                                                                           : binding->texture)
+                         : binding->texture;
+  if (!texture) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
+  ID3D12Resource* source = d3d12_texture->resource();
+  if (!source) {
+    return TextureCaptureResult::kUnresolved;
+  }
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  const uint64_t subresource_count = uint64_t(source_desc.MipLevels) * source_desc.DepthOrArraySize;
+  if (!subresource_count || subresource_count > UINT_MAX) {
+    return TextureCaptureResult::kUnsupported;
+  }
+
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+  std::vector<UINT> row_counts;
+  std::vector<UINT64> row_sizes;
+  try {
+    footprints.resize(size_t(subresource_count));
+    row_counts.resize(size_t(subresource_count));
+    row_sizes.resize(size_t(subresource_count));
+  } catch (const std::bad_alloc&) {
+    return TextureCaptureResult::kFailed;
+  }
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&source_desc, 0, UINT(subresource_count), 0, footprints.data(),
+                                row_counts.data(), row_sizes.data(), &buffer_size);
+  if (!buffer_size || buffer_size > UINT32_MAX ||
+      std::any_of(row_counts.cbegin(), row_counts.cend(), [](UINT count) { return count == 0; }) ||
+      std::any_of(row_sizes.cbegin(), row_sizes.cend(),
+                  [](UINT64 size) { return size == 0 || size > UINT32_MAX; })) {
+    return TextureCaptureResult::kUnsupported;
+  }
+  if (buffer_size > max_readback_bytes) {
+    return TextureCaptureResult::kReadbackBudget;
+  }
+
+  const TextureKey& key = texture->key();
+  diagnostic::DrawCaptureTexture& texture_out = capture_out.texture;
+  texture_out.guest_base_page = key.base_page;
+  texture_out.guest_mip_page = key.mip_page;
+  texture_out.guest_width = key.GetWidth();
+  texture_out.guest_height = key.GetHeight();
+  texture_out.guest_depth_or_array_size = key.GetDepthOrArraySize();
+  texture_out.guest_pitch = key.pitch;
+  texture_out.guest_format = uint32_t(key.format);
+  texture_out.guest_endianness = uint32_t(key.endianness);
+  texture_out.guest_tiled = key.tiled;
+  texture_out.guest_packed_mips = key.packed_mips;
+  texture_out.scaled_resolve = key.scaled_resolve;
+  texture_out.host_format = uint32_t(source_desc.Format);
+  texture_out.host_width = uint32_t(source_desc.Width);
+  texture_out.host_height = uint32_t(source_desc.Height);
+  texture_out.host_depth_or_array_size = source_desc.DepthOrArraySize;
+  texture_out.host_mip_levels = source_desc.MipLevels;
+  texture_out.texture_instance_id = identity.texture_instance_id;
+  texture_out.content_generation = identity.content_generation;
+  texture_out.mip_level = 0;
+  texture_out.row_pitch = footprints[0].Footprint.RowPitch;
+  texture_out.row_size = uint32_t(row_sizes[0]);
+  texture_out.row_count = row_counts[0];
+  try {
+    capture_out.subresources.reserve(size_t(subresource_count));
+    texture_out.subresources.reserve(size_t(subresource_count));
+    for (UINT array_slice = 0; array_slice < source_desc.DepthOrArraySize; ++array_slice) {
+      for (UINT mip_level = 0; mip_level < source_desc.MipLevels; ++mip_level) {
+        const UINT subresource = mip_level + array_slice * source_desc.MipLevels;
+        TextureCaptureSubresource& captured = capture_out.subresources.emplace_back();
+        captured.footprint = footprints[subresource];
+        captured.mip_level = mip_level;
+        captured.array_slice = array_slice;
+        captured.row_count = row_counts[subresource];
+        captured.row_size = uint32_t(row_sizes[subresource]);
+        diagnostic::DrawCaptureTextureSubresource& output = texture_out.subresources.emplace_back();
+        output.mip_level = mip_level;
+        output.array_slice = array_slice;
+        output.host_width = std::max(uint32_t(source_desc.Width) >> mip_level, uint32_t(1));
+        output.host_height = std::max(uint32_t(source_desc.Height) >> mip_level, uint32_t(1));
+        output.row_pitch = footprints[subresource].Footprint.RowPitch;
+        output.row_size = captured.row_size;
+        output.row_count = captured.row_count;
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    return TextureCaptureResult::kFailed;
+  }
+
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return TextureCaptureResult::kFailed;
+  }
+
+  texture->MarkAsUsed();
+  capture_out.identity = identity;
+  capture_out.source_resource = source;
+  const D3D12_RESOURCE_STATES previous_state =
+      d3d12_texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(source, previous_state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (UINT subresource = 0; subresource < UINT(subresource_count); ++subresource) {
+    destination.PlacedFootprint = footprints[subresource];
+    source_location.SubresourceIndex = subresource;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&destination, 0, 0, 0,
+                                                                     &source_location, nullptr);
+  }
+  d3d12_texture->SetResourceState(previous_state);
+  command_processor_.PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                           previous_state);
+  command_processor_.SubmitBarriers();
+
+  capture_out.buffer_size = uint32_t(buffer_size);
+  capture_out.buffer = std::move(capture_buffer);
+  return TextureCaptureResult::kCaptured;
+}
+
 bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(
     const TextureSRVKey* keys, const D3D12Shader::TextureBinding* host_shader_bindings,
     size_t host_shader_binding_count) const {
@@ -927,68 +1131,8 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
 
 D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     const D3D12Shader::SamplerBinding& binding) const {
-  const auto& regs = register_file();
-  xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
-
-  SamplerParameters parameters;
-
-  xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;
-  texture_util::GetClampModesForDimension(fetch, fetch_clamp_x, fetch_clamp_y, fetch_clamp_z);
-  parameters.clamp_x = NormalizeClampMode(fetch_clamp_x);
-  parameters.clamp_y = NormalizeClampMode(fetch_clamp_y);
-  parameters.clamp_z = NormalizeClampMode(fetch_clamp_z);
-  if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
-      xenos::ClampModeUsesBorder(parameters.clamp_y) ||
-      xenos::ClampModeUsesBorder(parameters.clamp_z)) {
-    parameters.border_color = fetch.border_color;
-  } else {
-    parameters.border_color = xenos::BorderColor::k_ABGR_Black;
-  }
-
-  uint32_t mip_min_level, mip_max_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                                 &mip_min_level, &mip_max_level);
-  parameters.mip_min_level = mip_min_level;
-  bool has_mips = mip_max_level > mip_min_level;
-
-  xenos::TextureFilter mag_filter = binding.mag_filter == xenos::TextureFilter::kUseFetchConst
-                                        ? fetch.mag_filter
-                                        : binding.mag_filter;
-  xenos::TextureFilter min_filter = binding.min_filter == xenos::TextureFilter::kUseFetchConst
-                                        ? fetch.min_filter
-                                        : binding.min_filter;
-  xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
-                                        ? fetch.mip_filter
-                                        : binding.mip_filter;
-  bool min_mag_linear = (mag_filter == xenos::TextureFilter::kLinear) &&
-                        (min_filter == xenos::TextureFilter::kLinear);
-  bool mip_filter_bilinear_or_trilinear =
-      mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear;
-  bool mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
-
-  // TODO(Triang3l): Disable filtering for texture formats not supporting it.
-  xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
-                                        ? fetch.aniso_filter
-                                        : binding.aniso_filter;
-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
-  if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips && !mip_base_map &&
-      min_mag_linear && mip_filter_bilinear_or_trilinear) {
-    aniso_filter = xenos::AnisoFilter(anisotropic_override);
-  }
-  aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
-  parameters.aniso_filter = aniso_filter;
-  if (aniso_filter != xenos::AnisoFilter::kDisabled) {
-    parameters.mag_linear = 1;
-    parameters.min_linear = 1;
-    parameters.mip_linear = 1;
-  } else {
-    parameters.mag_linear = mag_filter == xenos::TextureFilter::kLinear;
-    parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
-    parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
-  }
-  parameters.mip_base_map = mip_base_map;
-
-  return parameters;
+  return GetFrameInputSamplerParameters(register_file(), binding,
+                                        REXCVAR_GET(anisotropic_override));
 }
 
 void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
@@ -1888,6 +2032,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
   copy_buffer_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
   command_processor_.SubmitBarriers();
+  command_processor_.CaptureTextureLoadScratch(copy_buffer, uint32_t(copy_buffer_size));
   uint32_t texture_level_count = texture_key.mip_max_level + 1;
   D3D12_TEXTURE_COPY_LOCATION location_source, location_dest;
   location_source.pResource = copy_buffer;

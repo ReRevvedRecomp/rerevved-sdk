@@ -29,15 +29,15 @@ class ByteStream;
 namespace rex::memory::detail {
 
 /// Compensates for host allocation granularity coarser than 4KB on the 0xE0
-/// physical heap. When the granularity exceeds 0x1000, the backing file maps the
-/// 0xE0 heap at a 0x1000-byte offset that the mapping API rounds away (Windows
-/// MapViewOfFileEx rounds down to 64KB; macOS arm64 uses 16KB pages), so guest
-/// accesses must add it back. This must agree with Memory::MapViews, which only
-/// sets host_address_offset when allocation_granularity() > 0x1000:
-///   - Windows:        64KB granularity  -> offset
-///   - macOS arm64:    16KB granularity  -> offset
-///   - macOS x86_64:    4KB granularity  -> no offset
-///   - Linux (any):     4KB granularity  -> no offset (mmap handles it natively)
+///   physical heap. When the granularity exceeds 0x1000, the backing file maps
+///   the 0xE0 heap at a 0x1000-byte offset that the mapping API rounds away
+///   (Windows MapViewOfFileEx rounds down to 64KB; macOS arm64 uses 16KB
+///   pages), so guest accesses must add it back. This must agree with
+///   Memory::MapViews, which only sets host_address_offset when
+///   allocation_granularity() > 0x1000: - Windows:        64KB granularity  ->
+///   offset - macOS arm64:    16KB granularity  -> offset - macOS x86_64:
+///   4KB granularity  -> no offset - Linux (any):     4KB granularity  -> no
+///   offset (mmap handles it natively)
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
 #if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
@@ -234,25 +234,14 @@ class BaseHeap {
   // AcquireHostPageReconcileLock.
   bool SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_number);
 
-  // Acquires the global critical region for operations that will run the host
-  // page reconcile pass, which reads watch state guarded by it.
-  //
-  // It must be taken before heap_mutex_, not partway through: mutex.h requires
-  // the global region to be acquired first and held longest, and
-  // PhysicalHeap::Decommit/Release/Protect already call down into BaseHeap
-  // with it held. Acquiring it inside SyncHostPageAccess instead would give
-  // those paths heap_mutex_ -> global while PhysicalHeap has global ->
-  // heap_mutex_, which deadlocks.
-  //
-  // Returns an empty (unlocked) guard when guest pages are at least host page
-  // sized, since no reconcile happens then and the lock would be pure cost.
+  // Acquire the global critical region before heap_mutex_ and hold it longest
+  // (mutex.h/PhysicalHeap); taking it in SyncHostPageAccess inverts locks.
+  // Guest pages >= host size return an unlocked guard.
   virtual std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const;
 
-  // Whether a host page is currently write-watched for guest invalidation.
-  // SyncHostPageAccess must not restore write access to such a page: the watch
-  // is recorded in a flag that EnableAccessCallbacks checks before re-applying
-  // protection, so silently unprotecting here would disable the watch forever.
-  // Only PhysicalHeap tracks this; every other heap has no watch state.
+  // PhysicalHeap tracks host-page watches; EnableAccessCallbacks skips
+  // notify_on_invalidation pages. SyncHostPageAccess must keep write protection
+  // or permanently lose the watch.
   virtual bool IsHostPageWriteWatched(uint32_t host_page_number) const { return false; }
 
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
@@ -315,6 +304,10 @@ class PhysicalHeap : public BaseHeap {
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers);
+  // Whether any, or every, system page of a physical range is watched in this
+  // view; pages outside the view count as watched for the second.
+  bool IsAnyPageWriteWatched(uint32_t physical_address, uint32_t length) const;
+  bool AreAllPagesWriteWatched(uint32_t physical_address, uint32_t length) const;
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
@@ -322,13 +315,23 @@ class PhysicalHeap : public BaseHeap {
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
+  // Drops the watch flags of a guest range whose host protection was just
+  // replaced and returns whether any page was watched. Under the global
+  // critical region, held since the watchers were told.
+  bool ForgetWatches(uint32_t address, uint32_t size);
+
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+  // The system pages of a physical range in this view; false when none.
+  bool PhysicalSystemPages(uint32_t physical_address, uint32_t length, uint32_t& first,
+                           uint32_t& last) const;
+  // A fresh allocation's view of a watched range is writable now, so its
+  // watchers are told before the flags go. Under the global critical region.
+  void RetireWatches(uint32_t address, uint32_t size);
 
-  // Allocation on these heaps delegates to parent_heap_, whose own reconcile
-  // pass takes the global critical region. Acquire whenever this heap or its
-  // parent will need it, so the ordering holds even for a heap whose own guest
-  // pages are large enough to skip reconciling but whose parent's are not.
+  // Acquire the global critical region when this heap or parent_heap_ needs
+  // reconciliation. Parent allocation may require it when this heap skips
+  // host-page-sized pages, so keep the ordering.
   std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const override;
 
   VirtualHeap* parent_heap_;
@@ -340,6 +343,9 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Watched pages a watch made read-only although this view grants no write
+    // to them; unwatching makes them writable again.
+    uint64_t restore_write_on_unwatch;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -448,13 +454,15 @@ class Memory {
   // Once callbacks are triggered for a page, the page is not watched anymore
   // until requested again later. It is, however, unwatched only in one guest
   // view of physical memory (because different views may have different
-  // protection for the same memory) - but it's rare when the same memory is
-  // used with different guest page sizes, and it's okay to fire a callback more
-  // than once.
+  // protection for the same memory), and it's okay to fire a callback more
+  // than once. A watch covers the page in every guest view, including views
+  // that do not map it: a store through any of them reaches the same bytes.
   //
   // Only accessing the guest virtual memory views of physical memory triggers
   // callbacks - data providers, for instance, must write to the host physical
   // heap directly, otherwise their threads may infinitely await themselves.
+  // Host code that writes guest bytes through the physical view reports the
+  // write with NotifyPhysicalWrite.
   //
   // - Invalidation notifications:
   //
@@ -500,6 +508,25 @@ class Memory {
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
+  // Whether every system page of a physical range is watched in every guest
+  // view, so the next write to it through any view calls the invalidation
+  // callbacks. Host writes through the physical view report themselves with
+  // NotifyPhysicalWrite.
+  bool IsPhysicalRangeWriteWatched(uint32_t physical_address, uint32_t length);
+
+  // Calls every invalidation callback for the system pages of a physical range
+  // that host code wrote through the physical view, when any of those pages is
+  // watched in a guest view. Protection and watches are left as they are.
+  void NotifyPhysicalWrite(uint32_t physical_address, uint32_t length);
+
+  // For a write the host OS makes into guest memory, such as a socket receive:
+  // the OS fails instead of faulting on a watched page. When the whole range is
+  // in one physical heap and the guest may write it, returns the physical view,
+  // which watches never protect, and sets physical_address so the caller can
+  // NotifyPhysicalWrite what was written. Otherwise returns the guest view and
+  // sets physical_address to UINT32_MAX.
+  uint8_t* TranslateForHostWrite(uint32_t guest_address, uint32_t length,
+                                 uint32_t* physical_address);
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was

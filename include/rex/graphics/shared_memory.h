@@ -34,6 +34,11 @@ class SharedMemory {
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
 
+  template <typename T = const uint8_t*>
+  T TranslatePhysical(uint32_t guest_address) const {
+    return memory().TranslatePhysical<T>(guest_address);
+  }
+
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
                                       bool invalidated_by_gpu);
@@ -94,6 +99,11 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+
+  // Whether any page still contains GPU-owned data. CPU invalidation clears
+  // this ownership, so a reused address does not retain an old resolve label.
+  // Invalid or uninitialized ranges are conservatively GPU-owned.
+  bool IsRangeWrittenByGpu(uint32_t start, uint32_t length);
 
  protected:
   SharedMemory(memory::Memory& memory);
