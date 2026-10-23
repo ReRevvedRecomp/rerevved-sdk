@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include <rex/kernel/xam/module.h>
+#include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xsocket.h>
@@ -76,6 +77,23 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
     return X_STATUS_SUCCESS;
   }
 
+  // Guest SOL_SOCKET values are big-endian: SO_LINGER is two 16-bit fields and
+  // other 32-bit values are integers. Other levels may carry network-order
+  // addresses, so they and other lengths pass through unchanged.
+  const bool guest_socket_value = level == 0xFFFF && optval_ptr;
+  int native_value = 0;
+  linger native_linger{};
+  if (guest_socket_value && optname == 0x0080 && optlen == 2 * sizeof(uint16_t)) {
+    native_linger.l_onoff = memory::load_and_swap<uint16_t>(optval_ptr);
+    native_linger.l_linger =
+        memory::load_and_swap<uint16_t>(static_cast<uint8_t*>(optval_ptr) + sizeof(uint16_t));
+    optval_ptr = &native_linger;
+    optlen = sizeof(native_linger);
+  } else if (guest_socket_value && optlen == sizeof(uint32_t)) {
+    native_value = static_cast<int>(memory::load_and_swap<uint32_t>(optval_ptr));
+    optval_ptr = &native_value;
+  }
+
   int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
   if (ret < 0) {
     // TODO: WSAGetLastError()
@@ -84,7 +102,7 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
 
   // SO_BROADCAST
   if (level == 0xFFFF && optname == 0x0020) {
-    broadcast_socket_ = true;
+    broadcast_socket_ = optval_ptr == &native_value ? native_value != 0 : true;
   }
 
   return X_STATUS_SUCCESS;
@@ -118,6 +136,23 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   bound_ = true;
   bound_port_ = name->sin_port;
 
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS XSocket::GetSockName(N_XSOCKADDR_IN* name, uint32_t* name_len) {
+  sockaddr_in native_name{};
+  socklen_t native_name_len = sizeof(native_name);
+  int ret =
+      getsockname(native_handle_, reinterpret_cast<sockaddr*>(&native_name), &native_name_len);
+  if (ret < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  name->sin_family = native_name.sin_family;
+  name->sin_port = ntohs(native_name.sin_port);
+  name->sin_addr = ntohl(native_name.sin_addr.s_addr);
+  std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  *name_len = native_name_len;
   return X_STATUS_SUCCESS;
 }
 
@@ -186,14 +221,14 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   }
   */
 
-  sockaddr_in nfrom;
+  sockaddr_in nfrom{};
   socklen_t nfromlen = sizeof(sockaddr_in);
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                      (sockaddr*)&nfrom, &nfromlen);
   if (from) {
     from->sin_family = nfrom.sin_family;
     from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    from->sin_port = ntohs(nfrom.sin_port);
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -221,11 +256,11 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   }
   */
 
-  sockaddr_in nto;
+  sockaddr_in nto{};
   if (to) {
-    nto.sin_addr.s_addr = to->sin_addr;
+    nto.sin_addr.s_addr = htonl(static_cast<uint32_t>(to->sin_addr));
     nto.sin_family = to->sin_family;
-    nto.sin_port = to->sin_port;
+    nto.sin_port = htons(static_cast<uint16_t>(to->sin_port));
   }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
