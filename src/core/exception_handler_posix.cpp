@@ -66,7 +66,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
 #if REX_PLATFORM_MAC
   thread_context.rip = uint64_t(mcontext->__ss.__rip);
   thread_context.eflags = uint32_t(mcontext->__ss.__rflags);
-  // TODO (Graine25): Double check this one for me
+
   thread_context.rax = uint64_t(mcontext->__ss.__rax);
   thread_context.rcx = uint64_t(mcontext->__ss.__rcx);
   thread_context.rdx = uint64_t(mcontext->__ss.__rdx);

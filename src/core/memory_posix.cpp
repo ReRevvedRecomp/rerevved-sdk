@@ -258,10 +258,9 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
-    // On macOS, MAP_FIXED_NOREPLACE is unavailable. kCommit on a pre-reserved
-    // range uses mprotect to avoid clobbering the existing reservation. Do not
-    // widen sub-host-page requests here - higher-level guest heaps must reconcile
-    // all guest permissions sharing a host page first.
+    // macOS lacks MAP_FIXED_NOREPLACE; kCommit uses mprotect on pre-reserved
+    // ranges to avoid clobbering them. Do not widen sub-host-page requests:
+    // higher-level guest heaps reconcile shared host-page permissions.
 #if REX_PLATFORM_MAC
   if (base_address != nullptr && allocation_type == AllocationType::kCommit) {
     const size_t host_page = page_size();
@@ -472,7 +471,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       assert_always();
       return kFileMappingHandleInvalid;
   }
-  oflag |= O_CREAT;
+  // O_EXCL: an existing shm name belongs to another mapping and must not be shared.
+  oflag |= O_CREAT | O_EXCL;
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {

@@ -1,8 +1,4 @@
-/**
- * Unit tests for FileHandle::OpenExisting access mode handling.
- *
- * Covers the host-side handle only; guest path translation is out of scope.
- */
+
 
 #include <array>
 #include <cstdint>

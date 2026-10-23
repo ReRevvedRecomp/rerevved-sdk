@@ -46,6 +46,12 @@ namespace rex {
  * Creates shared sinks and loggers for all built-in categories.
  * Safe to call multiple times; subsequent calls update levels only.
  *
+ * The first call also installs a best-effort crash report: std::terminate
+ * and, on Windows, unhandled exceptions and abort are logged at critical level
+ * and flushed, and an unhandled exception writes a small minidump beside the
+ * log file with the same stem and a .dmp extension. MSVC terminate handlers
+ * are per thread, so other Windows threads report only the abort.
+ *
  * @param config  Logging configuration.
  */
 void InitLogging(const LogConfig& config);
@@ -79,6 +85,15 @@ void ShutdownLogging();
  * concurrent logger cannot hit freed state.
  */
 void FlushLogging();
+
+/**
+ * Get the absolute path of the active log file.
+ *
+ * Rotation keeps writing to this path. Thread-safe.
+ *
+ * @return  The file sink's path, or empty when logging has no file sink.
+ */
+std::filesystem::path GetLogFilePath();
 
 /**
  * Register a new log category at runtime.
