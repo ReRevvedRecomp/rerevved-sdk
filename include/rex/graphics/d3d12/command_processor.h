@@ -15,15 +15,19 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/diagnostic_draw_capture.h>
+#include <rex/graphics/draw_capture_mailbox.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -42,7 +46,16 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+namespace rex::graphics {
+class FrameInputBufferVersions;
+class FrameInputNativeSourceRejections;
+class FrameInputNativeSources;
+}  // namespace rex::graphics
+
 namespace rex::graphics::d3d12 {
+
+class D3D12Shader;
+class FrameCapture;
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
@@ -177,6 +190,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // by its user.
   void ReleaseScratchGPUBuffer(ID3D12Resource* buffer, D3D12_RESOURCE_STATES new_state);
 
+  // Diagnostic-only one-shot capture of the texture-load scratch buffer.
+  void ArmTextureLoadScratchCapture(const std::filesystem::path& path);
+  void CaptureTextureLoadScratch(ID3D12Resource* buffer, uint32_t size);
+  std::filesystem::path GetSwapTextureCapturePath() const;
+  ID3D12Resource* RequestDiagnosticBufferCapture(const std::filesystem::path& path, uint32_t size);
+
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
@@ -207,10 +226,145 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
 
+  void OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+
+  void PollDrawCaptureArmMarker();
+  void PollLiveFrameCaptureRequest();
+  void ReportDrawCaptureSkipCounts();
+  bool ScheduleDrawCapture(const PrimitiveProcessor::ProcessingResult& result,
+                           xenos::PrimitiveType primitive_type, uint32_t index_count,
+                           const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                           D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader,
+                           D3D12Shader* pixel_shader, uint32_t used_texture_mask,
+                           uint32_t normalized_color_mask,
+                           diagnostic::DrawCaptureMailbox::Token mailbox_token);
+  void FinalizeDrawCapture();
+  void FailPendingDrawCaptureMailbox();
+  void RetainDrawCaptureBuffersForRetry();
+  void AbandonDrawCaptureBuffersForTeardown();
+  void RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason);
+  void WriteDrawCaptureFailureManifest(const char* reason);
+
+  struct LiveFrameVertexReadback {
+    uint32_t fetch_constant = 0;
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  struct LiveFrameIndexReadback {
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  struct LiveFrameCopyReadback {
+    uint64_t event_id = 0;
+    uint32_t fetch_constant = 0;
+    uint32_t base = 0;
+    uint32_t size = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    std::vector<uint8_t> cpu_bytes;
+  };
+  struct LiveFrameTextureReadback {
+    diagnostic::DrawCaptureTextureUse use;
+    uint32_t capture_index = UINT32_MAX;
+  };
+  struct LiveFrameTextureCapture {
+    D3D12TextureCache::TextureCaptureReadback capture;
+    uint32_t snapshot_index = UINT32_MAX;
+  };
+  struct LiveFrameDraw {
+    uint64_t event_id = 0;
+    bool texture_bindings_complete = true;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+    diagnostic::DrawCaptureAvailability index_acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason index_acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+    std::vector<LiveFrameVertexReadback> vertex_fetches;
+    std::optional<LiveFrameIndexReadback> index;
+    std::vector<LiveFrameTextureReadback> textures;
+  };
+  struct LiveFrameDrawScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
+  struct LiveFrameCopyScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
+  struct LiveFrameSurfaceScheduleResult {
+    bool fatal = false;
+    diagnostic::DrawCaptureAvailability acquisition =
+        diagnostic::DrawCaptureAvailability::kComplete;
+    diagnostic::DrawCaptureReason acquisition_reason = diagnostic::DrawCaptureReason::kNone;
+  };
+  struct LiveFrameTextureReadbackSurface {
+    Microsoft::WRL::ComPtr<ID3D12Resource> source_resource;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    uint32_t row_count = 0;
+    uint32_t row_size = 0;
+    uint32_t buffer_size = 0;
+  };
+  struct LiveFrameCapture {
+    diagnostic::DrawCaptureMailbox::Token mailbox_token;
+    std::vector<LiveFrameDraw> draws;
+    std::vector<LiveFrameTextureCapture> texture_captures;
+    std::unordered_map<D3D12TextureCache::TextureCaptureIdentity, uint32_t,
+                       D3D12TextureCache::TextureCaptureIdentity::Hasher>
+        texture_capture_indices;
+    std::vector<LiveFrameCopyReadback> copies;
+    LiveFrameTextureReadbackSurface source;
+    LiveFrameTextureReadbackSurface output;
+    uint64_t source_submission = 0;
+    uint64_t output_submission = 0;
+    uint64_t readback_bytes = 0;
+    uint64_t frontbuffer_ptr = 0;
+    uint32_t source_format = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t output_format = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    diagnostic::DrawCaptureAvailability source_acquisition =
+        diagnostic::DrawCaptureAvailability::kUnavailable;
+    diagnostic::DrawCaptureReason source_acquisition_reason = diagnostic::DrawCaptureReason::kSwap;
+    diagnostic::DrawCaptureAvailability output_acquisition =
+        diagnostic::DrawCaptureAvailability::kUnavailable;
+    diagnostic::DrawCaptureReason output_acquisition_reason = diagnostic::DrawCaptureReason::kSwap;
+    diagnostic::DrawCaptureGamma gamma;
+  };
+
+  LiveFrameDrawScheduleResult ScheduleLiveFrameDraw(
+      uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
+      const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader,
+      D3D12Shader* pixel_shader, uint32_t used_texture_mask, bool memexport_used,
+      bool pixel_shader_was_bound);
+  LiveFrameCopyScheduleResult ScheduleLiveFrameCopy(uint64_t event_id);
+  LiveFrameSurfaceScheduleResult ScheduleLiveFrameSwapSource(ID3D12Resource* source,
+                                                             DXGI_FORMAT format, uint32_t width,
+                                                             uint32_t height);
+  LiveFrameSurfaceScheduleResult ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width,
+                                                             uint32_t height);
+  bool BeginLiveFrameCapture(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                             uint32_t frontbuffer_width, uint32_t frontbuffer_height);
+  bool ReadLiveFrameSurface(const LiveFrameTextureReadbackSurface& surface,
+                            std::vector<uint8_t>& bytes) const;
+  bool ReadLiveFrameBuffer(ID3D12Resource* buffer, uint32_t size,
+                           std::vector<uint8_t>& bytes) const;
+  void FinalizeLiveFrameCapture(uint64_t completed_frame, uint64_t completed_submission);
+  void FailLiveFrameCapture(const char* reason);
+  void RetainLiveFrameBuffersForRetry();
+  void AbandonLiveFrameBuffersForTeardown();
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -310,7 +464,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass submission_current_
   // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  bool CheckSubmissionFence(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -318,17 +472,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool BeginSubmission(bool is_guest_command);
   // If is_swap is true, a full frame is closed - with, if needed, cache
   // clearing and stopping capturing. Returns whether the submission was done
-  // successfully, if it has failed, leaves it open.
+  // successfully. A failure before execution leaves it open. A Signal failure
+  // after execution closes it permanently.
   bool EndSubmission(bool is_swap);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
-  }
+  bool AwaitAllQueueOperationsCompletion() { return CheckSubmissionFence(submission_current_); }
+  void HandleFenceFailure(const char* operation, HRESULT operation_result,
+                          bool tracking_is_unrecoverable);
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 
   void UpdateDebugMarkersEnabled();
@@ -365,9 +519,44 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
-  bool IssueCopy_ReadbackResolvePath();
+  bool IssueCopy_ReadbackResolvePath(uint32_t& written_address_out, uint32_t& written_length_out);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+
+  void RefreshFrameInputObserver();
+  struct FrameInputSwapIdentity {
+    diagnostic::DrawCaptureMailbox::ObserverToken token;
+    uint64_t id = 0;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    bool prepared = false;
+  };
+  void DispatchFrameInputDraw(
+      xenos::PrimitiveType primitive_type, uint32_t index_count,
+      const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+      D3D12Shader* vertex_shader, D3D12Shader* pixel_shader, bool original_host_issued = true,
+      diagnostic::DrawCaptureExecutionStatus execution_status =
+          diagnostic::DrawCaptureExecutionStatus::kIssued,
+      diagnostic::DrawCaptureReason execution_reason = diagnostic::DrawCaptureReason::kNone,
+      bool prepared = false);
+  void DispatchFrameInputCopy(std::string_view copy_mode, bool original_succeeded,
+                              uint32_t written_address, uint32_t written_length,
+                              bool prepared = false);
+  void DispatchFrameInputSwap(uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr,
+                              uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                              const FrameInputSwapIdentity* identity = nullptr,
+                              bool prepared = false);
+  void DispatchFrameInputEnd(uint64_t frame, uint64_t submission, bool original_succeeded,
+                             const FrameInputSwapIdentity* identity = nullptr);
+  void RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address, uint32_t length) noexcept;
+  bool IsFrameInputGuestMemoryDirtyLedger(uint32_t physical_address,
+                                          uint32_t length) const noexcept;
+  bool IsFrameInputGuestMemoryDirty(uint32_t physical_address, uint32_t length) const noexcept;
+  bool IsFrameInputGuestMemoryReadable(uint32_t physical_address, uint32_t length) const noexcept;
+  diagnostic::DrawCaptureGuestMemoryVersion GetFrameInputBufferVersion(uint32_t address,
+                                                                       uint32_t size) noexcept;
+  static bool CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
+                                        std::span<uint8_t> destination) noexcept;
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
@@ -425,8 +614,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   HANDLE fence_completion_event_ = nullptr;
 
   bool submission_open_ = false;
+  bool submission_fence_failed_ = false;
   // Values of submission_fence_.
   uint64_t submission_current_ = 1;
+  uint64_t submission_last_signaled_ = 0;
   uint64_t submission_completed_ = 0;
   ID3D12Fence* submission_fence_ = nullptr;
 
@@ -552,6 +743,107 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 
+  std::unique_ptr<FrameCapture> frame_capture_;
+
+  bool texture_load_scratch_capture_armed_ = false;
+  std::filesystem::path texture_load_scratch_capture_path_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> texture_load_scratch_capture_buffer_;
+  uint32_t texture_load_scratch_capture_size_ = 0;
+  uint64_t texture_load_scratch_capture_submission_ = 0;
+  struct DiagnosticBufferCapture {
+    std::filesystem::path path;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint32_t size;
+    uint64_t submission;
+  };
+  std::vector<DiagnosticBufferCapture> diagnostic_buffer_captures_;
+
+  struct DrawCaptureReadback {
+    std::string name;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint32_t size = 0;
+  };
+  struct DrawCapture {
+    std::filesystem::path path;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    uint32_t primitive_type = 0;
+    uint32_t requested_index_count = 0;
+    bool major_mode_explicit = false;
+    bool indexed = false;
+    uint32_t guest_draw_vertex_count = 0;
+    uint32_t host_draw_vertex_count = 0;
+    uint32_t guest_primitive_type = 0;
+    uint32_t host_primitive_type = 0;
+    uint32_t host_vertex_shader_type = 0;
+    uint32_t tessellation_mode = 0;
+    uint32_t guest_index_base = 0;
+    uint32_t guest_index_size = 0;
+    uint32_t guest_index_dma_length = 0;
+    uint32_t guest_index_dma_count = 0;
+    uint32_t guest_index_dma_format = 0;
+    uint32_t guest_index_dma_endianness = 0;
+    uint32_t host_index_format = 0;
+    uint32_t host_shader_index_endian = 0;
+    bool host_primitive_reset_enabled = false;
+    bool color_target_written = false;
+    bool half_pixel_offset = false;
+    uint32_t used_texture_mask = 0;
+    uint32_t normalized_color_mask = 0;
+    D3D12_PRIMITIVE_TOPOLOGY native_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    uint32_t native_vertex_count = 0;
+    uint32_t native_index_count = 0;
+    uint32_t native_instance_count = 1;
+    uint32_t native_start_vertex = 0;
+    uint32_t native_start_index = 0;
+    int32_t native_base_vertex = 0;
+    uint32_t native_start_instance = 0;
+    uint64_t vertex_shader_hash = 0;
+    uint64_t pixel_shader_hash = 0;
+    std::vector<uint32_t> registers;
+    std::vector<uint32_t> vertex_ucode;
+    std::vector<uint32_t> pixel_ucode;
+    diagnostic::DrawCaptureMailbox::Token mailbox_token;
+    std::vector<diagnostic::DrawCaptureRange> vertex_fetch_ranges;
+    std::vector<uint32_t> vertex_fetch_constants;
+    std::vector<DrawCaptureReadback> vertex_fetch_readbacks;
+    DrawCaptureReadback index_readback;
+    DrawCaptureReadback edram_before;
+    DrawCaptureReadback edram_after;
+  };
+  std::optional<DrawCapture> draw_capture_pending_;
+  std::filesystem::path draw_capture_path_;
+  std::string draw_capture_failure_reason_;
+  bool draw_capture_armed_ = false;
+  diagnostic::DrawCaptureMailbox::Token draw_capture_armed_mailbox_token_;
+  bool draw_capture_disarmed_ = false;
+  std::array<uint32_t, size_t(diagnostic::DrawCaptureSkipReason::kCount)>
+      draw_capture_skip_counts_{};
+  uint32_t draw_capture_skip_reports_remaining_ = 0;
+
+  bool live_frame_capture_armed_ = false;
+  diagnostic::DrawCaptureMailbox::Token live_frame_capture_armed_mailbox_token_;
+  std::optional<LiveFrameCapture> live_frame_capture_;
+
+  // This is a stream token, independent of the legacy capture request token.
+  // Event IDs are only meaningful within the active observer registration.
+  diagnostic::DrawCaptureMailbox::ObserverToken frame_input_observer_token_;
+  FrameInputSwapIdentity frame_input_pending_swap_;
+  uint64_t frame_input_next_event_id_ = 1;
+  bool frame_input_frame_open_ = false;
+  bool frame_input_prepared_draws_ = false;
+  std::unique_ptr<FrameInputBufferVersions> frame_input_buffer_versions_;
+  std::unique_ptr<FrameInputNativeSourceRejections> frame_input_native_source_rejections_;
+  std::unique_ptr<FrameInputNativeSources> frame_input_native_sources_;
+  bool frame_input_native_sources_failed_ = false;
+  uint32_t frame_input_native_source_address_ = 0;
+  uint32_t frame_input_native_source_length_ = 0;
+  uint64_t frame_input_native_source_generation_ = 0;
+  // GPU writes that may make later CPU input views stale. Generated texture
+  // bindings can still bypass the reader when their copy destination matches.
+  std::vector<std::pair<uint32_t, uint32_t>> frame_input_guest_memory_dirty_ranges_;
+  bool frame_input_guest_memory_dirty_all_ = false;
+
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
   // Bytes 0x400...0x9FF - 128-entry PWL R16G16 gamma ramp (R - base, G - delta,
@@ -636,6 +928,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> submission_retry_resources_;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

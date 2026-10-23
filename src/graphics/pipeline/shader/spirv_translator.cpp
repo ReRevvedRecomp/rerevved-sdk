@@ -519,10 +519,9 @@ void SpirvShaderTranslator::StartTranslation() {
       var_main_rectangle_guest_vertex_index_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
-      // Keep the interpolated gl_PerVertex members in plain function-local
-      // arrays - the block type's BuiltIn and ArrayStride decorations are only
-      // valid in Input and Output storage. Desktop drivers accept it anyway,
-      // MoltenVK's SPIRV-Cross does not.
+      // Keep interpolated gl_PerVertex members in function-local arrays:
+      // BuiltIn and ArrayStride are valid only in Input/Output storage. Desktop
+      // drivers accept the block, but MoltenVK's SPIRV-Cross does not.
       spv::Id type_rectangle_per_vertex_array =
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(3), 0);
       var_main_rectangle_per_vertex_ =

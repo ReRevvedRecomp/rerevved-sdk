@@ -25,6 +25,73 @@
 namespace rex::graphics {
 using namespace ucode;
 
+void ParsedTextureFetchInstruction::SamplerOverrides::Normalize() {
+  if (aniso_filter != xenos::AnisoFilter::kDisabled &&
+      aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
+    mag_filter = min_filter = mip_filter = xenos::TextureFilter::kLinear;
+    aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
+  }
+}
+
+ParsedTextureFetchInstruction::SamplerOverrides ParsedTextureFetchInstruction::GetSamplerOverrides(
+    bool is_pixel_shader) const {
+  SamplerOverrides result{
+      attributes.mag_filter, attributes.min_filter, attributes.mip_filter,
+      UsesComputedLod(is_pixel_shader) ? attributes.aniso_filter : xenos::AnisoFilter::kDisabled};
+  result.Normalize();
+  return result;
+}
+
+bool Shader::PrepareTextureBindings(const std::vector<TextureBinding>& bindings,
+                                    bool is_pixel_shader,
+                                    std::vector<PreparedTextureBinding>& output,
+                                    std::vector<PreparedSamplerBinding>& samplers) {
+  output.clear();
+  samplers.clear();
+  for (const auto& binding : bindings) {
+    const auto& instruction = binding.fetch_instr;
+    if (!instruction.GetNonZeroResultComponents()) {
+      continue;
+    }
+    if (instruction.opcode != FetchOpcode::kTextureFetch ||
+        (instruction.dimension != xenos::FetchOpDimension::k2D &&
+         instruction.dimension != xenos::FetchOpDimension::kCube) ||
+        instruction.operand_count < 2 ||
+        binding.fetch_constant >= xenos::kTextureFetchConstantCount ||
+        instruction.operands[1].storage_source != InstructionStorageSource::kTextureFetchConstant ||
+        instruction.operands[1].storage_index != binding.fetch_constant) {
+      output.clear();
+      samplers.clear();
+      return false;
+    }
+    const auto sampler = instruction.GetSamplerOverrides(is_pixel_shader);
+    // Different overrides may resolve to the same effective sampler in the
+    // current fetch. Preserve them for the texture owner to prove equivalence.
+    bool found = false;
+    for (const auto& existing : samplers) {
+      if (existing.fetch_constant == binding.fetch_constant && existing.sampler == sampler) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      samplers.push_back({binding.fetch_constant, sampler});
+    }
+    found = false;
+    for (const auto& existing : output) {
+      if (existing.fetch_constant == binding.fetch_constant) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      output.push_back({binding.fetch_constant, false});
+      output.push_back({binding.fetch_constant, true});
+    }
+  }
+  return true;
+}
+
 Shader::Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
                const uint32_t* ucode_dwords, size_t ucode_dword_count,
                std::endian ucode_source_endian)

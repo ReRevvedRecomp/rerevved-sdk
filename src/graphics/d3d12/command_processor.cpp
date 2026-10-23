@@ -12,25 +12,46 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <new>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
-#include <rex/perf/counter.h>
+#include <rex/graphics/diagnostic_util.h>
 #include <rex/graphics/d3d12/command_processor.h>
+
+#include "frame_capture.h"
+#include "frame_input_copy_plan.h"
+#include "frame_input_costs.h"
+#include "frame_input_draw_builder.h"
+#include "../frame_input_buffer_versions.h"
+#include "../frame_input_native_sources.h"
+#include "../frame_input_swap_view.h"
+
+#include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/perf/counter.h>
+#include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DECLARE(bool, half_pixel_offset);
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -47,7 +68,228 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(d3d12_capture_swap_texture, "", "GPU/D3D12",
+                      "One-shot path for a raw pre-gamma swap texture capture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(d3d12_capture_draw, "", "GPU/D3D12",
+                      "Output directory for a one-shot Xenos draw snapshot")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(d3d12_capture_frame, "", "GPU/D3D12",
+                      "Output directory for one complete Xenos frame RenderDoc capture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+bool& FLAGS_d3d12_frame_input_costs_storage_() {
+  static bool storage = false;
+  return storage;
+}
+static auto frame_input_costs_registrar = rex::cvar::FlagRegistrar(
+    {.name = "d3d12_frame_input_costs",
+     .type = rex::cvar::FlagType::Boolean,
+     .category = "GPU/D3D12",
+     .description = "Log bounded frame-input preparation, callback and guest-read costs",
+     .setter =
+         [](std::string_view value) {
+           FLAGS_d3d12_frame_input_costs_storage_() = rex::string::from_string<bool>(value, false);
+           return true;
+         },
+     .getter = [] { return FLAGS_d3d12_frame_input_costs_storage_() ? "true" : "false"; },
+     .command_callback = [](std::string_view) {},
+     .lifecycle = rex::cvar::Lifecycle::kInitOnly,
+     .constraints = {},
+     .default_value = "false",
+     .is_debug_only = false},
+    rex::cvar::Audience::kAdvanced, rex::cvar::Persistence::kSessionOnly);
 namespace rex::graphics::d3d12 {
+
+namespace {
+
+constexpr uint64_t kLiveFrameMaxReadbackBytes = UINT64_C(512) * 1024 * 1024;
+
+thread_local FrameInputCosts frame_input_costs;
+
+void LogFrameInputCosts(const std::optional<FrameInputCosts::Report>& report) noexcept {
+  if (!report) {
+    return;
+  }
+  using Stage = FrameInputCosts::Stage;
+  using Texture = FrameInputCosts::Texture;
+  const char* reason = "window";
+  switch (report->reason) {
+    case FrameInputCosts::Reason::kWindow:
+      break;
+    case FrameInputCosts::Reason::kDetached:
+      reason = "detached";
+      break;
+    case FrameInputCosts::Reason::kReplaced:
+      reason = "replaced";
+      break;
+    case FrameInputCosts::Reason::kFailed:
+      reason = "failed";
+      break;
+    case FrameInputCosts::Reason::kShutdown:
+      reason = "shutdown";
+      break;
+  }
+  const auto milliseconds = [&](Stage stage) {
+    return double(report->timing(stage).nanoseconds) / 1000000.0;
+  };
+  try {
+    // Shader/texture preparation is nested in SDK time. Guest reads are nested
+    // in observer time, including native work performed during OnSwap.
+    REXGPU_INFO(
+        "Frame input costs: stream={} observer={} reason={} frames={} first_frame={} last_frame={} "
+        "first_submission={} last_submission={} draws={} copies={} begins={} swaps={} ends={} "
+        "draw_sdk_ms={:.3f} shader_ms={:.3f} texture_views_ms={:.3f} draw_callback_ms={:.3f} "
+        "copy_sdk_ms={:.3f} copy_callback_ms={:.3f} begin_callback_ms={:.3f} "
+        "swap_callback_ms={:.3f} end_callback_ms={:.3f} guest_read_ms={:.3f} reads={} "
+        "requested_bytes={} copied_bytes={} read_failures={} callback_failures={} "
+        "texture_unavailable={} texture_not_required={} texture_gpu={} texture_current={} "
+        "texture_stale={} texture_missing={}",
+        report->stream, report->observer, reason, report->completed_frames, report->first_frame,
+        report->last_frame, report->first_submission, report->last_submission,
+        report->timing(Stage::kDrawTotal).calls, report->timing(Stage::kCopyTotal).calls,
+        report->timing(Stage::kBeginCallback).calls, report->timing(Stage::kSwapCallback).calls,
+        report->timing(Stage::kEndCallback).calls,
+        milliseconds(Stage::kDrawTotal) - milliseconds(Stage::kDrawCallback),
+        milliseconds(Stage::kDrawShader), milliseconds(Stage::kDrawTextures),
+        milliseconds(Stage::kDrawCallback),
+        milliseconds(Stage::kCopyTotal) - milliseconds(Stage::kCopyCallback),
+        milliseconds(Stage::kCopyCallback), milliseconds(Stage::kBeginCallback),
+        milliseconds(Stage::kSwapCallback), milliseconds(Stage::kEndCallback),
+        milliseconds(Stage::kGuestRead), report->read_requests, report->requested_bytes,
+        report->copied_bytes, report->read_requests - report->read_successes,
+        report->callback_failures, report->texture(Texture::kUnavailable),
+        report->texture(Texture::kNotRequired), report->texture(Texture::kGpuWritten),
+        report->texture(Texture::kCurrent), report->texture(Texture::kStale),
+        report->texture(Texture::kMissing));
+  } catch (...) {
+    // Logging is auxiliary and must not change PM4 execution or callback results.
+  }
+}
+
+template <typename Callback>
+bool ObserveFrameInputCallback(FrameInputCosts* costs, FrameInputCosts::Stage stage,
+                               Callback&& callback) {
+  FrameInputCostScope scope(costs, stage);
+  const bool succeeded = callback();
+  if (costs && !succeeded) {
+    costs->CallbackFailed();
+  }
+  return succeeded;
+}
+
+bool CreateDiagnosticCaptureParent(const std::filesystem::path& path, const char* name) {
+  const std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) {
+    return true;
+  }
+  std::error_code error;
+  std::filesystem::create_directories(parent, error);
+  if (error) {
+    REXGPU_ERROR("Skipping the {} capture because its parent directory could not be created: {}",
+                 name, error.message());
+    return false;
+  }
+  return true;
+}
+
+void AppendJsonString(std::string& json, std::string_view value) {
+  json.push_back('"');
+  for (char character : value) {
+    switch (character) {
+      case '"':
+        json += "\\\"";
+        break;
+      case '\\':
+        json += "\\\\";
+        break;
+      case '\n':
+        json += "\\n";
+        break;
+      case '\r':
+        json += "\\r";
+        break;
+      case '\t':
+        json += "\\t";
+        break;
+      default:
+        json.push_back(character);
+        break;
+    }
+  }
+  json.push_back('"');
+}
+bool WriteCaptureDwords(const std::filesystem::path& path, const std::vector<uint32_t>& dwords) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return false;
+  }
+  bool success = true;
+  for (uint32_t dword : dwords) {
+    const uint8_t bytes[sizeof(uint32_t)] = {uint8_t(dword), uint8_t(dword >> 8),
+                                             uint8_t(dword >> 16), uint8_t(dword >> 24)};
+    file.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+    if (!file) {
+      success = false;
+      break;
+    }
+  }
+  file.flush();
+  success = success && bool(file);
+  file.close();
+  return success && !file.fail();
+}
+bool WriteCaptureManifest(const std::filesystem::path& path, const std::string& contents) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return false;
+  }
+  file.write(contents.data(), std::streamsize(contents.size()));
+  const bool write_succeeded = bool(file);
+  file.flush();
+  const bool flush_succeeded = bool(file);
+  file.close();
+  return write_succeeded && flush_succeeded && !file.fail();
+}
+bool WriteCaptureMappedBuffer(const std::filesystem::path& path, ID3D12Resource* buffer,
+                              uint32_t size, std::vector<uint8_t>* bytes_out = nullptr) {
+  if (!buffer || !size) {
+    return false;
+  }
+  if (bytes_out) {
+    bytes_out->resize(size);
+  }
+  D3D12_RANGE read_range = {0, size};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  if (bytes_out) {
+    const uint8_t* mapped_bytes = static_cast<const uint8_t*>(mapping);
+    std::memcpy(bytes_out->data(), mapped_bytes, size);
+  }
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  bool success = false;
+  if (file) {
+    file.write(reinterpret_cast<const char*>(mapping), size);
+    file.flush();
+    success = bool(file);
+    file.close();
+    success = success && !file.fail();
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  buffer->Unmap(0, &write_range);
+  return success;
+}
+std::filesystem::path CaptureTemporaryPath(const std::filesystem::path& root,
+                                           std::string_view name) {
+  std::filesystem::path path = root / std::filesystem::path(name);
+  path += ".tmp";
+  return path;
+}
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -62,11 +304,339 @@ namespace shaders {
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
-    : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
+    : CommandProcessor(graphics_system,
+                       {graphics_system->memory(), kernel_state, graphics_system->register_file(),
+                        graphics_system,
+                        [](void* owner, uint32_t source, uint32_t cpu) {
+                          static_cast<D3D12GraphicsSystem*>(owner)->DispatchInterruptCallback(
+                              source, cpu);
+                          return true;
+                        }}),
+      deferred_command_list_(*this),
+      frame_capture_(std::make_unique<FrameCapture>()) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
 D3D12CommandProcessor::~D3D12CommandProcessor() = default;
 
+void D3D12CommandProcessor::ArmTextureLoadScratchCapture(const std::filesystem::path& path) {
+  texture_load_scratch_capture_armed_ = true;
+  texture_load_scratch_capture_path_ = path;
+  texture_load_scratch_capture_buffer_.Reset();
+  texture_load_scratch_capture_size_ = 0;
+  texture_load_scratch_capture_submission_ = 0;
+}
+
+void D3D12CommandProcessor::CaptureTextureLoadScratch(ID3D12Resource* buffer, uint32_t size) {
+  if (!texture_load_scratch_capture_armed_) {
+    return;
+  }
+  texture_load_scratch_capture_armed_ = false;
+  D3D12_RESOURCE_DESC capture_buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&texture_load_scratch_capture_buffer_)))) {
+    REXGPU_ERROR("Failed to create the texture-load scratch capture buffer");
+    return;
+  }
+  texture_load_scratch_capture_size_ = size;
+  deferred_command_list_.D3DCopyBufferRegion(texture_load_scratch_capture_buffer_.Get(), 0, buffer,
+                                             0, size);
+  texture_load_scratch_capture_submission_ = submission_current_;
+}
+
+std::filesystem::path D3D12CommandProcessor::GetSwapTextureCapturePath() const {
+  std::string path = REXCVAR_GET(d3d12_capture_swap_texture);
+  return path.empty() ? std::filesystem::path() : rex::to_path(path);
+}
+
+ID3D12Resource* D3D12CommandProcessor::RequestDiagnosticBufferCapture(
+    const std::filesystem::path& path, uint32_t size) {
+  if (path.empty() || !size) {
+    return nullptr;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+  DiagnosticBufferCapture capture{path, nullptr, size, submission_current_};
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture.buffer)))) {
+    REXGPU_ERROR("Failed to create a diagnostic readback buffer");
+    return nullptr;
+  }
+  diagnostic_buffer_captures_.push_back(std::move(capture));
+  return diagnostic_buffer_captures_.back().buffer.Get();
+}
+
+void D3D12CommandProcessor::PollDrawCaptureArmMarker() {
+  if (draw_capture_armed_ || draw_capture_disarmed_) {
+    return;
+  }
+  const std::string path_utf8 = REXCVAR_GET(d3d12_capture_draw);
+  if (path_utf8.empty()) {
+    return;
+  }
+  const std::filesystem::path path = rex::to_path(path_utf8);
+  const std::filesystem::path marker = path / diagnostic::kDrawCaptureArmMarker;
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(marker, error) || error) {
+    return;
+  }
+  draw_capture_path_ = path;
+  draw_capture_armed_mailbox_token_ = diagnostic::GetDrawCaptureMailbox()->GetRequestToken(path);
+  draw_capture_armed_ = true;
+  draw_capture_skip_reports_remaining_ = 4;
+  REXGPU_INFO("D3D12 draw capture armed from marker {}", rex::path_to_utf8(marker));
+}
+
+void D3D12CommandProcessor::PollLiveFrameCaptureRequest() {
+  if (live_frame_capture_armed_ || live_frame_capture_) {
+    return;
+  }
+  const diagnostic::DrawCaptureMailbox::Token token =
+      diagnostic::GetDrawCaptureMailbox()->GetFrameRequestToken();
+  if (!token) {
+    return;
+  }
+  live_frame_capture_armed_ = true;
+  live_frame_capture_armed_mailbox_token_ = token;
+  REXGPU_INFO("D3D12 owned frame capture armed for mailbox token {}", token.value);
+}
+
+bool D3D12CommandProcessor::BeginLiveFrameCapture(uint64_t frame, uint64_t submission,
+                                                  uint64_t frontbuffer_ptr,
+                                                  uint32_t frontbuffer_width,
+                                                  uint32_t frontbuffer_height) {
+  if (!live_frame_capture_armed_ || live_frame_capture_) {
+    return false;
+  }
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (!mailbox->IsPending(live_frame_capture_armed_mailbox_token_)) {
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+  const auto path = mailbox->GetRequestPath(live_frame_capture_armed_mailbox_token_);
+  const auto claimed = mailbox->ClaimFrame(live_frame_capture_armed_mailbox_token_, path);
+  if (!claimed || !frame_capture_->BeginOwnedFrame(
+                      frame, submission, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+                      register_file_->values, RegisterFile::kRegisterCount)) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+  try {
+    LiveFrameCapture capture;
+    capture.mailbox_token = claimed;
+    capture.frontbuffer_ptr = frontbuffer_ptr;
+    live_frame_capture_ = std::move(capture);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return true;
+  } catch (const std::bad_alloc&) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "owned_frame_allocation");
+    mailbox->Fail(claimed);
+    live_frame_capture_armed_ = false;
+    live_frame_capture_armed_mailbox_token_ = {};
+    return false;
+  }
+}
+void D3D12CommandProcessor::RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason reason) {
+  const size_t index = size_t(reason);
+  if (index >= draw_capture_skip_counts_.size()) {
+    return;
+  }
+  uint32_t& count = draw_capture_skip_counts_[index];
+  if (count != std::numeric_limits<uint32_t>::max()) {
+    ++count;
+  }
+}
+void D3D12CommandProcessor::ReportDrawCaptureSkipCounts() {
+  if (!draw_capture_armed_ || !draw_capture_skip_reports_remaining_) {
+    return;
+  }
+  std::ostringstream counts;
+  bool first = true;
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    const uint32_t count = draw_capture_skip_counts_[i];
+    if (!count) {
+      continue;
+    }
+    if (!first) {
+      counts << ',';
+    }
+    first = false;
+    counts << diagnostic::GetDrawCaptureSkipReasonName(
+                  static_cast<diagnostic::DrawCaptureSkipReason>(i))
+           << '=' << count;
+  }
+  REXGPU_INFO("D3D12 draw capture armed; skip_counts={}", first ? "none" : counts.str());
+  --draw_capture_skip_reports_remaining_;
+}
+void D3D12CommandProcessor::RetainDrawCaptureBuffersForRetry() {
+  if (!draw_capture_pending_) {
+    return;
+  }
+  auto retain = [this](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (buffer) {
+      submission_retry_resources_.push_back(std::move(buffer));
+    }
+  };
+  retain(draw_capture_pending_->edram_before.buffer);
+  retain(draw_capture_pending_->edram_after.buffer);
+  retain(draw_capture_pending_->index_readback.buffer);
+  for (DrawCaptureReadback& readback : draw_capture_pending_->vertex_fetch_readbacks) {
+    retain(readback.buffer);
+  }
+}
+
+void D3D12CommandProcessor::RetainLiveFrameBuffersForRetry() {
+  if (!live_frame_capture_) {
+    return;
+  }
+  auto retain = [this](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (buffer) {
+      submission_retry_resources_.push_back(std::move(buffer));
+    }
+  };
+  for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+    for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+      retain(readback.buffer);
+    }
+    if (draw.index) {
+      retain(draw.index->buffer);
+    }
+  }
+  for (LiveFrameTextureCapture& texture : live_frame_capture_->texture_captures) {
+    retain(texture.capture.buffer);
+    retain(texture.capture.source_resource);
+  }
+  for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+    retain(copy.buffer);
+  }
+  retain(live_frame_capture_->source.buffer);
+  retain(live_frame_capture_->source.source_resource);
+  retain(live_frame_capture_->output.buffer);
+  retain(live_frame_capture_->output.source_resource);
+}
+
+void D3D12CommandProcessor::FailLiveFrameCapture(const char* reason) {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (live_frame_capture_) {
+    const diagnostic::DrawCaptureMailbox::Token token = live_frame_capture_->mailbox_token;
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), reason ? reason : "owned_frame_failed");
+    RetainLiveFrameBuffersForRetry();
+    live_frame_capture_.reset();
+    if (token) {
+      mailbox->Fail(token);
+    }
+  }
+  if (live_frame_capture_armed_) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+  }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
+  if (reason) {
+    REXGPU_ERROR("D3D12 owned frame capture failed: {}", reason);
+  }
+}
+
+void D3D12CommandProcessor::AbandonLiveFrameBuffersForTeardown() {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (live_frame_capture_) {
+    mailbox->Fail(live_frame_capture_->mailbox_token);
+    auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
+    for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+      for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+        abandon(readback.buffer);
+      }
+      if (draw.index) {
+        abandon(draw.index->buffer);
+      }
+    }
+    for (LiveFrameTextureCapture& texture : live_frame_capture_->texture_captures) {
+      abandon(texture.capture.buffer);
+      abandon(texture.capture.source_resource);
+    }
+    for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+      abandon(copy.buffer);
+    }
+    abandon(live_frame_capture_->source.buffer);
+    abandon(live_frame_capture_->source.source_resource);
+    abandon(live_frame_capture_->output.buffer);
+    abandon(live_frame_capture_->output.source_resource);
+    live_frame_capture_.reset();
+  }
+  if (live_frame_capture_armed_) {
+    mailbox->Fail(live_frame_capture_armed_mailbox_token_);
+  }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
+}
+
+void D3D12CommandProcessor::FailPendingDrawCaptureMailbox() {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (draw_capture_pending_ && draw_capture_pending_->mailbox_token) {
+    mailbox->Fail(draw_capture_pending_->mailbox_token);
+  }
+  if (draw_capture_armed_mailbox_token_) {
+    mailbox->Fail(draw_capture_armed_mailbox_token_);
+    draw_capture_armed_mailbox_token_ = {};
+    draw_capture_armed_ = false;
+    draw_capture_disarmed_ = true;
+  }
+}
+void D3D12CommandProcessor::AbandonDrawCaptureBuffersForTeardown() {
+  FailPendingDrawCaptureMailbox();
+  if (draw_capture_pending_) {
+    auto abandon = [](Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) { buffer.Detach(); };
+    abandon(draw_capture_pending_->edram_before.buffer);
+    abandon(draw_capture_pending_->edram_after.buffer);
+    abandon(draw_capture_pending_->index_readback.buffer);
+    for (DrawCaptureReadback& readback : draw_capture_pending_->vertex_fetch_readbacks) {
+      abandon(readback.buffer);
+    }
+    draw_capture_pending_.reset();
+    draw_capture_failure_reason_.clear();
+  }
+  for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {
+    resource.Detach();
+  }
+  submission_retry_resources_.clear();
+}
+void D3D12CommandProcessor::WriteDrawCaptureFailureManifest(const char* reason) {
+  if (!draw_capture_pending_ && draw_capture_path_.empty()) {
+    return;
+  }
+  const std::filesystem::path path =
+      draw_capture_pending_ ? draw_capture_pending_->path : draw_capture_path_;
+  if (!CreateDiagnosticCaptureParent(path / "manifest.json", "draw")) {
+    return;
+  }
+  std::string manifest;
+  manifest += "{\n  \"schema_version\":1,\n  \"status\":\"failed\",\n";
+  manifest += "  \"valid\":false,\n  \"reason\":";
+  AppendJsonString(manifest, reason ? reason : "unknown");
+  manifest += ",\n  \"files\":[],\n  \"skip_counts\":{";
+  bool first = true;
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    if (!first) {
+      manifest += ',';
+    }
+    first = false;
+    AppendJsonString(manifest, diagnostic::GetDrawCaptureSkipReasonName(
+                                   static_cast<diagnostic::DrawCaptureSkipReason>(i)));
+    manifest += ':' + std::to_string(draw_capture_skip_counts_[i]);
+  }
+  manifest += "}\n}\n";
+  if (!WriteCaptureManifest(path / "manifest.json", manifest)) {
+    REXGPU_ERROR("Failed to write the draw capture failure manifest: {}", reason);
+  }
+}
 void D3D12CommandProcessor::UpdateDebugMarkersEnabled() {
   debug_markers_enabled_ = IsGpuDebugMarkersEnabled();
 }
@@ -1627,7 +2197,37 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
-  AwaitAllQueueOperationsCompletion();
+  // Retire CPU watches even if draining the GPU queue fails below.
+  frame_input_buffer_versions_.reset();
+  // The native sideband holds references to both owners. Retire it at the
+  // same boundary, before either the queue-drain early return or shared memory
+  // teardown can invalidate those references.
+  frame_input_native_sources_.reset();
+  frame_input_native_source_rejections_.reset();
+  frame_input_native_sources_failed_ = false;
+  frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+  frame_input_native_source_generation_ = 0;
+  if (frame_input_costs.ForOwner(this)) {
+    LogFrameInputCosts(frame_input_costs.Flush(FrameInputCosts::Reason::kShutdown));
+    (void)frame_input_costs.Bind(false, nullptr, 0);
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  FailPendingDrawCaptureMailbox();
+  FailLiveFrameCapture("shutdown_before_completed_swap");
+  frame_capture_->Abort(device, "shutdown_before_completed_swap");
+  const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
+  const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
+  if (!diagnostic::CanReleaseSubmittedGpuResources(queue_is_idle, device_is_removed)) {
+    REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
+    // Keep capture readbacks alive when the queue may still reference them. The detached
+    // COM references remain valid until process/device teardown rather than being released here.
+    AbandonLiveFrameBuffersForTeardown();
+    AbandonDrawCaptureBuffersForTeardown();
+    CommandProcessor::ShutdownContext();
+    return;
+  }
+  live_frame_capture_armed_ = false;
+  live_frame_capture_armed_mailbox_token_ = {};
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1746,6 +2346,12 @@ void D3D12CommandProcessor::ShutdownContext() {
   frame_current_ = 1;
   frame_completed_ = 0;
   std::memset(closed_frame_submissions_, 0, sizeof(closed_frame_submissions_));
+  frame_input_observer_token_ = {};
+  frame_input_next_event_id_ = 1;
+  frame_input_frame_open_ = false;
+  frame_input_prepared_draws_ = false;
+  frame_input_guest_memory_dirty_ranges_.clear();
+  frame_input_guest_memory_dirty_all_ = false;
 
   // First release the fences since they may reference fence_completion_event_.
 
@@ -1755,7 +2361,9 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ui::d3d12::util::ReleaseAndNull(submission_fence_);
   submission_open_ = false;
+  submission_fence_failed_ = false;
   submission_current_ = 1;
+  submission_last_signaled_ = 0;
   submission_completed_ = 0;
 
   if (fence_completion_event_) {
@@ -1891,24 +2499,138 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+void D3D12CommandProcessor::OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width,
+                                          uint32_t height) {
+  frame_input_pending_swap_ = {};
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+    const auto token = mailbox->GetFrameInputObserverToken();
+    if (!mailbox->HasFrameInputPreparedSwapObserver(token)) {
+      return;
+    }
+    // Pin the selected observer even if optional setup fails. Original issue
+    // must not deliver this terminal to a replacement or fall back to legacy.
+    frame_input_pending_swap_ = {token, 0, frame_current_, submission_current_, true};
+    RefreshFrameInputObserver();
+    frame_input_pending_swap_.id = frame_input_next_event_id_++;
+    DispatchFrameInputSwap(frame_input_pending_swap_.frame, frame_input_pending_swap_.submission,
+                           frontbuffer_ptr, width, height, &frame_input_pending_swap_, true);
+  } catch (...) {
+    // A missed prepared terminal cannot leave input spanning that boundary.
+    // Cleanup stays optional; original issue and packet progress continue.
+    if (frame_input_pending_swap_.prepared) {
+      if (!frame_input_pending_swap_.id) {
+        frame_input_pending_swap_.id = frame_input_next_event_id_++;
+      }
+      if (mailbox && frame_input_frame_open_) {
+        // Empty state spans expose unavailable final state for failure
+        // attribution. This prospective view cannot form a complete graph.
+        diagnostic::DrawCaptureFrameInputSwapView unavailable;
+        unavailable.id = frame_input_pending_swap_.id;
+        unavailable.frame = frame_input_pending_swap_.frame;
+        unavailable.submission = frame_input_pending_swap_.submission;
+        unavailable.frontbuffer_ptr = frontbuffer_ptr;
+        unavailable.frontbuffer_width = width;
+        unavailable.frontbuffer_height = height;
+        try {
+          mailbox->DispatchFrameInputPreparedSwap(frame_input_pending_swap_.token, unavailable);
+        } catch (...) {}
+      }
+      try {
+        if (mailbox) {
+          mailbox->UnregisterFrameInputObserver(frame_input_pending_swap_.token);
+        }
+      } catch (...) {}
+    }
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    try {
+      if (frame_input_buffer_versions_) {
+        frame_input_buffer_versions_->Reset();
+      }
+    } catch (...) {}
+  }
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
-  if (!graphics_system_)
+  // Original issue owns this local identity on every exit, including early
+  // failures before a post-swap view exists.
+  const auto swap_identity = std::exchange(frame_input_pending_swap_, {});
+  const auto* prepared_identity = swap_identity.prepared ? &swap_identity : nullptr;
+  const uint64_t frame_input_swap_frame = prepared_identity ? swap_identity.frame : frame_current_;
+  const uint64_t frame_input_swap_submission =
+      prepared_identity ? swap_identity.submission : submission_current_;
+  auto fail_frame_input_observer = [this, frame_input_swap_frame, frame_input_swap_submission,
+                                    prepared_identity]() {
+    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false,
+                          prepared_identity);
+  };
+
+  if (!graphics_system_) {
+    fail_frame_input_observer();
+    FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("graphics_system_unavailable");
+    frame_capture_->Abort(nullptr, "graphics_system_unavailable");
     return;
+  }
+  PollDrawCaptureArmMarker();
+  PollLiveFrameCaptureRequest();
+  ReportDrawCaptureSkipCounts();
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
+    fail_frame_input_observer();
     REXGPU_ERROR("IssueSwap: presenter is null");
+    FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("presenter_unavailable");
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "presenter_unavailable");
     return;
   }
 
+  const bool submission_had_prior_guest_work = submission_open_;
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
+    fail_frame_input_observer();
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+    FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("begin_submission_failure");
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
     return;
+  }
+  if (current_xenos_fence_trace_token()) {
+    diagnostic::GetXenosFenceTrace().D3D12SwapRecording(
+        current_xenos_fence_trace_token(), submission_current_, submission_had_prior_guest_work);
+  }
+
+  bool swap_marker_recorded = false;
+  bool swap_submission_failed = false;
+  auto record_swap_marker = [&]() {
+    if (swap_marker_recorded) {
+      return;
+    }
+    const std::string marker = frame_capture_->RecordSwapEnd(
+        frame_current_, submission_current_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+        register_file_->values, RegisterFile::kRegisterCount);
+    if (!marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(marker.c_str());
+      swap_marker_recorded = true;
+    }
+  };
+
+  static bool swap_texture_capture_attempted = false;
+  std::string swap_texture_capture_path_utf8 = REXCVAR_GET(d3d12_capture_swap_texture);
+  std::filesystem::path swap_texture_capture_path;
+  if (!swap_texture_capture_attempted && !swap_texture_capture_path_utf8.empty()) {
+    swap_texture_capture_path = rex::to_path(swap_texture_capture_path_utf8);
+    std::filesystem::path scratch_path = swap_texture_capture_path;
+    scratch_path.replace_extension(".scratch.bin");
+    ArmTextureLoadScratchCapture(scratch_path);
   }
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
@@ -1916,19 +2638,113 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
   xenos::TextureFormat frontbuffer_format;
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+  const auto& regs = *register_file_;
+  auto fetch = regs.GetTextureFetch(0);
   ID3D12Resource* swap_texture_resource =
       texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
                                          &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
-    const auto& regs = *register_file_;
-    auto fetch = regs.GetTextureFetch(0);
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    fail_frame_input_observer();
+    FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("swap_texture_unavailable");
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "swap_texture_unavailable");
     return;
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+  if (live_frame_capture_) {
+    live_frame_capture_->frontbuffer_ptr = frontbuffer_ptr;
+    live_frame_capture_->source_format = uint32_t(swap_texture_desc.Format);
+    live_frame_capture_->source_width = uint32_t(swap_texture_desc.Width);
+    live_frame_capture_->source_height = uint32_t(swap_texture_desc.Height);
+    const LiveFrameSurfaceScheduleResult source_capture_result = ScheduleLiveFrameSwapSource(
+        swap_texture_resource, static_cast<DXGI_FORMAT>(swap_texture_desc.Format),
+        uint32_t(swap_texture_desc.Width), uint32_t(swap_texture_desc.Height));
+    live_frame_capture_->source_acquisition = source_capture_result.acquisition;
+    live_frame_capture_->source_acquisition_reason = source_capture_result.acquisition_reason;
+    if (source_capture_result.fatal) {
+      FailLiveFrameCapture("owned_swap_source_capture_failed");
+    }
+  }
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> swap_texture_capture_buffer;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT swap_texture_capture_footprint = {};
+  UINT swap_texture_capture_row_count = 0;
+  UINT64 swap_texture_capture_row_size = 0;
+  UINT64 swap_texture_capture_buffer_size = 0;
+  uint64_t swap_texture_capture_submission = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource> swap_source_capture_buffer;
+  uint32_t swap_source_capture_size = 0;
+  uint64_t swap_source_capture_submission = 0;
+  std::filesystem::path swap_source_capture_path;
+  if (!swap_texture_capture_attempted && !swap_texture_capture_path_utf8.empty()) {
+    swap_texture_capture_attempted = true;
+
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+
+    const FormatInfo* format_info = FormatInfo::Get(fetch.format);
+    uint32_t pitch_blocks =
+        ((fetch.pitch << 5) + format_info->block_width - 1) / format_info->block_width;
+    uint32_t height_blocks =
+        (frontbuffer_height_unscaled + format_info->block_height - 1) / format_info->block_height;
+    if (fetch.tiled) {
+      height_blocks = rex::align(height_blocks, xenos::kTextureTileWidthHeight);
+    }
+    swap_source_capture_size = pitch_blocks * height_blocks * format_info->bytes_per_block();
+    D3D12_RESOURCE_DESC source_capture_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(source_capture_buffer_desc, swap_source_capture_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    if (SUCCEEDED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                                  D3D12_HEAP_FLAG_NONE, &source_capture_buffer_desc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&swap_source_capture_buffer)))) {
+      shared_memory_->UseAsCopySource();
+      SubmitBarriers();
+      deferred_command_list_.D3DCopyBufferRegion(
+          swap_source_capture_buffer.Get(), 0, shared_memory_->GetBuffer(),
+          fetch.base_address << 12, swap_source_capture_size);
+      swap_source_capture_submission = submission_current_;
+      shared_memory_->UseForReading();
+      SubmitBarriers();
+      swap_source_capture_path = swap_texture_capture_path;
+      swap_source_capture_path.replace_extension(".source.bin");
+    } else {
+      REXGPU_ERROR("Failed to create the swap source capture buffer");
+    }
+
+    device->GetCopyableFootprints(&swap_texture_desc, 0, 1, 0, &swap_texture_capture_footprint,
+                                  &swap_texture_capture_row_count, &swap_texture_capture_row_size,
+                                  &swap_texture_capture_buffer_size);
+    D3D12_RESOURCE_DESC capture_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(capture_buffer_desc, swap_texture_capture_buffer_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&swap_texture_capture_buffer)))) {
+      REXGPU_ERROR("Failed to create the pre-gamma swap texture capture buffer");
+    } else {
+      PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+      SubmitBarriers();
+      D3D12_TEXTURE_COPY_LOCATION capture_dest = {};
+      capture_dest.pResource = swap_texture_capture_buffer.Get();
+      capture_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      capture_dest.PlacedFootprint = swap_texture_capture_footprint;
+      D3D12_TEXTURE_COPY_LOCATION capture_source = {};
+      capture_source.pResource = swap_texture_resource;
+      capture_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      capture_source.SubresourceIndex = 0;
+      deferred_command_list_.D3DCopyTextureRegion(&capture_dest, 0, 0, 0, &capture_source, nullptr);
+      PushTransitionBarrier(swap_texture_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      SubmitBarriers();
+      swap_texture_capture_submission = submission_current_;
+    }
+  }
+
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
   // from the swap packet, scaled proportionally to the actual source texture.
@@ -1965,6 +2781,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                                : (frontbuffer_height ? frontbuffer_height
                                                                      : frontbuffer_height_unscaled);
   }
+  // Give the title observer a synchronous chance to prepare the native output
+  // before the presenter refresh consumes the guest output. Submission status
+  // is deliberately reported later by DispatchFrameInputEnd.
+  DispatchFrameInputSwap(frame_input_swap_frame, frame_input_swap_submission, frontbuffer_ptr,
+                         frontbuffer_width, frontbuffer_height, prepared_identity);
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (source_width_scaled != frontbuffer_width_unscaled ||
                              source_height_scaled != frontbuffer_height_unscaled);
@@ -1985,10 +2806,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  const bool refresh_succeeded = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       guest_output_height, frontbuffer_ptr, &record_swap_marker,
+       &swap_submission_failed](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2045,6 +2867,26 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        if (live_frame_capture_) {
+          try {
+            live_frame_capture_->frontbuffer_ptr = frontbuffer_ptr;
+            live_frame_capture_->gamma.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
+            live_frame_capture_->gamma.use_fxaa = use_fxaa;
+            live_frame_capture_->gamma.is_8bpc = !use_pwl_gamma_ramp && !use_fxaa;
+            live_frame_capture_->gamma.source_format = uint32_t(frontbuffer_format);
+            live_frame_capture_->gamma.gamma_256.resize(256);
+            for (size_t i = 0; i < live_frame_capture_->gamma.gamma_256.size(); ++i) {
+              live_frame_capture_->gamma.gamma_256[i] = gamma_ramp_256_entry_table()[i].value;
+            }
+            live_frame_capture_->gamma.gamma_pwl_rgb.resize(128 * 3);
+            for (size_t i = 0; i < live_frame_capture_->gamma.gamma_pwl_rgb.size(); ++i) {
+              live_frame_capture_->gamma.gamma_pwl_rgb[i] = gamma_ramp_pwl_rgb()[i].value;
+            }
+          } catch (const std::bad_alloc&) {
+            FailLiveFrameCapture("owned_gamma_capture_allocation");
+            // Capture failure must not suppress the normal gamma/output path.
+          }
+        }
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2109,6 +2951,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         ID3D12Resource* guest_output_resource =
             static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
                 .resource_uav_capable();
+        if (live_frame_capture_) {
+          live_frame_capture_->output_format = uint32_t(guest_output_resource->GetDesc().Format);
+          live_frame_capture_->output_width = guest_output_width;
+          live_frame_capture_->output_height = guest_output_height;
+        }
 
         if (use_fxaa) {
           fxaa_source_texture_submission_ = submission_current_;
@@ -2247,25 +3094,2479 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
-        EndSubmission(true);
-        return true;
+        if (live_frame_capture_) {
+          const LiveFrameSurfaceScheduleResult output_capture_result = ScheduleLiveFrameSwapOutput(
+              guest_output_resource, guest_output_width, guest_output_height);
+          live_frame_capture_->output_acquisition = output_capture_result.acquisition;
+          live_frame_capture_->output_acquisition_reason = output_capture_result.acquisition_reason;
+          if (output_capture_result.fatal) {
+            FailLiveFrameCapture("owned_swap_output_capture_failed");
+            // Capture failure must not suppress the normal presenter output.
+          } else if (live_frame_capture_) {
+            live_frame_capture_->gamma.output_format = live_frame_capture_->output_format;
+            live_frame_capture_->gamma.output_width = guest_output_width;
+            live_frame_capture_->gamma.output_height = guest_output_height;
+          }
+        }
+        record_swap_marker();
+        const bool submission_result = EndSubmission(true);
+        swap_submission_failed |= !submission_result;
+        return submission_result;
       });
 
+  swap_submission_failed |= !refresh_succeeded;
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
-  EndSubmission(true);
+  record_swap_marker();
+  // The live observer must prepare its native output before the presenter
+  // refresh consumes the guest output. OnSwap has already run immediately
+  // before RefreshGuestOutput; this callback reports the eventual result.
+  const bool outer_submission_succeeded = EndSubmission(true);
+  if (!outer_submission_succeeded || swap_submission_failed) {
+    DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, false,
+                          prepared_identity);
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
+    FailPendingDrawCaptureMailbox();
+    FailLiveFrameCapture("submission_failure");
+    RetainDrawCaptureBuffersForRetry();
+    if (draw_capture_pending_) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
+      WriteDrawCaptureFailureManifest(draw_capture_failure_reason_.empty()
+                                          ? "submission_failure"
+                                          : draw_capture_failure_reason_.c_str());
+      draw_capture_pending_.reset();
+      draw_capture_failure_reason_.clear();
+    }
+    if (swap_texture_capture_buffer) {
+      submission_retry_resources_.push_back(std::move(swap_texture_capture_buffer));
+    }
+    if (swap_source_capture_buffer) {
+      submission_retry_resources_.push_back(std::move(swap_source_capture_buffer));
+    }
+    return;
+  }
+
+  // Complete the callback-delivered frame only after the original submission
+  // has succeeded. No host texture or swap readback is created for this path.
+  DispatchFrameInputEnd(frame_input_swap_frame, frame_input_swap_submission, true,
+                        prepared_identity);
+
+  bool swap_boundary_fence_succeeded = true;
+  std::filesystem::path frame_capture_path;
+  const std::string frame_capture_path_utf8 = REXCVAR_GET(d3d12_capture_frame);
+  if (frame_capture_->IsIdle() && !frame_capture_path_utf8.empty()) {
+    const std::filesystem::path requested_path = rex::to_path(frame_capture_path_utf8);
+    const std::filesystem::path arm_marker = requested_path / diagnostic::kDrawCaptureArmMarker;
+    std::error_code error;
+    if (std::filesystem::is_regular_file(arm_marker, error) && !error) {
+      frame_capture_path = requested_path;
+    }
+  }
+  if (frame_capture_->IsActive() || !frame_capture_path.empty()) {
+    // Both captured boundaries must own completed guest work. A successful
+    // submission alone does not establish that its GPU execution succeeded.
+    swap_boundary_fence_succeeded = CheckSubmissionFence(submission_current_ - 1);
+    if (swap_boundary_fence_succeeded) {
+      frame_capture_->OnCompletedSwap(GetD3D12Provider().GetDevice(), frame_capture_path,
+                                      frame_current_, submission_current_);
+    } else {
+      frame_capture_->Abort(GetD3D12Provider().GetDevice(), "frame_boundary_fence_failure");
+    }
+  }
+
+  if (live_frame_capture_) {
+    if (swap_boundary_fence_succeeded) {
+      FinalizeLiveFrameCapture(frame_current_, submission_current_);
+    } else {
+      FailLiveFrameCapture("frame_boundary_fence_failure");
+    }
+  } else if (live_frame_capture_armed_) {
+    if (swap_boundary_fence_succeeded && CheckSubmissionFence(submission_current_ - 1)) {
+      BeginLiveFrameCapture(frame_current_, submission_current_, frontbuffer_ptr, frontbuffer_width,
+                            frontbuffer_height);
+    } else {
+      FailLiveFrameCapture("frame_boundary_fence_failure");
+    }
+  }
+
+  FinalizeDrawCapture();
+  if (swap_texture_capture_buffer) {
+    if (!CheckSubmissionFence(swap_texture_capture_submission)) {
+      REXGPU_ERROR("Failed to await the pre-gamma swap texture capture submission");
+    } else if (CreateDiagnosticCaptureParent(swap_texture_capture_path, "pre-gamma swap texture")) {
+      D3D12_RANGE read_range = {swap_texture_capture_footprint.Offset,
+                                swap_texture_capture_buffer_size};
+      void* mapping = nullptr;
+      if (FAILED(swap_texture_capture_buffer->Map(0, &read_range, &mapping))) {
+        REXGPU_ERROR("Failed to map the pre-gamma swap texture capture buffer");
+      } else {
+        std::ofstream capture_file(swap_texture_capture_path, std::ios::binary);
+        const uint8_t* capture_base =
+            static_cast<const uint8_t*>(mapping) + swap_texture_capture_footprint.Offset;
+        for (UINT row = 0; row < swap_texture_capture_row_count; ++row) {
+          capture_file.write(
+              reinterpret_cast<const char*>(
+                  capture_base + size_t(row) * swap_texture_capture_footprint.Footprint.RowPitch),
+              swap_texture_capture_row_size);
+        }
+        D3D12_RANGE write_range = {0, 0};
+        swap_texture_capture_buffer->Unmap(0, &write_range);
+        if (!capture_file) {
+          REXGPU_ERROR("Failed to write the pre-gamma swap texture capture");
+        } else {
+          REXGPU_INFO(
+              "Captured pre-gamma swap texture: {}x{}, format {}, row pitch {}, "
+              "row size {}, {} rows, submission {}, path {}",
+              swap_texture_desc.Width, swap_texture_desc.Height, uint32_t(swap_texture_desc.Format),
+              swap_texture_capture_footprint.Footprint.RowPitch, swap_texture_capture_row_size,
+              swap_texture_capture_row_count, swap_texture_capture_submission,
+              rex::path_to_utf8(swap_texture_capture_path));
+        }
+      }
+    }
+  }
+
+  auto write_buffer_capture = [this](ID3D12Resource* buffer, uint32_t size,
+                                     const std::filesystem::path& path, uint64_t submission,
+                                     const char* name) {
+    if (!buffer || !size || path.empty()) {
+      return;
+    }
+    if (!submission || !CheckSubmissionFence(submission)) {
+      REXGPU_ERROR("Skipping the {} capture because submission {} did not complete", name,
+                   submission);
+      return;
+    }
+    if (!CreateDiagnosticCaptureParent(path, name)) {
+      return;
+    }
+    D3D12_RANGE read_range = {0, size};
+    void* mapping = nullptr;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      REXGPU_ERROR("Failed to map the {} capture buffer", name);
+      return;
+    }
+    std::ofstream capture_file(path, std::ios::binary);
+    capture_file.write(reinterpret_cast<const char*>(mapping), size);
+    D3D12_RANGE write_range = {0, 0};
+    buffer->Unmap(0, &write_range);
+    if (!capture_file) {
+      REXGPU_ERROR("Failed to write the {} capture", name);
+    }
+  };
+  write_buffer_capture(swap_source_capture_buffer.Get(), swap_source_capture_size,
+                       swap_source_capture_path, swap_source_capture_submission, "swap source");
+  write_buffer_capture(texture_load_scratch_capture_buffer_.Get(),
+                       texture_load_scratch_capture_size_, texture_load_scratch_capture_path_,
+                       texture_load_scratch_capture_submission_, "texture-load scratch");
+  for (const DiagnosticBufferCapture& capture : diagnostic_buffer_captures_) {
+    write_buffer_capture(capture.buffer.Get(), capture.size, capture.path, capture.submission,
+                         "diagnostic buffer");
+  }
+  diagnostic_buffer_captures_.clear();
+  texture_load_scratch_capture_buffer_.Reset();
+  texture_load_scratch_capture_size_ = 0;
+  texture_load_scratch_capture_submission_ = 0;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
-    EndSubmission(false);
+    if (!EndSubmission(false)) {
+      REXGPU_WARN("Deferred primary-buffer-end submission remains pending");
+    }
+  }
+  auto& fence_trace = diagnostic::GetXenosFenceTrace();
+  if (fence_trace.enabled()) {
+    fence_trace.PollTimeouts();
+  }
+  if (fence_trace.enabled() && fence_trace.HasSubmittedWatches() && submission_fence_) {
+    uint64_t completed = submission_fence_->GetCompletedValue();
+    fence_trace.D3D12FenceCompleted(reinterpret_cast<uint64_t>(submission_fence_), completed,
+                                    diagnostic::IsFenceCompletionValueValid(completed));
   }
 }
 
+bool D3D12CommandProcessor::ScheduleDrawCapture(
+    const PrimitiveProcessor::ProcessingResult& result, xenos::PrimitiveType primitive_type,
+    uint32_t index_count, const IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+    D3D12_PRIMITIVE_TOPOLOGY native_topology, D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
+    uint32_t used_texture_mask, uint32_t normalized_color_mask,
+    diagnostic::DrawCaptureMailbox::Token mailbox_token) {
+  if (!draw_capture_armed_ || draw_capture_disarmed_ || draw_capture_pending_ || !vertex_shader ||
+      !pixel_shader || !shared_memory_->GetBuffer()) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
+  if (!mailbox_token && diagnostic::GetDrawCaptureMailbox()->HasActiveRequest()) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
+  DrawCapture capture;
+  capture.path = draw_capture_path_;
+  capture.mailbox_token = mailbox_token;
+  capture.frame = frame_current_;
+  capture.submission = submission_current_;
+  capture.primitive_type = uint32_t(primitive_type);
+  capture.requested_index_count = index_count;
+  capture.major_mode_explicit = major_mode_explicit;
+  capture.guest_primitive_type = uint32_t(result.guest_primitive_type);
+  capture.host_primitive_type = uint32_t(result.host_primitive_type);
+  capture.host_vertex_shader_type = uint32_t(result.host_vertex_shader_type);
+  capture.tessellation_mode = uint32_t(result.tessellation_mode);
+  capture.guest_draw_vertex_count = result.guest_draw_vertex_count;
+  capture.host_draw_vertex_count = result.host_draw_vertex_count;
+  capture.guest_index_base = result.guest_index_base;
+  capture.host_index_format = uint32_t(result.host_index_format);
+  capture.host_shader_index_endian = uint32_t(result.host_shader_index_endian);
+  capture.host_primitive_reset_enabled = result.host_primitive_reset_enabled;
+  capture.used_texture_mask = used_texture_mask;
+  capture.normalized_color_mask = normalized_color_mask;
+  capture.color_target_written = normalized_color_mask != 0;
+  capture.native_topology = native_topology;
+  capture.native_instance_count = 1;
+  capture.native_start_vertex = 0;
+  capture.native_start_index = 0;
+  capture.native_base_vertex = 0;
+  capture.native_start_instance = 0;
+  capture.vertex_shader_hash = vertex_shader->ucode_data_hash();
+  capture.pixel_shader_hash = pixel_shader->ucode_data_hash();
+  const uint64_t max_shader_dwords = diagnostic::kDrawCaptureMaxShaderBytes / sizeof(uint32_t);
+  if (vertex_shader->ucode_dword_count() > max_shader_dwords ||
+      pixel_shader->ucode_dword_count() > max_shader_dwords) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+    return false;
+  }
+  capture.registers.assign(register_file_->values,
+                           register_file_->values + RegisterFile::kRegisterCount);
+  capture.vertex_ucode.assign(vertex_shader->ucode_data().begin(),
+                              vertex_shader->ucode_data().end());
+  capture.pixel_ucode.assign(pixel_shader->ucode_data().begin(), pixel_shader->ucode_data().end());
+  uint64_t geometry_size = 0;
+  const RegisterFile& regs = *register_file_;
+  capture.half_pixel_offset =
+      REXCVAR_GET(half_pixel_offset) &&
+      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
+  const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+    uint32_t fetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+    uint32_t bit;
+    while (rex::bit_scan_forward(fetch_bits_remaining, &bit)) {
+      fetch_bits_remaining &= ~(uint32_t(1) << bit);
+      const uint32_t fetch_constant_index = i * 32 + bit;
+      const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_constant_index);
+      if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
+        RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+        return false;
+      }
+      diagnostic::DrawCaptureRange range;
+      if (!diagnostic::AppendDrawCaptureRange(
+              uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+              SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes,
+              capture.vertex_fetch_ranges, geometry_size)) {
+        RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+        return false;
+      }
+      capture.vertex_fetch_constants.push_back(fetch_constant_index);
+    }
+  }
+  if (result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+    if (!index_buffer_info || !result.guest_draw_vertex_count ||
+        (result.host_index_format != xenos::IndexFormat::kInt16 &&
+         result.host_index_format != xenos::IndexFormat::kInt32)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    const uint64_t index_element_size = result.host_index_format == xenos::IndexFormat::kInt16
+                                            ? sizeof(uint16_t)
+                                            : sizeof(uint32_t);
+    const uint64_t index_size = uint64_t(result.guest_draw_vertex_count) * index_element_size;
+    if (index_buffer_info->guest_base != result.guest_index_base ||
+        index_buffer_info->format != result.host_index_format ||
+        index_buffer_info->length < index_size ||
+        index_buffer_info->count < result.guest_draw_vertex_count) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    diagnostic::DrawCaptureRange index_range;
+    if (!diagnostic::ValidateDrawCaptureRange(
+            result.guest_index_base, index_size, SharedMemory::kBufferSize,
+            diagnostic::kDrawCaptureMaxGeometryBytes - geometry_size, index_range)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kRangeLimit);
+      return false;
+    }
+    geometry_size += index_range.size;
+    capture.indexed = true;
+    capture.guest_index_size = index_range.size;
+    capture.guest_index_dma_count = index_buffer_info->count;
+    capture.guest_index_dma_format = uint32_t(index_buffer_info->format);
+    capture.guest_index_dma_endianness = uint32_t(index_buffer_info->endianness);
+    if (index_buffer_info->length > std::numeric_limits<uint32_t>::max()) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+      return false;
+    }
+    capture.guest_index_dma_length = uint32_t(index_buffer_info->length);
+    capture.index_readback.name = "index.bin";
+    capture.index_readback.size = index_range.size;
+  } else if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kIndexSource);
+    return false;
+  } else {
+    capture.native_vertex_count = result.host_draw_vertex_count;
+  }
+  if (capture.indexed) {
+    capture.native_index_count = result.host_draw_vertex_count;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto create_readback = [device](DrawCaptureReadback& readback) {
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, readback.size, D3D12_RESOURCE_FLAG_NONE);
+    return SUCCEEDED(device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.buffer)));
+  };
+  capture.edram_before.name = "edram_before.bin";
+  capture.edram_before.size = xenos::kEdramSizeBytes;
+  capture.edram_after.name = "edram_after.bin";
+  capture.edram_after.size = xenos::kEdramSizeBytes;
+  if (!create_readback(capture.edram_before) || !create_readback(capture.edram_after)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+    return false;
+  }
+  capture.vertex_fetch_readbacks.reserve(capture.vertex_fetch_ranges.size());
+  for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+    DrawCaptureReadback readback;
+    readback.name = "vertex_fetch_" + std::to_string(capture.vertex_fetch_constants[i]) + ".bin";
+    readback.size = capture.vertex_fetch_ranges[i].size;
+    if (!create_readback(readback)) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+      return false;
+    }
+    capture.vertex_fetch_readbacks.push_back(std::move(readback));
+  }
+  if (capture.indexed && !create_readback(capture.index_readback)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kReadbackAllocation);
+    return false;
+  }
+  if (!render_target_cache_->ScheduleEdramCapture(capture.edram_before.buffer.Get(),
+                                                  capture.edram_before.size, true)) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    return false;
+  }
+  if (!capture.vertex_fetch_ranges.empty() || capture.indexed) {
+    shared_memory_->UseAsCopySource();
+    SubmitBarriers();
+    for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+      const diagnostic::DrawCaptureRange& range = capture.vertex_fetch_ranges[i];
+      deferred_command_list_.D3DCopyBufferRegion(capture.vertex_fetch_readbacks[i].buffer.Get(), 0,
+                                                 shared_memory_->GetBuffer(), range.base,
+                                                 range.size);
+    }
+    if (capture.indexed) {
+      deferred_command_list_.D3DCopyBufferRegion(
+          capture.index_readback.buffer.Get(), 0, shared_memory_->GetBuffer(),
+          capture.guest_index_base, capture.guest_index_size);
+    }
+    shared_memory_->UseForReading();
+    SubmitBarriers();
+  }
+  draw_capture_pending_ = std::move(capture);
+  return true;
+}
+
+D3D12CommandProcessor::LiveFrameDrawScheduleResult D3D12CommandProcessor::ScheduleLiveFrameDraw(
+    uint64_t event_id, const PrimitiveProcessor::ProcessingResult& result,
+    const IndexBufferInfo* index_buffer_info, D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
+    uint32_t used_texture_mask, bool memexport_used, bool pixel_shader_was_bound) {
+  if (!live_frame_capture_ || !event_id) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kJournal};
+  }
+  LiveFrameCapture& frame = *live_frame_capture_;
+  try {
+    // Keep one slot available before any readback is recorded. The failure path
+    // moves the partially built draw into the live frame so all submitted
+    // readback resources remain owned until cancellation can retain them.
+    frame.draws.reserve(frame.draws.size() + 1);
+  } catch (const std::bad_alloc&) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackAllocation};
+  }
+  LiveFrameDraw capture;
+  capture.event_id = event_id;
+  capture.texture_bindings_complete = !pixel_shader_was_bound || pixel_shader != nullptr;
+  bool moved_to_frame = false;
+  auto finish = [&](diagnostic::DrawCaptureAvailability availability,
+                    diagnostic::DrawCaptureReason reason, bool fatal) {
+    capture.acquisition = availability;
+    capture.acquisition_reason = reason;
+    if (!moved_to_frame) {
+      frame.draws.push_back(std::move(capture));
+      moved_to_frame = true;
+    }
+    return LiveFrameDrawScheduleResult{fatal, availability, reason};
+  };
+  auto unavailable = [&](diagnostic::DrawCaptureReason reason) {
+    return finish(diagnostic::DrawCaptureAvailability::kUnavailable, reason, false);
+  };
+  auto fatal = [&](diagnostic::DrawCaptureReason reason) {
+    return finish(diagnostic::DrawCaptureAvailability::kUnavailable, reason, true);
+  };
+  if (!vertex_shader) {
+    return unavailable(diagnostic::DrawCaptureReason::kNoVertexShader);
+  }
+  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock) {
+    return unavailable(diagnostic::DrawCaptureReason::kRenderTargetPath);
+  }
+  if (texture_cache_->draw_resolution_scale_x() != 1 ||
+      texture_cache_->draw_resolution_scale_y() != 1) {
+    return unavailable(diagnostic::DrawCaptureReason::kResolutionScale);
+  }
+  if (memexport_used) {
+    return unavailable(diagnostic::DrawCaptureReason::kMemexport);
+  }
+  auto reserve_readback = [&frame](uint64_t size) {
+    if (!size || frame.readback_bytes > kLiveFrameMaxReadbackBytes ||
+        size > kLiveFrameMaxReadbackBytes - frame.readback_bytes) {
+      return false;
+    }
+    frame.readback_bytes += size;
+    return true;
+  };
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto create_readback = [device](uint32_t size, Microsoft::WRL::ComPtr<ID3D12Resource>& buffer) {
+    if (!size) {
+      return false;
+    }
+    D3D12_RESOURCE_DESC desc;
+    ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_NONE);
+    return SUCCEEDED(device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)));
+  };
+
+  try {
+    uint64_t geometry_size = 0;
+    std::vector<diagnostic::DrawCaptureRange> geometry_ranges;
+    const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+    const RegisterFile& regs = *register_file_;
+    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+      uint32_t fetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+      uint32_t bit;
+      while (rex::bit_scan_forward(fetch_bits_remaining, &bit)) {
+        fetch_bits_remaining &= ~(uint32_t(1) << bit);
+        const uint32_t fetch_constant_index = i * 32 + bit;
+        const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_constant_index);
+        if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
+          return unavailable(diagnostic::DrawCaptureReason::kVertexFetch);
+        }
+        diagnostic::DrawCaptureRange range;
+        if (!diagnostic::AppendDrawCaptureRange(
+                uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+                SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes,
+                geometry_ranges, geometry_size)) {
+          return unavailable(diagnostic::DrawCaptureReason::kVertexFetch);
+        }
+        if (!diagnostic::ValidateDrawCaptureRange(
+                uint64_t(fetch.address) * sizeof(uint32_t), uint64_t(fetch.size) * sizeof(uint32_t),
+                SharedMemory::kBufferSize, diagnostic::kDrawCaptureMaxGeometryBytes, range)) {
+          return unavailable(diagnostic::DrawCaptureReason::kVertexFetch);
+        }
+        if (!reserve_readback(range.size)) {
+          return unavailable(diagnostic::DrawCaptureReason::kReadbackBudget);
+        }
+        LiveFrameVertexReadback readback;
+        readback.fetch_constant = fetch_constant_index;
+        readback.base = range.base;
+        readback.size = range.size;
+        if (!create_readback(readback.size, readback.buffer)) {
+          return fatal(diagnostic::DrawCaptureReason::kReadbackAllocation);
+        }
+        capture.vertex_fetches.push_back(std::move(readback));
+      }
+    }
+
+    if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+      if (result.index_buffer_type != PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+          !index_buffer_info || !result.guest_draw_vertex_count ||
+          (index_buffer_info->format != xenos::IndexFormat::kInt16 &&
+           index_buffer_info->format != xenos::IndexFormat::kInt32) ||
+          index_buffer_info->guest_base != result.guest_index_base) {
+        capture.index_acquisition = diagnostic::DrawCaptureAvailability::kUnavailable;
+        capture.index_acquisition_reason =
+            result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
+                ? diagnostic::DrawCaptureReason::kIndexSource
+                : diagnostic::DrawCaptureReason::kIndexTranslation;
+        if (result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = capture.index_acquisition_reason;
+        }
+      } else {
+        const uint64_t index_element_size = index_buffer_info->format == xenos::IndexFormat::kInt16
+                                                ? sizeof(uint16_t)
+                                                : sizeof(uint32_t);
+        const uint64_t index_size = uint64_t(result.guest_draw_vertex_count) * index_element_size;
+        if (index_size > UINT32_MAX || index_buffer_info->length < index_size ||
+            index_buffer_info->count < result.guest_draw_vertex_count) {
+          capture.index_acquisition = diagnostic::DrawCaptureAvailability::kUnavailable;
+          capture.index_acquisition_reason = diagnostic::DrawCaptureReason::kIndexSource;
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = capture.index_acquisition_reason;
+        } else {
+          diagnostic::DrawCaptureRange range;
+          if (!diagnostic::ValidateDrawCaptureRange(
+                  result.guest_index_base, index_size, SharedMemory::kBufferSize,
+                  diagnostic::kDrawCaptureMaxGeometryBytes - geometry_size, range)) {
+            capture.index_acquisition = diagnostic::DrawCaptureAvailability::kUnavailable;
+            capture.index_acquisition_reason = diagnostic::DrawCaptureReason::kIndexSource;
+            capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+            capture.acquisition_reason = capture.index_acquisition_reason;
+          } else if (!reserve_readback(range.size)) {
+            capture.index_acquisition = diagnostic::DrawCaptureAvailability::kUnavailable;
+            capture.index_acquisition_reason = diagnostic::DrawCaptureReason::kReadbackBudget;
+            capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+            capture.acquisition_reason = capture.index_acquisition_reason;
+          } else {
+            LiveFrameIndexReadback readback;
+            readback.base = range.base;
+            readback.size = range.size;
+            if (!create_readback(readback.size, readback.buffer)) {
+              return fatal(diagnostic::DrawCaptureReason::kReadbackAllocation);
+            }
+            capture.index = std::move(readback);
+          }
+        }
+      }
+    }
+
+    if (!capture.vertex_fetches.empty() || capture.index) {
+      shared_memory_->UseAsCopySource();
+      SubmitBarriers();
+      for (const LiveFrameVertexReadback& readback : capture.vertex_fetches) {
+        deferred_command_list_.D3DCopyBufferRegion(
+            readback.buffer.Get(), 0, shared_memory_->GetBuffer(), readback.base, readback.size);
+      }
+      if (capture.index) {
+        deferred_command_list_.D3DCopyBufferRegion(capture.index->buffer.Get(), 0,
+                                                   shared_memory_->GetBuffer(), capture.index->base,
+                                                   capture.index->size);
+      }
+      shared_memory_->UseForReading();
+      SubmitBarriers();
+    }
+
+    const auto& vertex_texture_bindings = vertex_shader->GetTextureBindingsAfterTranslation();
+    const size_t pixel_texture_binding_count =
+        pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0;
+    capture.textures.reserve(vertex_texture_bindings.size() + pixel_texture_binding_count);
+    diagnostic::DrawCaptureReason texture_capture_failure_reason =
+        diagnostic::DrawCaptureReason::kNone;
+
+    auto append_texture_uses = [&](uint32_t stage,
+                                   const std::vector<D3D12Shader::TextureBinding>& texture_bindings,
+                                   const std::vector<D3D12Shader::SamplerBinding>& samplers) {
+      for (size_t binding_index = 0; binding_index < texture_bindings.size(); ++binding_index) {
+        const D3D12Shader::TextureBinding& binding = texture_bindings[binding_index];
+        diagnostic::DrawCaptureTextureUse use;
+        use.stage = stage;
+        use.shader_binding_index = uint32_t(binding_index);
+        use.fetch_constant = binding.fetch_constant;
+        use.dimension = uint32_t(binding.dimension);
+        use.is_signed = binding.is_signed;
+        use.host_swizzle = texture_cache_->GetActiveTextureHostSwizzle(binding.fetch_constant);
+        use.swizzled_signs = texture_cache_->GetActiveTextureSwizzledSigns(binding.fetch_constant);
+        // The active host swizzle already includes the guest fetch swizzle.
+        use.component_mapping =
+            use.host_swizzle |
+            D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        for (size_t sampler_index = 0; sampler_index < samplers.size(); ++sampler_index) {
+          if (samplers[sampler_index].fetch_constant == binding.fetch_constant) {
+            use.sampler_value = texture_cache_->GetSamplerParameters(samplers[sampler_index]).value;
+            break;
+          }
+        }
+        // Keep one canonical copy per frame. The identity includes the cache
+        // instance and its watched-data generation, so a recreated or mutated
+        // resource can never reuse stale bytes.
+        capture.textures.emplace_back();
+        LiveFrameTextureReadback& texture_readback = capture.textures.back();
+        texture_readback.use = use;
+        const bool sign_mask_uses_binding =
+            binding.is_signed ? texture_util::IsAnySignSigned(use.swizzled_signs)
+                              : texture_util::IsAnySignNotSigned(use.swizzled_signs);
+        if (!sign_mask_uses_binding) {
+          // Shader translation keeps both signed and unsigned companion
+          // bindings in its layout. An inactive companion is diagnostic data,
+          // not a missing input required by this draw.
+          texture_readback.use.required = false;
+          texture_readback.use.unavailable_reason = diagnostic::DrawCaptureReason::kSignMaskUnused;
+          continue;
+        }
+        const uint64_t remaining_readback_bytes =
+            frame.readback_bytes <= kLiveFrameMaxReadbackBytes
+                ? kLiveFrameMaxReadbackBytes - frame.readback_bytes
+                : 0;
+        D3D12TextureCache::TextureCaptureIdentity identity;
+        const D3D12TextureCache::TextureCaptureResult identity_result =
+            texture_cache_->GetActiveTextureCaptureIdentity(binding, identity);
+        if (identity_result == D3D12TextureCache::TextureCaptureResult::kUnresolved) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason =
+              diagnostic::DrawCaptureReason::kTextureUnresolved;
+          capture.texture_bindings_complete = false;
+          if (capture.acquisition == diagnostic::DrawCaptureAvailability::kComplete) {
+            capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+            capture.acquisition_reason = diagnostic::DrawCaptureReason::kTextureUnresolved;
+          }
+          continue;
+        }
+        if (identity_result == D3D12TextureCache::TextureCaptureResult::kUnsupported) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason =
+              diagnostic::DrawCaptureReason::kTextureDimension;
+          capture.texture_bindings_complete = false;
+          if (capture.acquisition == diagnostic::DrawCaptureAvailability::kComplete) {
+            capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+            capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          }
+          continue;
+        }
+        if (identity_result == D3D12TextureCache::TextureCaptureResult::kResolutionScale) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason = diagnostic::DrawCaptureReason::kResolutionScale;
+          capture.texture_bindings_complete = false;
+          if (capture.acquisition == diagnostic::DrawCaptureAvailability::kComplete) {
+            capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+            capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          }
+          continue;
+        }
+        const auto existing = frame.texture_capture_indices.find(identity);
+        if (existing != frame.texture_capture_indices.end()) {
+          texture_readback.capture_index = existing->second;
+          texture_readback.use.data_available = true;
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kComplete;
+          continue;
+        }
+        const uint32_t capture_index = uint32_t(frame.texture_captures.size());
+        frame.texture_capture_indices.emplace(identity, capture_index);
+        frame.texture_captures.emplace_back();
+        const D3D12TextureCache::TextureCaptureResult result =
+            texture_cache_->ScheduleActiveTextureCapture(
+                binding, frame.texture_captures.back().capture, remaining_readback_bytes);
+        if (result == D3D12TextureCache::TextureCaptureResult::kCaptured &&
+            frame.texture_captures.back().capture.identity != identity) {
+          frame.texture_capture_indices.erase(identity);
+          frame.texture_capture_indices.emplace(frame.texture_captures.back().capture.identity,
+                                                capture_index);
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kUnresolved) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason =
+              diagnostic::DrawCaptureReason::kTextureUnresolved;
+          capture.texture_bindings_complete = false;
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          frame.texture_capture_indices.erase(identity);
+          frame.texture_captures.pop_back();
+          continue;
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kUnsupported) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason =
+              diagnostic::DrawCaptureReason::kTextureDimension;
+          capture.texture_bindings_complete = false;
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          frame.texture_capture_indices.erase(identity);
+          frame.texture_captures.pop_back();
+          continue;
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kResolutionScale) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason = diagnostic::DrawCaptureReason::kResolutionScale;
+          capture.texture_bindings_complete = false;
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          frame.texture_capture_indices.erase(identity);
+          frame.texture_captures.pop_back();
+          continue;
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kReadbackBudget) {
+          texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kUnavailable;
+          texture_readback.use.unavailable_reason = diagnostic::DrawCaptureReason::kReadbackBudget;
+          capture.texture_bindings_complete = false;
+          capture.acquisition = diagnostic::DrawCaptureAvailability::kPartial;
+          capture.acquisition_reason = texture_readback.use.unavailable_reason;
+          frame.texture_capture_indices.erase(identity);
+          frame.texture_captures.pop_back();
+          continue;
+        }
+        if (result == D3D12TextureCache::TextureCaptureResult::kFailed) {
+          texture_capture_failure_reason = diagnostic::DrawCaptureReason::kReadbackAllocation;
+          return false;
+        }
+        if (!reserve_readback(frame.texture_captures.back().capture.buffer_size)) {
+          texture_capture_failure_reason = diagnostic::DrawCaptureReason::kReadbackBudget;
+          return false;
+        }
+        texture_readback.capture_index = capture_index;
+        texture_readback.use.data_available = true;
+        texture_readback.use.availability = diagnostic::DrawCaptureAvailability::kComplete;
+      }
+      return true;
+    };
+    if (!append_texture_uses(0, vertex_texture_bindings,
+                             vertex_shader->GetSamplerBindingsAfterTranslation()) ||
+        (pixel_shader &&
+         !append_texture_uses(1, pixel_shader->GetTextureBindingsAfterTranslation(),
+                              pixel_shader->GetSamplerBindingsAfterTranslation()))) {
+      return texture_capture_failure_reason == diagnostic::DrawCaptureReason::kNone
+                 ? unavailable(diagnostic::DrawCaptureReason::kTextureUnresolved)
+                 : fatal(texture_capture_failure_reason);
+    }
+    if (pixel_shader_was_bound && !pixel_shader) {
+      capture.texture_bindings_complete = false;
+    }
+    (void)used_texture_mask;
+    return finish(capture.acquisition, capture.acquisition_reason, false);
+  } catch (const std::bad_alloc&) {
+    return fatal(diagnostic::DrawCaptureReason::kReadbackAllocation);
+  }
+}
+
+D3D12CommandProcessor::LiveFrameCopyScheduleResult D3D12CommandProcessor::ScheduleLiveFrameCopy(
+    uint64_t event_id) {
+  if (!live_frame_capture_ || !event_id) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kJournal};
+  }
+  const xenos::xe_gpu_vertex_fetch_t fetch = register_file_->GetVertexFetch(0);
+  if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size ||
+      fetch.size > diagnostic::kDrawCaptureMaxGeometryBytes / sizeof(uint32_t)) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kVertexFetch};
+  }
+  const uint64_t byte_address = uint64_t(fetch.address) * sizeof(uint32_t);
+  const uint64_t byte_size = uint64_t(fetch.size) * sizeof(uint32_t);
+  if (byte_address > SharedMemory::kBufferSize ||
+      byte_size > SharedMemory::kBufferSize - byte_address || byte_size > UINT32_MAX) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kVertexFetch};
+  }
+  if (live_frame_capture_->readback_bytes > kLiveFrameMaxReadbackBytes ||
+      byte_size > kLiveFrameMaxReadbackBytes - live_frame_capture_->readback_bytes) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackBudget};
+  }
+  const void* source = memory_->TranslatePhysical(uint32_t(byte_address));
+  if (!source) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kVertexFetch};
+  }
+  try {
+    LiveFrameCopyReadback capture;
+    capture.event_id = event_id;
+    capture.fetch_constant = 0;
+    capture.base = uint32_t(byte_address);
+    capture.size = uint32_t(byte_size);
+    capture.cpu_bytes.resize(capture.size);
+    std::memcpy(capture.cpu_bytes.data(), source, capture.size);
+    live_frame_capture_->readback_bytes += capture.size;
+    live_frame_capture_->copies.push_back(std::move(capture));
+    return {false, diagnostic::DrawCaptureAvailability::kComplete,
+            diagnostic::DrawCaptureReason::kNone};
+  } catch (const std::bad_alloc&) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackAllocation};
+  }
+}
+
+D3D12CommandProcessor::LiveFrameSurfaceScheduleResult
+D3D12CommandProcessor::ScheduleLiveFrameSwapSource(ID3D12Resource* source, DXGI_FORMAT format,
+                                                   uint32_t width, uint32_t height) {
+  if (!live_frame_capture_ || !source || live_frame_capture_->source.buffer) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      source_desc.DepthOrArraySize != 1 || source_desc.MipLevels == 0 ||
+      source_desc.Width > UINT32_MAX || source_desc.Height > UINT32_MAX) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&source_desc, 0, 1, 0, &footprint, &row_count, &row_size,
+                                &buffer_size);
+  if (!row_count || !row_size || row_size > UINT32_MAX || buffer_size > UINT32_MAX) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  if (live_frame_capture_->readback_bytes > kLiveFrameMaxReadbackBytes ||
+      buffer_size > kLiveFrameMaxReadbackBytes - live_frame_capture_->readback_bytes) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackBudget};
+  }
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackAllocation};
+  }
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  deferred_command_list_.D3DCopyTextureRegion(&destination, 0, 0, 0, &source_location, nullptr);
+  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+  live_frame_capture_->readback_bytes += buffer_size;
+  live_frame_capture_->source.buffer = std::move(capture_buffer);
+  live_frame_capture_->source.source_resource = source;
+  live_frame_capture_->source.footprint = footprint;
+  live_frame_capture_->source.row_count = row_count;
+  live_frame_capture_->source.row_size = uint32_t(row_size);
+  live_frame_capture_->source.buffer_size = uint32_t(buffer_size);
+  live_frame_capture_->source_submission = submission_current_;
+  live_frame_capture_->source_format = uint32_t(format);
+  live_frame_capture_->source_width = width;
+  live_frame_capture_->source_height = height;
+  return {false, diagnostic::DrawCaptureAvailability::kComplete,
+          diagnostic::DrawCaptureReason::kNone};
+}
+
+D3D12CommandProcessor::LiveFrameSurfaceScheduleResult
+D3D12CommandProcessor::ScheduleLiveFrameSwapOutput(ID3D12Resource* output, uint32_t width,
+                                                   uint32_t height) {
+  if (!live_frame_capture_ || !output || live_frame_capture_->output.buffer) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  const D3D12_RESOURCE_DESC output_desc = output->GetDesc();
+  if (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      output_desc.DepthOrArraySize != 1 || output_desc.MipLevels == 0 ||
+      output_desc.Width > UINT32_MAX || output_desc.Height > UINT32_MAX) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  UINT64 buffer_size = 0;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  device->GetCopyableFootprints(&output_desc, 0, 1, 0, &footprint, &row_count, &row_size,
+                                &buffer_size);
+  if (!row_count || !row_size || row_size > UINT32_MAX || buffer_size > UINT32_MAX) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kSwap};
+  }
+  if (live_frame_capture_->readback_bytes > kLiveFrameMaxReadbackBytes ||
+      buffer_size > kLiveFrameMaxReadbackBytes - live_frame_capture_->readback_bytes) {
+    return {false, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackBudget};
+  }
+  D3D12_RESOURCE_DESC capture_desc;
+  ui::d3d12::util::FillBufferResourceDesc(capture_desc, uint32_t(buffer_size),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> capture_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &capture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&capture_buffer)))) {
+    return {true, diagnostic::DrawCaptureAvailability::kUnavailable,
+            diagnostic::DrawCaptureReason::kReadbackAllocation};
+  }
+  PushTransitionBarrier(output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION destination = {};
+  destination.pResource = capture_buffer.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = output;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  deferred_command_list_.D3DCopyTextureRegion(&destination, 0, 0, 0, &source_location, nullptr);
+  PushTransitionBarrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  SubmitBarriers();
+  live_frame_capture_->readback_bytes += buffer_size;
+  live_frame_capture_->output.buffer = std::move(capture_buffer);
+  live_frame_capture_->output.source_resource = output;
+  live_frame_capture_->output.footprint = footprint;
+  live_frame_capture_->output.row_count = row_count;
+  live_frame_capture_->output.row_size = uint32_t(row_size);
+  live_frame_capture_->output.buffer_size = uint32_t(buffer_size);
+  live_frame_capture_->output_submission = submission_current_;
+  live_frame_capture_->output_format = uint32_t(output_desc.Format);
+  live_frame_capture_->output_width = width;
+  live_frame_capture_->output_height = height;
+  return {false, diagnostic::DrawCaptureAvailability::kComplete,
+          diagnostic::DrawCaptureReason::kNone};
+}
+
+bool D3D12CommandProcessor::ReadLiveFrameBuffer(ID3D12Resource* buffer, uint32_t size,
+                                                std::vector<uint8_t>& bytes) const {
+  if (!buffer || !size) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, size};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  try {
+    bytes.assign(static_cast<const uint8_t*>(mapping), static_cast<const uint8_t*>(mapping) + size);
+  } catch (const std::bad_alloc&) {
+    const D3D12_RANGE write_range = {0, 0};
+    buffer->Unmap(0, &write_range);
+    return false;
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  buffer->Unmap(0, &write_range);
+  return true;
+}
+
+bool D3D12CommandProcessor::ReadLiveFrameSurface(const LiveFrameTextureReadbackSurface& surface,
+                                                 std::vector<uint8_t>& bytes) const {
+  if (!surface.buffer || !surface.row_count || !surface.row_size ||
+      surface.footprint.Footprint.RowPitch < surface.row_size ||
+      uint64_t(surface.row_size) * surface.row_count > UINT32_MAX) {
+    return false;
+  }
+  const uint64_t row_pitch = surface.footprint.Footprint.RowPitch;
+  if (surface.row_count > 1 && row_pitch > UINT64_MAX / (surface.row_count - 1)) {
+    return false;
+  }
+  const uint64_t last_row_offset = row_pitch * (surface.row_count - 1);
+  if (surface.footprint.Offset > surface.buffer_size ||
+      last_row_offset > surface.buffer_size - surface.footprint.Offset ||
+      surface.row_size > surface.buffer_size - surface.footprint.Offset - last_row_offset) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, surface.buffer_size};
+  void* mapping = nullptr;
+  if (FAILED(surface.buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  try {
+    bytes.resize(size_t(surface.row_size) * surface.row_count);
+    const uint8_t* mapped = static_cast<const uint8_t*>(mapping) + surface.footprint.Offset;
+    for (uint32_t row = 0; row < surface.row_count; ++row) {
+      std::memcpy(bytes.data() + size_t(row) * surface.row_size,
+                  mapped + size_t(row) * surface.footprint.Footprint.RowPitch, surface.row_size);
+    }
+  } catch (const std::bad_alloc&) {
+    const D3D12_RANGE write_range = {0, 0};
+    surface.buffer->Unmap(0, &write_range);
+    return false;
+  }
+  const D3D12_RANGE write_range = {0, 0};
+  surface.buffer->Unmap(0, &write_range);
+  return true;
+}
+
+void D3D12CommandProcessor::FinalizeLiveFrameCapture(uint64_t completed_frame,
+                                                     uint64_t completed_submission) {
+  if (!live_frame_capture_) {
+    return;
+  }
+  const diagnostic::DrawCaptureMailbox::Token mailbox_token = live_frame_capture_->mailbox_token;
+  std::shared_ptr<diagnostic::DrawCaptureFrameSnapshot> snapshot =
+      frame_capture_->TakeOwnedFrame(completed_frame, completed_submission);
+  if (!snapshot) {
+    FailLiveFrameCapture("owned_frame_journal_failed");
+    return;
+  }
+
+  auto find_event = [&snapshot](uint64_t event_id) {
+    return std::find_if(snapshot->events.begin(), snapshot->events.end(),
+                        [event_id](const diagnostic::DrawCaptureFrameEvent& event) {
+                          return event.id == event_id;
+                        });
+  };
+  auto fail = [this](const char* reason) { FailLiveFrameCapture(reason); };
+  try {
+    for (LiveFrameTextureCapture& texture_capture : live_frame_capture_->texture_captures) {
+      if (!texture_capture.capture.buffer || texture_capture.capture.subresources.empty()) {
+        fail("owned_texture_readback_missing");
+        return;
+      }
+      const uint32_t texture_index = uint32_t(snapshot->textures.size());
+      diagnostic::DrawCaptureTexture& texture_snapshot =
+          snapshot->textures.emplace_back(std::move(texture_capture.capture.texture));
+      if (texture_snapshot.subresources.size() != texture_capture.capture.subresources.size()) {
+        fail("owned_texture_subresource_metadata_missing");
+        return;
+      }
+      for (size_t subresource_index = 0;
+           subresource_index < texture_capture.capture.subresources.size(); ++subresource_index) {
+        const D3D12TextureCache::TextureCaptureSubresource& captured =
+            texture_capture.capture.subresources[subresource_index];
+        LiveFrameTextureReadbackSurface surface;
+        surface.buffer = texture_capture.capture.buffer;
+        surface.footprint = captured.footprint;
+        surface.row_count = captured.row_count;
+        surface.row_size = captured.row_size;
+        surface.buffer_size = texture_capture.capture.buffer_size;
+        if (!ReadLiveFrameSurface(surface,
+                                  texture_snapshot.subresources[subresource_index].bytes)) {
+          fail("owned_texture_readback_failed");
+          return;
+        }
+      }
+      if (!texture_snapshot.subresources.empty()) {
+        texture_snapshot.row_pitch = texture_snapshot.subresources[0].row_pitch;
+        texture_snapshot.row_size = texture_snapshot.subresources[0].row_size;
+        texture_snapshot.row_count = texture_snapshot.subresources[0].row_count;
+        texture_snapshot.bytes = texture_snapshot.subresources[0].bytes;
+      }
+      texture_capture.snapshot_index = texture_index;
+      texture_capture.capture.buffer.Reset();
+      texture_capture.capture.source_resource.Reset();
+    }
+    for (LiveFrameDraw& draw : live_frame_capture_->draws) {
+      auto event = find_event(draw.event_id);
+      if (event == snapshot->events.end() ||
+          event->kind != diagnostic::DrawCaptureFrameEvent::Kind::kDraw) {
+        fail("owned_draw_event_missing");
+        return;
+      }
+      event->draw.texture_bindings_complete = draw.texture_bindings_complete;
+      event->draw.acquisition = draw.acquisition;
+      event->draw.acquisition_reason = draw.acquisition_reason;
+      event->acquisition = draw.acquisition;
+      event->acquisition_reason = draw.acquisition_reason;
+      event->draw.draw.index.availability = draw.index_acquisition;
+      event->draw.draw.index.unavailable_reason = draw.index_acquisition_reason;
+      for (LiveFrameVertexReadback& readback : draw.vertex_fetches) {
+        diagnostic::DrawCaptureVertexFetch& fetch = event->draw.draw.vertex_fetches.emplace_back();
+        fetch.fetch_constant = readback.fetch_constant;
+        fetch.base = readback.base;
+        if (!ReadLiveFrameBuffer(readback.buffer.Get(), readback.size, fetch.bytes)) {
+          fail("owned_vertex_readback_failed");
+          return;
+        }
+        readback.buffer.Reset();
+      }
+      if (draw.index) {
+        event->draw.draw.index.present = true;
+        event->draw.draw.index.availability = diagnostic::DrawCaptureAvailability::kComplete;
+        event->draw.draw.index.unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+        event->draw.draw.index.guest_base = draw.index->base;
+        event->draw.draw.guest_index_size = draw.index->size;
+        if (!ReadLiveFrameBuffer(draw.index->buffer.Get(), draw.index->size,
+                                 event->draw.draw.index.bytes)) {
+          fail("owned_index_readback_failed");
+          return;
+        }
+        draw.index->buffer.Reset();
+      }
+      for (LiveFrameTextureReadback& texture : draw.textures) {
+        if (texture.capture_index != UINT32_MAX &&
+            texture.capture_index < live_frame_capture_->texture_captures.size()) {
+          const LiveFrameTextureCapture& texture_capture =
+              live_frame_capture_->texture_captures[texture.capture_index];
+          if (texture_capture.snapshot_index == UINT32_MAX) {
+            fail("owned_texture_snapshot_missing");
+            return;
+          }
+          texture.use.texture_index = texture_capture.snapshot_index;
+        } else {
+          texture.use.data_available = false;
+        }
+        event->draw.texture_uses.push_back(texture.use);
+      }
+    }
+
+    for (LiveFrameCopyReadback& copy : live_frame_capture_->copies) {
+      auto event = find_event(copy.event_id);
+      if (event == snapshot->events.end() ||
+          event->kind != diagnostic::DrawCaptureFrameEvent::Kind::kCopy) {
+        fail("owned_copy_event_missing");
+        return;
+      }
+      diagnostic::DrawCaptureVertexFetch& fetch = event->draw.draw.vertex_fetches.emplace_back();
+      fetch.fetch_constant = copy.fetch_constant;
+      fetch.base = copy.base;
+      fetch.bytes = std::move(copy.cpu_bytes);
+    }
+
+    diagnostic::DrawCaptureFinalSwap& final_swap = snapshot->final_swap;
+    final_swap.frontbuffer_ptr = live_frame_capture_->frontbuffer_ptr;
+    final_swap.source_format = live_frame_capture_->source_format;
+    final_swap.source_width = live_frame_capture_->source_width;
+    final_swap.source_height = live_frame_capture_->source_height;
+    if (live_frame_capture_->source.buffer) {
+      final_swap.source_row_pitch = live_frame_capture_->source.footprint.Footprint.RowPitch;
+      final_swap.source_row_size = live_frame_capture_->source.row_size;
+      final_swap.source_row_count = live_frame_capture_->source.row_count;
+      final_swap.source_availability = diagnostic::DrawCaptureAvailability::kComplete;
+      final_swap.source_unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+      if (!ReadLiveFrameSurface(live_frame_capture_->source, final_swap.source_bytes)) {
+        fail("owned_swap_source_readback_failed");
+        return;
+      }
+      live_frame_capture_->source.buffer.Reset();
+      live_frame_capture_->source.source_resource.Reset();
+    } else {
+      final_swap.source_availability = live_frame_capture_->source_acquisition;
+      final_swap.source_unavailable_reason = live_frame_capture_->source_acquisition_reason;
+    }
+
+    final_swap.output_format = live_frame_capture_->output_format;
+    final_swap.output_width = live_frame_capture_->output_width;
+    final_swap.output_height = live_frame_capture_->output_height;
+    if (live_frame_capture_->output.buffer) {
+      final_swap.output_row_pitch = live_frame_capture_->output.footprint.Footprint.RowPitch;
+      final_swap.output_row_size = live_frame_capture_->output.row_size;
+      final_swap.output_row_count = live_frame_capture_->output.row_count;
+      final_swap.output_availability = diagnostic::DrawCaptureAvailability::kComplete;
+      final_swap.output_unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+      if (!ReadLiveFrameSurface(live_frame_capture_->output, final_swap.output_bytes)) {
+        fail("owned_swap_output_readback_failed");
+        return;
+      }
+      live_frame_capture_->output.buffer.Reset();
+      live_frame_capture_->output.source_resource.Reset();
+    } else {
+      final_swap.output_availability = live_frame_capture_->output_acquisition;
+      final_swap.output_unavailable_reason = live_frame_capture_->output_acquisition_reason;
+    }
+    const auto fold_swap_availability = [&snapshot](
+                                            diagnostic::DrawCaptureAvailability availability,
+                                            diagnostic::DrawCaptureReason reason) {
+      const uint32_t severity = static_cast<uint32_t>(availability);
+      const uint32_t current_severity = static_cast<uint32_t>(snapshot->acquisition);
+      if (severity < current_severity ||
+          (severity == current_severity &&
+           snapshot->acquisition_reason == diagnostic::DrawCaptureReason::kNone &&
+           reason != diagnostic::DrawCaptureReason::kNone)) {
+        snapshot->acquisition = availability;
+        snapshot->acquisition_reason = reason;
+      }
+    };
+    fold_swap_availability(final_swap.source_availability, final_swap.source_unavailable_reason);
+    fold_swap_availability(final_swap.output_availability, final_swap.output_unavailable_reason);
+    final_swap.gamma = std::move(live_frame_capture_->gamma);
+  } catch (const std::bad_alloc&) {
+    fail("owned_frame_snapshot_allocation");
+    return;
+  }
+
+  if (!diagnostic::GetDrawCaptureMailbox()->PublishFrame(mailbox_token, std::move(snapshot))) {
+    diagnostic::GetDrawCaptureMailbox()->Fail(mailbox_token);
+    live_frame_capture_.reset();
+    REXGPU_WARN("D3D12 owned frame capture was cancelled before publication");
+    return;
+  }
+  live_frame_capture_.reset();
+  REXGPU_INFO("D3D12 owned frame capture published at frame {}, submission {}", completed_frame,
+              completed_submission);
+}
+
+void D3D12CommandProcessor::FinalizeDrawCapture() {
+  if (!draw_capture_pending_) {
+    return;
+  }
+  DrawCapture& capture = *draw_capture_pending_;
+  const std::filesystem::path capture_path = capture.path;
+  auto fail = [this](const char* reason, bool retain_buffers) {
+    FailPendingDrawCaptureMailbox();
+    if (retain_buffers) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kSubmissionFailure);
+      RetainDrawCaptureBuffersForRetry();
+    }
+    WriteDrawCaptureFailureManifest(reason);
+    draw_capture_pending_.reset();
+    draw_capture_failure_reason_.clear();
+  };
+  if (!capture.submission || !CheckSubmissionFence(capture.submission)) {
+    fail("submission_failure", true);
+    return;
+  }
+  if (!draw_capture_failure_reason_.empty()) {
+    fail(draw_capture_failure_reason_.c_str(), false);
+    return;
+  }
+  std::shared_ptr<diagnostic::DrawCaptureSnapshot> snapshot;
+  if (capture.mailbox_token) {
+    snapshot = std::make_shared<diagnostic::DrawCaptureSnapshot>();
+    snapshot->frame = capture.frame;
+    snapshot->submission = capture.submission;
+    snapshot->vertex_shader_hash = capture.vertex_shader_hash;
+    snapshot->pixel_shader_hash = capture.pixel_shader_hash;
+    snapshot->primitive_type = capture.primitive_type;
+    snapshot->requested_index_count = capture.requested_index_count;
+    snapshot->major_mode_explicit = capture.major_mode_explicit;
+    snapshot->indexed = capture.indexed;
+    snapshot->guest_draw_vertex_count = capture.guest_draw_vertex_count;
+    snapshot->host_draw_vertex_count = capture.host_draw_vertex_count;
+    snapshot->guest_primitive_type = capture.guest_primitive_type;
+    snapshot->host_primitive_type = capture.host_primitive_type;
+    snapshot->host_vertex_shader_type = capture.host_vertex_shader_type;
+    snapshot->tessellation_mode = capture.tessellation_mode;
+    snapshot->guest_index_base = capture.guest_index_base;
+    snapshot->guest_index_size = capture.guest_index_size;
+    snapshot->host_index_format = capture.host_index_format;
+    snapshot->host_shader_index_endian = capture.host_shader_index_endian;
+    snapshot->host_primitive_reset_enabled = capture.host_primitive_reset_enabled;
+    snapshot->color_target_written = capture.color_target_written;
+    snapshot->used_texture_mask = capture.used_texture_mask;
+    snapshot->normalized_color_mask = capture.normalized_color_mask;
+    snapshot->native_topology = static_cast<uint32_t>(capture.native_topology);
+    snapshot->native_vertex_count = capture.native_vertex_count;
+    snapshot->native_index_count = capture.native_index_count;
+    snapshot->native_instance_count = capture.native_instance_count;
+    snapshot->native_start_vertex = capture.native_start_vertex;
+    snapshot->native_start_index = capture.native_start_index;
+    snapshot->native_base_vertex = capture.native_base_vertex;
+    snapshot->native_start_instance = capture.native_start_instance;
+    snapshot->half_pixel_offset = capture.half_pixel_offset;
+    snapshot->registers = capture.registers;
+    snapshot->vertex_ucode = capture.vertex_ucode;
+    snapshot->pixel_ucode = capture.pixel_ucode;
+    snapshot->vertex_fetches.reserve(capture.vertex_fetch_readbacks.size());
+    for (size_t i = 0; i < capture.vertex_fetch_readbacks.size(); ++i) {
+      diagnostic::DrawCaptureVertexFetch& fetch = snapshot->vertex_fetches.emplace_back();
+      fetch.fetch_constant = capture.vertex_fetch_constants[i];
+      fetch.base = capture.vertex_fetch_ranges[i].base;
+    }
+    snapshot->index.present = capture.indexed;
+    snapshot->index.guest_base = capture.guest_index_base;
+    snapshot->index.format = capture.guest_index_dma_format;
+    snapshot->index.endianness = capture.guest_index_dma_endianness;
+    snapshot->index.count = capture.guest_draw_vertex_count;
+    snapshot->index.dma_count = capture.guest_index_dma_count;
+    snapshot->index.dma_length = capture.guest_index_dma_length;
+  }
+  if (!CreateDiagnosticCaptureParent(capture_path / "manifest.json", "draw")) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+    fail("output_directory", false);
+    return;
+  }
+  std::vector<std::string> file_names;
+  file_names.reserve(5 + capture.vertex_fetch_readbacks.size() + size_t(capture.indexed));
+  file_names.emplace_back("registers.bin");
+  file_names.emplace_back("vertex.ucode.bin");
+  file_names.emplace_back("pixel.ucode.bin");
+  for (const DrawCaptureReadback& readback : capture.vertex_fetch_readbacks) {
+    file_names.push_back(readback.name);
+  }
+  if (capture.indexed) {
+    file_names.push_back(capture.index_readback.name);
+  }
+  file_names.emplace_back(capture.edram_before.name);
+  file_names.emplace_back(capture.edram_after.name);
+  std::error_code error;
+  for (const std::string& name : file_names) {
+    const bool exists = std::filesystem::exists(capture_path / name, error);
+    if (error || exists) {
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+      fail(exists ? "output_exists" : "output_stat", false);
+      return;
+    }
+  }
+  std::vector<std::filesystem::path> temporary_paths;
+  std::vector<std::filesystem::path> published_paths;
+  std::vector<std::pair<std::string, uint64_t>> files;
+  auto cleanup = [&] {
+    for (const std::filesystem::path& path : temporary_paths) {
+      std::error_code cleanup_error;
+      std::filesystem::remove(path, cleanup_error);
+    }
+    for (const std::filesystem::path& path : published_paths) {
+      std::error_code cleanup_error;
+      std::filesystem::remove(path, cleanup_error);
+    }
+  };
+  auto fail_with_cleanup = [&](const char* reason) {
+    RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kFileWrite);
+    cleanup();
+    fail(reason, false);
+  };
+  auto write_dwords = [&](const std::string& name, const std::vector<uint32_t>& dwords) {
+    if (dwords.empty()) {
+      return false;
+    }
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, name);
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_path, remove_error);
+    if (!WriteCaptureDwords(temporary_path, dwords)) {
+      return false;
+    }
+    temporary_paths.push_back(temporary_path);
+    files.emplace_back(name, uint64_t(dwords.size()) * sizeof(uint32_t));
+    return true;
+  };
+  auto write_readback = [&](const DrawCaptureReadback& readback, std::vector<uint8_t>* bytes_out) {
+    if (readback.name.empty() || !readback.buffer || !readback.size) {
+      return false;
+    }
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, readback.name);
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_path, remove_error);
+    if (!WriteCaptureMappedBuffer(temporary_path, readback.buffer.Get(), readback.size,
+                                  bytes_out)) {
+      return false;
+    }
+    temporary_paths.push_back(temporary_path);
+    files.emplace_back(readback.name, readback.size);
+    return true;
+  };
+  if (!write_dwords("registers.bin", capture.registers) ||
+      !write_dwords("vertex.ucode.bin", capture.vertex_ucode) ||
+      !write_dwords("pixel.ucode.bin", capture.pixel_ucode)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  for (size_t i = 0; i < capture.vertex_fetch_readbacks.size(); ++i) {
+    const DrawCaptureReadback& readback = capture.vertex_fetch_readbacks[i];
+    if (!write_readback(readback, snapshot ? &snapshot->vertex_fetches[i].bytes : nullptr)) {
+      fail_with_cleanup("file_write");
+      return;
+    }
+  }
+  if (capture.indexed &&
+      !write_readback(capture.index_readback, snapshot ? &snapshot->index.bytes : nullptr)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  if (!write_readback(capture.edram_before, snapshot ? &snapshot->edram_before : nullptr) ||
+      !write_readback(capture.edram_after, snapshot ? &snapshot->edram_after : nullptr)) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  auto shader_hash = [](uint64_t hash) {
+    std::ostringstream value;
+    value << "0x" << std::uppercase << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return value.str();
+  };
+  std::ostringstream manifest;
+  manifest << "{\n"
+           << "  \"schema_version\":1,\n"
+           << "  \"status\":\"complete\",\n"
+           << "  \"valid\":true,\n"
+           << "  \"completion\":\"queue_fence_and_all_files\",\n"
+           << "  \"encoding\":\"uint32-little-endian\",\n"
+           << "  \"bounds\":{\"max_range_count\":" << diagnostic::kDrawCaptureMaxRangeCount
+           << ",\"max_geometry_bytes\":" << diagnostic::kDrawCaptureMaxGeometryBytes
+           << ",\"max_shader_bytes\":" << diagnostic::kDrawCaptureMaxShaderBytes << "},\n"
+           << "  \"provenance\":{\"backend\":\"d3d12\",\"producer\":"
+           << "\"D3D12CommandProcessor::IssueDraw\",\"intended_consumer\":\"native_replay\","
+           << "\"frame\":" << capture.frame << ",\"submission\":" << capture.submission << "},\n"
+           << "  \"draw\":{\n"
+           << "    \"guest\":{\"primitive_type\":" << capture.primitive_type
+           << ",\"index_count\":" << capture.requested_index_count
+           << ",\"major_mode_explicit\":" << (capture.major_mode_explicit ? "true" : "false")
+           << ",\"guest_draw_vertex_count\":" << capture.guest_draw_vertex_count << ",\"source\":\""
+           << (capture.indexed ? "guest_dma" : "auto_index") << "\"";
+  if (capture.indexed) {
+    manifest << ",\"dma\":{\"base\":" << capture.guest_index_base
+             << ",\"length_bytes\":" << capture.guest_index_dma_length
+             << ",\"count\":" << capture.guest_index_dma_count
+             << ",\"format\":" << capture.guest_index_dma_format
+             << ",\"endianness\":" << capture.guest_index_dma_endianness << "}";
+  }
+  manifest << "},\n"
+           << "    \"processed\":{\"guest_primitive_type\":" << capture.guest_primitive_type
+           << ",\"host_primitive_type\":" << capture.host_primitive_type
+           << ",\"host_vertex_shader_type\":" << capture.host_vertex_shader_type
+           << ",\"tessellation_mode\":" << capture.tessellation_mode
+           << ",\"host_draw_vertex_count\":" << capture.host_draw_vertex_count
+           << ",\"index_buffer_type\":"
+           << (capture.indexed ? uint32_t(PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA)
+                               : uint32_t(PrimitiveProcessor::ProcessedIndexBufferType::kNone))
+           << ",\"host_index_format\":" << capture.host_index_format
+           << ",\"host_shader_index_endian\":" << capture.host_shader_index_endian
+           << ",\"primitive_reset\":" << (capture.host_primitive_reset_enabled ? "true" : "false")
+           << "},\n"
+           << "    \"native\":{\"indexed\":" << (capture.indexed ? "true" : "false")
+           << ",\"topology\":" << uint32_t(capture.native_topology)
+           << ",\"vertex_count\":" << capture.native_vertex_count
+           << ",\"index_count\":" << capture.native_index_count
+           << ",\"instance_count\":" << capture.native_instance_count
+           << ",\"start_vertex\":" << capture.native_start_vertex
+           << ",\"start_index\":" << capture.native_start_index
+           << ",\"base_vertex\":" << capture.native_base_vertex
+           << ",\"start_instance\":" << capture.native_start_instance << "},\n"
+           << "    \"used_texture_mask\":" << capture.used_texture_mask
+           << ",\"normalized_color_mask\":" << capture.normalized_color_mask
+           << ",\"resolution_scale\":[1,1],\n"
+           << "    \"resources\":{\n      \"vertex_fetch_ranges\":[";
+  for (size_t i = 0; i < capture.vertex_fetch_ranges.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << "{\"fetch_constant\":" << capture.vertex_fetch_constants[i]
+             << ",\"base\":" << capture.vertex_fetch_ranges[i].base
+             << ",\"size_bytes\":" << capture.vertex_fetch_ranges[i].size
+             << ",\"file\":\"vertex_fetch_" << capture.vertex_fetch_constants[i] << ".bin\"}";
+  }
+  manifest << "],\n      \"index\":";
+  if (capture.indexed) {
+    manifest << "{\"file\":\"index.bin\",\"base\":" << capture.guest_index_base
+             << ",\"size_bytes\":" << capture.guest_index_size << "}";
+  } else {
+    manifest << "null";
+  }
+  manifest << "\n    }\n  },\n"
+           << "  \"shaders\":{\n"
+           << "    \"vertex\":{\"stage\":\"vertex\",\"hash\":\""
+           << shader_hash(capture.vertex_shader_hash)
+           << "\",\"dword_count\":" << capture.vertex_ucode.size()
+           << ",\"file\":\"vertex.ucode.bin\"},\n"
+           << "    \"pixel\":{\"stage\":\"pixel\",\"hash\":\""
+           << shader_hash(capture.pixel_shader_hash)
+           << "\",\"dword_count\":" << capture.pixel_ucode.size()
+           << ",\"file\":\"pixel.ucode.bin\"}\n"
+           << "  },\n"
+           << "  \"registers\":{\"dword_count\":" << capture.registers.size()
+           << ",\"file\":\"registers.bin\"},\n"
+           << "  \"edram\":{\"path\":\"rov\",\"scale_x\":1,\"scale_y\":1,"
+           << "\"snapshot_size_bytes\":" << capture.edram_before.size
+           << ",\"before_file\":\"edram_before.bin\",\"after_file\":\"edram_after.bin\","
+           << "\"copy_state\":\"copy_source\",\"restored_state\":\"unordered_access\"},\n"
+           << "  \"skip_counts\":{";
+  for (size_t i = 0; i < draw_capture_skip_counts_.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << '"'
+             << diagnostic::GetDrawCaptureSkipReasonName(
+                    static_cast<diagnostic::DrawCaptureSkipReason>(i))
+             << "\":" << draw_capture_skip_counts_[i];
+  }
+  manifest << "},\n  \"files\":[";
+  for (size_t i = 0; i < files.size(); ++i) {
+    if (i) {
+      manifest << ',';
+    }
+    manifest << "{\"name\":\"" << files[i].first << "\",\"size_bytes\":" << files[i].second << "}";
+  }
+  manifest << "]\n}\n";
+  const std::filesystem::path manifest_temporary_path =
+      CaptureTemporaryPath(capture_path, "manifest.json");
+  std::error_code remove_error;
+  std::filesystem::remove(manifest_temporary_path, remove_error);
+  if (!WriteCaptureManifest(manifest_temporary_path, manifest.str())) {
+    fail_with_cleanup("file_write");
+    return;
+  }
+  temporary_paths.push_back(manifest_temporary_path);
+  for (const std::pair<std::string, uint64_t>& file : files) {
+    const std::filesystem::path temporary_path = CaptureTemporaryPath(capture_path, file.first);
+    const std::filesystem::path final_path = capture_path / file.first;
+    std::filesystem::rename(temporary_path, final_path, error);
+    if (error) {
+      fail_with_cleanup("file_publish");
+      return;
+    }
+    published_paths.push_back(final_path);
+  }
+  const std::filesystem::path manifest_path = capture_path / "manifest.json";
+  std::filesystem::remove(manifest_path, error);
+  if (error) {
+    fail_with_cleanup("manifest_publish");
+    return;
+  }
+  std::filesystem::rename(manifest_temporary_path, manifest_path, error);
+  if (error) {
+    fail_with_cleanup("manifest_publish");
+    return;
+  }
+  if (snapshot &&
+      !diagnostic::GetDrawCaptureMailbox()->Publish(capture.mailbox_token, std::move(snapshot))) {
+    diagnostic::GetDrawCaptureMailbox()->Fail(capture.mailbox_token);
+  }
+  const uint64_t captured_frame = capture.frame;
+  const uint64_t captured_submission = capture.submission;
+  draw_capture_pending_.reset();
+  draw_capture_failure_reason_.clear();
+  REXGPU_INFO("Captured D3D12 Xenos draw at frame {}, submission {}, path {}", captured_frame,
+              captured_submission, rex::path_to_utf8(capture_path));
+}
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+}
+
+bool D3D12CommandProcessor::CopyFrameInputGuestMemory(void* context, uint32_t physical_address,
+                                                      std::span<uint8_t> destination) noexcept {
+  auto* command_processor = static_cast<D3D12CommandProcessor*>(context);
+  auto* costs = frame_input_costs.ForOwner(command_processor);
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kGuestRead);
+  if (costs) {
+    costs->ReadRequest(destination.size());
+  }
+  if (!command_processor || !command_processor->memory_ ||
+      destination.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
+  const uint32_t address = physical_address & kPhysicalAddressMask;
+  const uint64_t size = destination.size();
+  if (address > SharedMemory::kBufferSize || size > uint64_t(SharedMemory::kBufferSize) - address) {
+    return false;
+  }
+  if (!destination.empty()) {
+    if (command_processor->IsFrameInputGuestMemoryDirty(address, static_cast<uint32_t>(size))) {
+      return false;
+    }
+    auto* physical_heap = command_processor->memory_->GetPhysicalHeap();
+    const uint32_t high_address = address + static_cast<uint32_t>(size) - 1;
+    if (!physical_heap || physical_heap->QueryRangeAccess(address, high_address) ==
+                              rex::memory::PageAccess::kNoAccess) {
+      return false;
+    }
+    const uint8_t* source = command_processor->memory_->TranslatePhysical(physical_address);
+    if (!source) {
+      return false;
+    }
+    std::memcpy(destination.data(), source, destination.size());
+  }
+  if (costs) {
+    costs->ReadSucceeded(destination.size());
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::RecordFrameInputGuestMemoryDirtyRange(uint32_t physical_address,
+                                                                  uint32_t length) noexcept {
+  constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
+  const uint32_t address = physical_address & kPhysicalAddressMask;
+  if (!length) {
+    return;
+  }
+  if (address >= SharedMemory::kBufferSize || length > SharedMemory::kBufferSize - address) {
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = true;
+    return;
+  }
+  try {
+    const uint64_t new_end = uint64_t(address) + length;
+    for (auto& existing : frame_input_guest_memory_dirty_ranges_) {
+      const uint64_t existing_end = uint64_t(existing.first) + existing.second;
+      if (new_end < existing.first || uint64_t(address) > existing_end) {
+        continue;
+      }
+      const uint64_t merged_start = std::min<uint64_t>(address, existing.first);
+      const uint64_t merged_end = std::max<uint64_t>(new_end, existing_end);
+      existing.first = static_cast<uint32_t>(merged_start);
+      existing.second = static_cast<uint32_t>(merged_end - merged_start);
+      return;
+    }
+    frame_input_guest_memory_dirty_ranges_.emplace_back(address, length);
+  } catch (...) {
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = true;
+  }
+}
+
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryReadable(uint32_t physical_address,
+                                                            uint32_t length) const noexcept {
+  physical_address &= 0x1FFFFFFFu;
+  if (!memory_ || physical_address > SharedMemory::kBufferSize ||
+      uint64_t(length) > uint64_t(SharedMemory::kBufferSize) - physical_address) {
+    return false;
+  }
+  if (!length) {
+    return true;
+  }
+  auto* heap = memory_->GetPhysicalHeap();
+  return !IsFrameInputGuestMemoryDirty(physical_address, length) && heap &&
+         heap->QueryRangeAccess(physical_address, physical_address + length - 1) !=
+             rex::memory::PageAccess::kNoAccess &&
+         memory_->TranslatePhysical(physical_address) != nullptr;
+}
+
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirtyLedger(uint32_t physical_address,
+                                                               uint32_t length) const noexcept {
+  constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
+  const uint32_t address = physical_address & kPhysicalAddressMask;
+  if (!length || address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - address) {
+    return false;
+  }
+  if (frame_input_guest_memory_dirty_all_) {
+    return true;
+  }
+  const uint64_t end = uint64_t(address) + length;
+  for (const auto& dirty : frame_input_guest_memory_dirty_ranges_) {
+    const uint64_t dirty_end = uint64_t(dirty.first) + dirty.second;
+    if (uint64_t(address) < dirty_end && uint64_t(dirty.first) < end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::IsFrameInputGuestMemoryDirty(uint32_t physical_address,
+                                                         uint32_t length) const noexcept {
+  constexpr uint32_t kPhysicalAddressMask = 0x1FFFFFFFu;
+  const uint32_t address = physical_address & kPhysicalAddressMask;
+  if (!length || address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - address) {
+    return false;
+  }
+  if (IsFrameInputGuestMemoryDirtyLedger(address, length)) {
+    return true;
+  }
+  return !shared_memory_ || shared_memory_->IsRangeWrittenByGpu(address, length);
+}
+
+diagnostic::DrawCaptureGuestMemoryVersion D3D12CommandProcessor::GetFrameInputBufferVersion(
+    uint32_t address, uint32_t size) noexcept {
+  try {
+    if (!memory_ || !shared_memory_ || IsFrameInputGuestMemoryDirty(address, size)) {
+      return {};
+    }
+    if (!frame_input_buffer_versions_) {
+      frame_input_buffer_versions_ =
+          std::make_unique<FrameInputBufferVersions>(*memory_, *shared_memory_);
+    }
+    return frame_input_buffer_versions_->Get(address, size);
+  } catch (...) {
+    // Optional watch metadata must never suppress an otherwise valid draw.
+    return {};
+  }
+}
+
+void D3D12CommandProcessor::RefreshFrameInputObserver() {
+  const auto mailbox = diagnostic::GetDrawCaptureMailbox();
+  if (!mailbox->HasFrameInputObserver()) {
+    frame_input_buffer_versions_.reset();
+    frame_input_native_sources_.reset();
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+    frame_input_native_source_generation_ = 0;
+    LogFrameInputCosts(frame_input_costs.Bind(false, nullptr, 0));
+    frame_input_observer_token_ = {};
+    frame_input_frame_open_ = false;
+    frame_input_prepared_draws_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  const auto token = mailbox->GetFrameInputObserverToken();
+  frame_input_prepared_draws_ = mailbox->HasFrameInputPreparedDrawObserver(token);
+  LogFrameInputCosts(
+      frame_input_costs.Bind(REXCVAR_GET(d3d12_frame_input_costs), this, token.value));
+  if (token != frame_input_observer_token_) {
+    frame_input_buffer_versions_.reset();
+    frame_input_native_sources_.reset();
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+    frame_input_native_source_generation_ = 0;
+    frame_input_observer_token_ = token;
+    frame_input_next_event_id_ = 1;
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+  }
+  if (frame_input_prepared_draws_ && !frame_input_native_sources_) {
+    try {
+      if (!frame_input_native_source_rejections_) {
+        frame_input_native_source_rejections_ =
+            std::make_unique<FrameInputNativeSourceRejections>();
+        // A failed allocation may have left no interval owner. Retain that
+        // uncertainty across observer replacement before allowing CPU reads.
+        if (frame_input_native_sources_failed_) {
+          frame_input_native_source_rejections_->FailClosed();
+        }
+      }
+      frame_input_native_sources_ = std::make_unique<FrameInputNativeSources>(
+          *memory_, *shared_memory_, frame_input_native_source_rejections_.get());
+    } catch (...) {
+      // Keep the original command running while native-source admission stays
+      // closed for this command processor lifetime.
+      frame_input_native_sources_failed_ = true;
+      if (frame_input_native_source_rejections_) {
+        frame_input_native_source_rejections_->FailClosed();
+      }
+    }
+  }
+}
+
+void D3D12CommandProcessor::DispatchFrameInputDraw(
+    xenos::PrimitiveType primitive_type, uint32_t index_count,
+    const IndexBufferInfo* index_buffer_info, bool major_mode_explicit, D3D12Shader* vertex_shader,
+    D3D12Shader* pixel_shader, bool original_host_issued,
+    diagnostic::DrawCaptureExecutionStatus execution_status,
+    diagnostic::DrawCaptureReason execution_reason, bool prepared) {
+  try {
+    RefreshFrameInputObserver();
+  } catch (...) {
+    // Observer setup is diagnostic-only and must not interrupt the original
+    // draw if mailbox initialization cannot allocate.
+    return;
+  }
+  const auto token = frame_input_observer_token_;
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+  } catch (...) {
+    return;
+  }
+  if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver() ||
+      (prepared && !mailbox->HasFrameInputPreparedDrawObserver(token))) {
+    return;
+  }
+
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame_current_, submission_current_);
+  }
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kDrawTotal);
+  const RegisterFile& regs = *register_file_;
+  diagnostic::DrawCaptureFrameInputDrawView draw;
+  draw.id = frame_input_next_event_id_;
+  if (!prepared) {
+    ++frame_input_next_event_id_;
+  }
+  draw.frame = frame_current_;
+  draw.submission = submission_current_;
+  draw.registers = std::span<const uint32_t>(regs.values, RegisterFile::kRegisterCount);
+  draw.primitive_type = static_cast<uint32_t>(primitive_type);
+  draw.requested_index_count = index_count;
+  draw.major_mode_explicit = major_mode_explicit;
+  draw.indexed = index_buffer_info != nullptr;
+  draw.original_host_issued = original_host_issued;
+  draw.execution_status = execution_status;
+  draw.execution_reason = execution_reason;
+  draw.cpu_data_complete =
+      original_host_issued && execution_status == diagnostic::DrawCaptureExecutionStatus::kIssued;
+  draw.unavailable_reason = execution_reason;
+
+  D3D12Shader* guest_vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
+  D3D12Shader* guest_pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
+  if (!guest_vertex_shader) {
+    guest_vertex_shader = vertex_shader;
+  }
+  if (!guest_pixel_shader) {
+    guest_pixel_shader = pixel_shader;
+  }
+  // Host setup may omit the pixel shader for a depth-only draw. Retain the
+  // guest program identity even when no host pixel shader was necessary.
+  FrameInputDrawBuilder::PopulateShaderViews(guest_vertex_shader, guest_pixel_shader, draw);
+  if (index_buffer_info) {
+    draw.index.present = true;
+    draw.index.format = static_cast<uint32_t>(index_buffer_info->format);
+    draw.index.endianness = static_cast<uint32_t>(index_buffer_info->endianness);
+    draw.index.count = index_buffer_info->count;
+    draw.index.physical_address = index_buffer_info->guest_base;
+    draw.index.size = index_buffer_info->length > UINT32_MAX
+                          ? 0
+                          : static_cast<uint32_t>(index_buffer_info->length);
+  }
+  auto dispatch_draw = [&] {
+    return ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kDrawCallback, [&] {
+      return prepared ? mailbox->DispatchFrameInputPreparedDraw(token, draw)
+                      : mailbox->DispatchFrameInputDraw(token, draw);
+    });
+  };
+  if (!prepared && execution_status != diagnostic::DrawCaptureExecutionStatus::kIssued) {
+    (void)dispatch_draw();
+    return;
+  }
+
+  try {
+    FrameInputCostScope shader_cost_scope(costs, FrameInputCosts::Stage::kDrawShader);
+    if (vertex_shader) {
+      pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+    }
+    if (pixel_shader) {
+      pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+    }
+    if (guest_pixel_shader && !pixel_shader) {
+      // Retain the raw guest binding list for depth-only or otherwise omitted
+      // host pixel shaders. A used binding is explicitly unavailable below.
+      pipeline_cache_->AnalyzeShaderUcode(*guest_pixel_shader);
+    }
+    shader_cost_scope.Finish();
+
+    if (prepared && (!guest_vertex_shader || !guest_vertex_shader->is_ucode_analyzed() ||
+                     !guest_pixel_shader || !guest_pixel_shader->is_ucode_analyzed())) {
+      draw.cpu_data_complete = false;
+      draw.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+      (void)dispatch_draw();
+      return;
+    }
+
+    const diagnostic::DrawCaptureGuestMemoryReader memory_reader{
+        this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
+    if (prepared) {
+      FrameInputCostScope texture_cost_scope(costs, FrameInputCosts::Stage::kDrawTextures);
+      FrameInputDrawBuilderInput builder_input{
+          regs,
+          *texture_cache_,
+          vertex_shader,
+          pixel_shader,
+          guest_vertex_shader,
+          guest_pixel_shader,
+          memory_reader,
+          [this](uint32_t address, uint32_t size) {
+            return IsFrameInputGuestMemoryDirtyLedger(address, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return !shared_memory_ ||
+                   shared_memory_->IsRangeWrittenByGpu(address & 0x1FFFFFFFu, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return IsFrameInputGuestMemoryReadable(address, size);
+          },
+          [this](uint32_t address, uint32_t size) {
+            return GetFrameInputBufferVersion(address, size);
+          },
+          [this](const Shader::PreparedSamplerBinding& binding, uint32_t& value) {
+            D3D12Shader::SamplerBinding sampler{0,
+                                                binding.fetch_constant,
+                                                binding.sampler.mag_filter,
+                                                binding.sampler.min_filter,
+                                                binding.sampler.mip_filter,
+                                                binding.sampler.aniso_filter};
+            value = texture_cache_->GetSamplerParameters(sampler).value;
+            return true;
+          },
+          [this](uint32_t address, uint32_t size) {
+            address &= 0x1FFFFFFFu;
+            // A failed resolve invalidates every retained CPU range. Do this
+            // before native-source classification so the exact RG16 owner
+            // cannot bypass a fail-closed dirty-all ledger.
+            if (frame_input_guest_memory_dirty_all_) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            if (frame_input_native_sources_failed_ && !frame_input_native_source_rejections_) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            if (frame_input_native_sources_) {
+              switch (frame_input_native_sources_->Classify(address, size)) {
+                case FrameInputNativeSources::State::kUnresolved:
+                  return diagnostic::DrawCaptureReason::kTextureUnresolved;
+                case FrameInputNativeSources::State::kRejected:
+                  return diagnostic::DrawCaptureReason::kTextureSource;
+                default:
+                  break;
+              }
+            }
+            if (frame_input_native_source_rejections_ &&
+                frame_input_native_source_rejections_->Overlaps(address, size)) {
+              return diagnostic::DrawCaptureReason::kTextureSource;
+            }
+            return diagnostic::DrawCaptureReason::kNone;
+          },
+          index_count};
+      FrameInputDrawBuilderResult builder_result;
+      (void)FrameInputDrawBuilder::BuildPrepared(builder_input, builder_result, draw);
+      if (frame_input_native_sources_) {
+        for (auto& view : builder_result.textures) {
+          if (!frame_input_native_sources_->BindTextureView(view)) {
+            draw.cpu_data_complete = false;
+            draw.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+          }
+        }
+      }
+      texture_cost_scope.Finish();
+      (void)dispatch_draw();
+      return;
+    }
+    std::vector<diagnostic::DrawCaptureFrameInputVertexFetchView> vertex_fetches;
+    bool vertex_fetches_valid = vertex_shader != nullptr;
+    bool vertex_fetch_dirty = false;
+    if (vertex_shader) {
+      const Shader::ConstantRegisterMap& constant_map = vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t bits = constant_map.vertex_fetch_bitmap[i];
+        uint32_t bit = 0;
+        while (rex::bit_scan_forward(bits, &bit)) {
+          bits &= ~(uint32_t(1) << bit);
+          const uint32_t fetch_constant = i * 32 + bit;
+          const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(fetch_constant);
+          diagnostic::DrawCaptureFrameInputVertexFetchView view;
+          view.fetch_constant = fetch_constant;
+          const uint64_t physical_address = uint64_t(fetch.address) * sizeof(uint32_t);
+          view.physical_address =
+              physical_address > UINT32_MAX ? 0 : static_cast<uint32_t>(physical_address);
+          view.size =
+              fetch.size > UINT32_MAX / sizeof(uint32_t) ? 0 : fetch.size * sizeof(uint32_t);
+          view.memory = memory_reader;
+          if (!fetch.size || fetch.size > UINT32_MAX / sizeof(uint32_t) ||
+              physical_address > SharedMemory::kBufferSize ||
+              uint64_t(view.size) > uint64_t(SharedMemory::kBufferSize) - physical_address) {
+            vertex_fetches_valid = false;
+          } else if (IsFrameInputGuestMemoryDirty(view.physical_address, view.size)) {
+            vertex_fetches_valid = false;
+            vertex_fetch_dirty = true;
+          } else if (prepared &&
+                     !IsFrameInputGuestMemoryReadable(view.physical_address, view.size)) {
+            vertex_fetches_valid = false;
+          } else {
+            view.memory_version = GetFrameInputBufferVersion(view.physical_address, view.size);
+          }
+          vertex_fetches.push_back(view);
+        }
+      }
+    }
+
+    std::vector<std::array<uint32_t, 6>> texture_words;
+    std::vector<diagnostic::DrawCaptureFrameInputTextureView> textures;
+    FrameInputCostScope texture_cost_scope(costs, FrameInputCosts::Stage::kDrawTextures);
+    // Translation may still be asynchronous during preparation. Only original
+    // delivery reads its published bindings; prepared demand uses raw analysis.
+    const size_t vertex_texture_binding_count =
+        !prepared && vertex_shader ? vertex_shader->GetTextureBindingsAfterTranslation().size() : 0;
+    const size_t pixel_texture_binding_count =
+        !prepared && pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0;
+    const size_t missing_pixel_texture_binding_count =
+        (guest_pixel_shader && !pixel_shader) ? guest_pixel_shader->texture_bindings().size() : 0;
+    const size_t texture_binding_count = vertex_texture_binding_count +
+                                         pixel_texture_binding_count +
+                                         missing_pixel_texture_binding_count;
+    const size_t prepared_binding_capacity =
+        prepared ? 2 * (guest_vertex_shader->texture_bindings().size() +
+                        guest_pixel_shader->texture_bindings().size())
+                 : 0;
+    texture_words.reserve(
+        std::max<size_t>(xenos::kTextureFetchConstantCount,
+                         std::max(texture_binding_count, prepared_binding_capacity)));
+    textures.reserve(texture_words.capacity());
+    bool texture_bindings_complete = true;
+
+    auto append_texture_view =
+        [&](uint32_t stage, uint32_t shader_binding_index, uint32_t fetch_constant, bool is_signed,
+            const std::vector<D3D12Shader::SamplerBinding>& samplers, bool available,
+            diagnostic::DrawCaptureReason unavailable_reason) -> bool {
+      if (fetch_constant >= xenos::kTextureFetchConstantCount) {
+        diagnostic::DrawCaptureFrameInputTextureView view;
+        view.fetch_constant = fetch_constant;
+        view.stage = stage;
+        view.shader_binding_index = shader_binding_index;
+        view.is_signed = is_signed;
+        view.available = false;
+        view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+        textures.push_back(view);
+        return false;
+      }
+      const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
+      texture_words.push_back({fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
+                               fetch.dword_4, fetch.dword_5});
+      diagnostic::DrawCaptureFrameInputTextureView view;
+      view.fetch_constant = fetch_constant;
+      view.fetch_words = texture_words.back();
+      view.stage = stage;
+      view.shader_binding_index = shader_binding_index;
+      view.is_signed = is_signed;
+      view.available = available;
+      view.unavailable_reason =
+          available ? diagnostic::DrawCaptureReason::kNone : unavailable_reason;
+      if (!available) {
+        textures.push_back(view);
+        return false;
+      }
+      if (fetch.type != xenos::FetchConstantType::kTexture) {
+        view.available = false;
+        view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+        textures.push_back(view);
+        return false;
+      }
+      if (prepared) {
+        if (!texture_cache_->PrepareFrameInputTexture(fetch, view)) {
+          textures.push_back(view);
+          return false;
+        }
+        view.component_mapping |=
+            D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        bool sampler_found = false;
+        for (const auto& sampler : samplers) {
+          if (sampler.fetch_constant != fetch_constant) {
+            continue;
+          }
+          const uint32_t value = texture_cache_->GetSamplerParameters(sampler).value;
+          if (sampler_found && view.sampler_value != value) {
+            view.available = false;
+            view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+            textures.push_back(view);
+            return false;
+          }
+          sampler_found = true;
+          view.sampler_value = value;
+        }
+        view.memory = memory_reader;
+        view.gpu_written = IsFrameInputGuestMemoryDirty(view.base_address, view.base_size) ||
+                           IsFrameInputGuestMemoryDirty(view.mip_address, view.mip_size);
+        if (!sampler_found ||
+            (view.required &&
+             (view.gpu_written ||
+              !IsFrameInputGuestMemoryReadable(view.base_address, view.base_size) ||
+              !IsFrameInputGuestMemoryReadable(view.mip_address, view.mip_size)))) {
+          view.available = false;
+          view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+        }
+        // Missing watches use the established guarded reader fallback. No
+        // active-upload token can describe this unprepared CPU metadata.
+        textures.push_back(view);
+        return view.available || !view.required;
+      }
+      if ((fetch.dimension == xenos::DataDimension::k1D && fetch.stacked) ||
+          (fetch.dimension == xenos::DataDimension::k3D && fetch.stacked) ||
+          (fetch.dimension == xenos::DataDimension::kCube &&
+           (fetch.stacked || fetch.size_2d.stack_depth != 5))) {
+        view.available = false;
+        view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureDimension;
+        textures.push_back(view);
+        return false;
+      }
+      TextureInfo texture_info{};
+      if (!TextureInfo::Prepare(fetch, &texture_info)) {
+        view.available = false;
+        view.unavailable_reason = diagnostic::DrawCaptureReason::kTextureSource;
+        textures.push_back(view);
+        return false;
+      }
+      view.swizzled_signs = texture_cache_->GetActiveTextureSwizzledSigns(fetch_constant);
+      view.component_mapping =
+          texture_cache_->GetActiveTextureHostSwizzle(fetch_constant) |
+          D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+      view.required = is_signed ? texture_util::IsAnySignSigned(view.swizzled_signs)
+                                : texture_util::IsAnySignNotSigned(view.swizzled_signs);
+      for (const auto& sampler : samplers) {
+        if (sampler.fetch_constant == fetch_constant) {
+          view.sampler_value = texture_cache_->GetSamplerParameters(sampler).value;
+          break;
+        }
+      }
+      view.format = static_cast<uint32_t>(texture_info.format);
+      view.endianness = static_cast<uint32_t>(texture_info.endianness);
+      view.dimension = static_cast<uint32_t>(texture_info.dimension);
+      view.width = texture_info.width;
+      view.height = texture_info.height;
+      view.depth = texture_info.depth;
+      view.pitch = texture_info.pitch;
+      view.mip_min_level = texture_info.mip_min_level;
+      view.mip_max_level = texture_info.mip_max_level;
+      view.tiled = texture_info.is_tiled;
+      view.packed_mips = texture_info.has_packed_mips;
+      view.base_address = texture_info.memory.base_address;
+      view.base_size = texture_info.memory.base_size;
+      view.mip_address = texture_info.memory.mip_address;
+      view.mip_size = texture_info.memory.mip_size;
+      view.gpu_written = IsFrameInputGuestMemoryDirty(view.base_address, view.base_size) ||
+                         IsFrameInputGuestMemoryDirty(view.mip_address, view.mip_size);
+      view.memory = memory_reader;
+      if (view.required && !view.gpu_written) {
+        view.memory_version =
+            texture_cache_->GetActiveTextureGuestMemoryVersion(fetch_constant, is_signed);
+      }
+      textures.push_back(view);
+      return true;
+    };
+
+    auto append_shader_texture_views = [&](uint32_t stage, D3D12Shader* shader) {
+      if (!shader) {
+        return;
+      }
+      if (prepared) {
+        std::vector<Shader::PreparedTextureBinding> bindings;
+        std::vector<Shader::PreparedSamplerBinding> overrides;
+        if (!Shader::PrepareTextureBindings(shader->texture_bindings(), stage != 0, bindings,
+                                            overrides)) {
+          texture_bindings_complete = false;
+          return;
+        }
+        std::vector<D3D12Shader::SamplerBinding> samplers;
+        samplers.reserve(overrides.size());
+        for (const auto& binding : overrides) {
+          samplers.push_back({0, binding.fetch_constant, binding.sampler.mag_filter,
+                              binding.sampler.min_filter, binding.sampler.mip_filter,
+                              binding.sampler.aniso_filter});
+        }
+        for (size_t i = 0; i < bindings.size(); ++i) {
+          const auto& binding = bindings[i];
+          if (!append_texture_view(stage, static_cast<uint32_t>(i), binding.fetch_constant,
+                                   binding.is_signed, samplers, true,
+                                   diagnostic::DrawCaptureReason::kNone)) {
+            texture_bindings_complete = false;
+          }
+        }
+        return;
+      }
+      const auto& bindings = shader->GetTextureBindingsAfterTranslation();
+      const auto& samplers = shader->GetSamplerBindingsAfterTranslation();
+      for (size_t binding_index = 0; binding_index < bindings.size(); ++binding_index) {
+        const auto& binding = bindings[binding_index];
+        if (!append_texture_view(stage, static_cast<uint32_t>(binding_index),
+                                 binding.fetch_constant, binding.is_signed, samplers, true,
+                                 diagnostic::DrawCaptureReason::kNone)) {
+          texture_bindings_complete = false;
+        }
+      }
+    };
+
+    append_shader_texture_views(0, vertex_shader);
+    append_shader_texture_views(1, pixel_shader);
+    if (guest_pixel_shader && !pixel_shader) {
+      const auto& guest_bindings = guest_pixel_shader->texture_bindings();
+      for (size_t binding_index = 0; binding_index < guest_bindings.size(); ++binding_index) {
+        const auto& binding = guest_bindings[binding_index];
+        append_texture_view(1, static_cast<uint32_t>(binding_index), binding.fetch_constant, false,
+                            {}, false, diagnostic::DrawCaptureReason::kTextureSource);
+      }
+      const bool omitted_pixel_bindings_complete =
+          guest_bindings.empty() && guest_pixel_shader->is_ucode_analyzed();
+      texture_bindings_complete = prepared
+                                      ? texture_bindings_complete && omitted_pixel_bindings_complete
+                                      : omitted_pixel_bindings_complete;
+    }
+    texture_cost_scope.Finish();
+    if (costs) {
+      // Sample while the token's context is valid. A current token here does
+      // not guarantee collector reuse, exact title ranges or GPU completion.
+      for (const auto& view : textures) {
+        using Texture = FrameInputCosts::Texture;
+        Texture state = Texture::kMissing;
+        if (!view.available) {
+          state = Texture::kUnavailable;
+        } else if (!view.required) {
+          state = Texture::kNotRequired;
+        } else if (view.gpu_written) {
+          state = Texture::kGpuWritten;
+        } else if (view.memory_version.identity && view.memory_version.generation &&
+                   view.memory_version.check) {
+          state = view.memory_version.IsCurrent() ? Texture::kCurrent : Texture::kStale;
+        }
+        costs->AddTexture(state);
+      }
+    }
+
+    bool index_valid = true;
+    bool index_dirty = false;
+    if (index_buffer_info) {
+      draw.index.memory = memory_reader;
+      index_valid = index_buffer_info->length != 0 &&
+                    index_buffer_info->guest_base <= SharedMemory::kBufferSize &&
+                    index_buffer_info->length <=
+                        uint64_t(SharedMemory::kBufferSize) - index_buffer_info->guest_base &&
+                    !IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
+      index_dirty = !index_valid && draw.index.size != 0 &&
+                    IsFrameInputGuestMemoryDirty(draw.index.physical_address, draw.index.size);
+      if (prepared && index_valid &&
+          !IsFrameInputGuestMemoryReadable(draw.index.physical_address, draw.index.size)) {
+        index_valid = false;
+      }
+      const uint32_t element_size = draw.index.format == 0 ? 2 : draw.index.format == 1 ? 4 : 0;
+      const uint64_t consumed_size = uint64_t(index_count) * element_size;
+      if (index_valid && element_size && index_count && index_count <= draw.index.count &&
+          consumed_size <= draw.index.size) {
+        draw.index.memory_version = GetFrameInputBufferVersion(
+            draw.index.physical_address, static_cast<uint32_t>(consumed_size));
+      }
+    }
+    draw.vertex_fetches = vertex_fetches;
+    draw.textures = textures;
+    draw.cpu_data_complete = vertex_fetches_valid && index_valid && texture_bindings_complete;
+    if (!draw.cpu_data_complete) {
+      draw.unavailable_reason =
+          (vertex_fetch_dirty || index_dirty) ? diagnostic::DrawCaptureReason::kMemexport
+          : !vertex_fetches_valid             ? diagnostic::DrawCaptureReason::kVertexFetch
+          : !index_valid                      ? diagnostic::DrawCaptureReason::kIndexSource
+                                              : diagnostic::DrawCaptureReason::kTextureSource;
+    } else {
+      draw.unavailable_reason = diagnostic::DrawCaptureReason::kNone;
+    }
+    if (vertex_shader && vertex_shader->memexport_eM_written() != 0) {
+      draw.cpu_data_complete = false;
+      draw.unavailable_reason = diagnostic::DrawCaptureReason::kMemexport;
+    }
+    if (pixel_shader && pixel_shader->memexport_eM_written() != 0) {
+      draw.cpu_data_complete = false;
+      draw.unavailable_reason = diagnostic::DrawCaptureReason::kMemexport;
+    }
+    (void)dispatch_draw();
+  } catch (...) {
+    // Diagnostic preparation is auxiliary: failed allocation or unsupported
+    // descriptors report an incomplete observer event without changing the
+    // original result or escaping into PM4.
+    draw.vertex_fetches = {};
+    draw.textures = {};
+    draw.cpu_data_complete = false;
+    draw.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
+    (void)dispatch_draw();
+  }
+}
+
+void D3D12CommandProcessor::DispatchFrameInputCopy(std::string_view copy_mode,
+                                                   bool original_succeeded,
+                                                   uint32_t written_address,
+                                                   uint32_t written_length, bool prepared) {
+  try {
+    RefreshFrameInputObserver();
+  } catch (...) {
+    return;
+  }
+  const auto token = frame_input_observer_token_;
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+  } catch (...) {
+    return;
+  }
+  if (!token || !frame_input_frame_open_ || !mailbox->HasFrameInputObserver()) {
+    return;
+  }
+  if (prepared && !mailbox->HasFrameInputPreparedCopyObserver(token)) {
+    return;
+  }
+  diagnostic::DrawCaptureFrameInputCopyView copy;
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame_current_, submission_current_);
+  }
+  FrameInputCostScope cost_scope(costs, FrameInputCosts::Stage::kCopyTotal);
+  copy.id = frame_input_next_event_id_;
+  if (!prepared) {
+    ++frame_input_next_event_id_;
+  }
+  copy.frame = frame_current_;
+  copy.submission = submission_current_;
+  copy.copy_mode = copy_mode;
+  copy.original_succeeded = original_succeeded;
+  copy.written_address = written_address;
+  copy.written_length = written_length;
+  FrameInputCopyGeometry geometry;
+  try {
+    copy.source_geometry.memory = {this, &D3D12CommandProcessor::CopyFrameInputGuestMemory};
+    PrepareFrameInputCopyPlan(
+        copy, *register_file_, *memory_, texture_cache_->draw_resolution_scale_x(),
+        texture_cache_->draw_resolution_scale_y(),
+        render_target_cache_->IsFixed16TruncatedToMinus1To1(), geometry, prepared);
+    if (prepared && geometry.present) {
+      copy.source_geometry.memory = {&geometry, &FrameInputCopyGeometry::Read};
+    } else if (!prepared && copy.source_geometry.size &&
+               IsFrameInputGuestMemoryReadable(copy.source_geometry.physical_address,
+                                               copy.source_geometry.size)) {
+      copy.source_geometry.memory_version = GetFrameInputBufferVersion(
+          copy.source_geometry.physical_address & 0x1FFFFFFFu, copy.source_geometry.size);
+    }
+  } catch (...) {
+    // Diagnostic view preparation is auxiliary to the original copy. Preserve
+    // its result and range while omitting any partially prepared CPU view.
+    copy.registers = {};
+    copy.source_geometry = {};
+    copy.source_rect_present = false;
+    copy.cpu_data_complete = false;
+    copy.unavailable_reason = diagnostic::DrawCaptureReason::kExecutionFailure;
+    copy.planned_address = copy.planned_length = 0;
+  }
+  FrameInputNativeSources::Composition composition;
+  if (prepared && FrameInputNativeSources::GetPreparedResolvePlan(copy, composition)) {
+    if (frame_input_native_sources_failed_) {
+      try {
+        if (!frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_ =
+              std::make_unique<FrameInputNativeSourceRejections>();
+        }
+        (void)frame_input_native_source_rejections_->Add(copy.planned_address, copy.planned_length);
+      } catch (...) {
+        if (frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_->FailClosed();
+        }
+      }
+      frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+      frame_input_native_source_generation_ = 0;
+    } else {
+      try {
+        if (!frame_input_native_source_rejections_) {
+          frame_input_native_source_rejections_ =
+              std::make_unique<FrameInputNativeSourceRejections>();
+        }
+        if (!frame_input_native_sources_) {
+          frame_input_native_sources_ = std::make_unique<FrameInputNativeSources>(
+              *memory_, *shared_memory_, frame_input_native_source_rejections_.get());
+        }
+        if (frame_input_native_sources_->Arm(copy.planned_address, copy.planned_length, copy.id,
+                                             composition.width ? &composition : nullptr)) {
+          frame_input_native_source_address_ = copy.planned_address;
+          frame_input_native_source_length_ = copy.planned_length;
+          frame_input_native_source_generation_ = copy.id;
+        } else {
+          frame_input_native_sources_failed_ = frame_input_native_sources_->failed();
+          (void)frame_input_native_source_rejections_->Add(copy.planned_address,
+                                                           copy.planned_length);
+          frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+          frame_input_native_source_generation_ = 0;
+        }
+      } catch (...) {
+        // Native-source observation is auxiliary; failed owners close metadata
+        // to prevent stale CPU fallback for this plan. Keep the observer alive
+        // and ordinary CPU texture handling unchanged.
+        frame_input_native_sources_failed_ = true;
+        if (frame_input_native_source_rejections_) {
+          (void)frame_input_native_source_rejections_->Add(copy.planned_address,
+                                                           copy.planned_length);
+          frame_input_native_source_rejections_->FailClosed();
+        }
+        frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+        frame_input_native_source_generation_ = 0;
+      }
+    }
+  } else if (!prepared && frame_input_native_sources_ && frame_input_native_source_address_ &&
+             frame_input_native_source_length_) {
+    frame_input_native_sources_->Complete(frame_input_native_source_address_,
+                                          frame_input_native_source_length_, original_succeeded,
+                                          frame_input_native_source_generation_);
+    frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+    frame_input_native_source_generation_ = 0;
+  }
+  (void)ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kCopyCallback, [&] {
+    return prepared ? mailbox->DispatchFrameInputPreparedCopy(token, copy)
+                    : mailbox->DispatchFrameInputCopy(token, copy);
+  });
+}
+
+void D3D12CommandProcessor::DispatchFrameInputSwap(
+    uint64_t frame, uint64_t submission, uint64_t frontbuffer_ptr, uint32_t frontbuffer_width,
+    uint32_t frontbuffer_height, const FrameInputSwapIdentity* identity, bool prepared) {
+  // Previous draw/copy views have returned. Swap views borrow no buffer token;
+  // reclaim per-frame metadata before assembling the next boundary.
+  if ((!identity || prepared) && frame_input_buffer_versions_) {
+    frame_input_buffer_versions_->Reset();
+  }
+  try {
+    if (!identity) {
+      RefreshFrameInputObserver();
+    }
+  } catch (...) {
+    return;
+  }
+  const auto token = identity ? identity->token : frame_input_observer_token_;
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+  } catch (...) {
+    if (prepared) {
+      // The decoded owner retains the selected mailbox and fails that stream
+      // closed, including cleanup, without letting failure escape IssueSwap.
+      throw;
+    }
+    return;
+  }
+  if (!token || token != frame_input_observer_token_ ||
+      token != mailbox->GetFrameInputObserverToken()) {
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  // A prepared observer attached after decode starts at the next decoded
+  // boundary; a legacy post-swap cannot open its prepared stream retroactively.
+  if (!identity && mailbox->HasFrameInputPreparedSwapObserver(token)) {
+    return;
+  }
+
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame, submission);
+  }
+  FrameInputSwapView storage;
+  const auto swap = storage.Build(
+      *register_file_, gamma_ramp_256_entry_table(), gamma_ramp_pwl_rgb(),
+      GetActualSwapPostEffect(), identity ? identity->id : frame_input_next_event_id_++, frame,
+      submission, frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // The original result is not known until the surrounding submission ends;
+  // OnFrameEnd carries that result after the presenter refresh.
+  if ((!identity || prepared) && !frame_input_frame_open_) {
+    if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kBeginCallback,
+                                   [&] { return mailbox->DispatchFrameInputBegin(token, swap); })) {
+      frame_input_frame_open_ = false;
+      frame_input_guest_memory_dirty_ranges_.clear();
+      frame_input_guest_memory_dirty_all_ = false;
+      return;
+    }
+    frame_input_frame_open_ = true;
+  }
+  if (!frame_input_frame_open_) {
+    return;
+  }
+  if (!ObserveFrameInputCallback(costs, FrameInputCosts::Stage::kSwapCallback, [&] {
+        return prepared ? mailbox->DispatchFrameInputPreparedSwap(token, swap)
+                        : mailbox->DispatchFrameInputSwap(token, swap);
+      })) {
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  // The swap closes the interval guard. Shared-memory page ownership still
+  // protects GPU writes carried into the next frame until the CPU rewrites them.
+  if (!identity || prepared) {
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+  }
+}
+
+void D3D12CommandProcessor::DispatchFrameInputEnd(uint64_t frame, uint64_t submission,
+                                                  bool original_succeeded,
+                                                  const FrameInputSwapIdentity* identity) {
+  try {
+    if (!identity) {
+      RefreshFrameInputObserver();
+    }
+  } catch (...) {
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  const auto token = identity ? identity->token : frame_input_observer_token_;
+  std::shared_ptr<diagnostic::DrawCaptureMailbox> mailbox;
+  try {
+    mailbox = diagnostic::GetDrawCaptureMailbox();
+  } catch (...) {
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  if (!token || !frame_input_frame_open_ || token != frame_input_observer_token_ ||
+      token != mailbox->GetFrameInputObserverToken()) {
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+    return;
+  }
+  auto* costs = frame_input_costs.ForOwner(this);
+  if (costs) {
+    costs->Touch(frame, submission);
+  }
+  const bool delivered = ObserveFrameInputCallback(
+      costs, FrameInputCosts::Stage::kEndCallback,
+      [&] { return mailbox->DispatchFrameInputEnd(token, frame, submission, original_succeeded); });
+  if (costs) {
+    LogFrameInputCosts(costs->EndFrame(delivered && original_succeeded));
+  }
+  if (!delivered || (!identity && !original_succeeded)) {
+    frame_input_buffer_versions_.reset();
+    frame_input_frame_open_ = false;
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = false;
+  }
+  // Prepared admission keeps successor CPU input independent of the original
+  // result. Rejection still closes either mode; legacy original failure closes.
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -2278,19 +5579,104 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
 
-  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  D3D12Shader* active_vertex_shader_at_entry = static_cast<D3D12Shader*>(active_vertex_shader());
+  D3D12Shader* active_pixel_shader_at_entry = static_cast<D3D12Shader*>(active_pixel_shader());
+  FrameCapture::ShaderView vertex_shader_at_entry;
+  FrameCapture::DrawScope draw_frame_capture;
+  if (frame_capture_->IsActive()) {
+    if (active_vertex_shader_at_entry) {
+      vertex_shader_at_entry.present = true;
+      vertex_shader_at_entry.hash = active_vertex_shader_at_entry->ucode_data_hash();
+      vertex_shader_at_entry.dwords = active_vertex_shader_at_entry->ucode_dwords();
+      vertex_shader_at_entry.dword_count = active_vertex_shader_at_entry->ucode_dword_count();
+    }
+  }
+  FrameCapture::ShaderView pixel_shader_at_entry;
+  if (frame_capture_->IsActive()) {
+    if (active_pixel_shader_at_entry) {
+      pixel_shader_at_entry.present = true;
+      pixel_shader_at_entry.hash = active_pixel_shader_at_entry->ucode_data_hash();
+      pixel_shader_at_entry.dwords = active_pixel_shader_at_entry->ucode_dwords();
+      pixel_shader_at_entry.dword_count = active_pixel_shader_at_entry->ucode_dword_count();
+    }
+  }
+  FrameCapture::IndexInfo original_index_info;
+  if (frame_capture_->IsActive() && index_buffer_info) {
+    original_index_info.present = true;
+    original_index_info.format = static_cast<uint32_t>(index_buffer_info->format);
+    original_index_info.endianness = static_cast<uint32_t>(index_buffer_info->endianness);
+    original_index_info.count = index_buffer_info->count;
+    original_index_info.guest_base = index_buffer_info->guest_base;
+    original_index_info.length = index_buffer_info->length;
+  }
+  if (frame_capture_->IsActive()) {
+    draw_frame_capture = frame_capture_->BeginDraw(
+        frame_current_, submission_current_, static_cast<uint32_t>(primitive_type), index_count,
+        major_mode_explicit, original_index_info, regs.values, RegisterFile::kRegisterCount,
+        vertex_shader_at_entry, pixel_shader_at_entry);
+  }
+
+  D3D12Shader* vertex_shader = active_vertex_shader_at_entry;
+  D3D12Shader* pixel_shader = nullptr;
+  bool frame_input_draw_dispatched = false;
+  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+
+  auto finish_frame_capture_draw = [this, &draw_frame_capture, primitive_type, index_count,
+                                    index_buffer_info, major_mode_explicit, &vertex_shader,
+                                    &pixel_shader, &frame_input_draw_dispatched, edram_mode](
+                                       bool success,
+                                       diagnostic::DrawCaptureReason reason =
+                                           diagnostic::DrawCaptureReason::kExecutionFailure,
+                                       bool no_effect = false) {
+    const diagnostic::DrawCaptureReason execution_reason =
+        success ? ((draw_frame_capture.host_issued() || draw_frame_capture.copy())
+                       ? diagnostic::DrawCaptureReason::kNone
+                       : (no_effect ? diagnostic::DrawCaptureReason::kNoEffect
+                                    : diagnostic::DrawCaptureReason::kExecutionFailure))
+                : reason;
+    draw_frame_capture.SetResult(success, execution_reason);
+    if (live_frame_capture_ && draw_frame_capture.event_id() &&
+        draw_frame_capture.acquisition() == diagnostic::DrawCaptureAvailability::kComplete) {
+      draw_frame_capture.SetCaptureResult(
+          diagnostic::DrawCaptureAvailability::kUnavailable,
+          success ? (no_effect ? diagnostic::DrawCaptureReason::kNoEffect
+                               : diagnostic::DrawCaptureReason::kExecutionFailure)
+                  : reason);
+    }
+    // DrawScope records copy state only during a journal capture. The
+    // synchronous observer also runs without one and receives copies via
+    // IssueCopy, so classify the command from its original mode instead.
+    if (edram_mode != xenos::EdramMode::kCopy && !frame_input_draw_dispatched) {
+      const bool host_issued = draw_frame_capture.host_issued();
+      const auto execution_status =
+          !success      ? diagnostic::DrawCaptureExecutionStatus::kFailed
+          : host_issued ? diagnostic::DrawCaptureExecutionStatus::kIssued
+                        : (no_effect ? diagnostic::DrawCaptureExecutionStatus::kNoEffect
+                                     : diagnostic::DrawCaptureExecutionStatus::kFailed);
+      const auto observer_reason =
+          !success      ? reason
+          : host_issued ? diagnostic::DrawCaptureReason::kNone
+                        : (no_effect ? diagnostic::DrawCaptureReason::kNoEffect : reason);
+      DispatchFrameInputDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit,
+                             vertex_shader, pixel_shader, host_issued, execution_status,
+                             observer_reason);
+    }
+    return success;
+  };
+
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    const bool copy_result = IssueCopy();
+    draw_frame_capture.MarkCopy(copy_result);
+    return finish_frame_capture_draw(copy_result);
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   // Vertex shader analysis.
-  auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
-    return false;
+    return finish_frame_capture_draw(false, diagnostic::DrawCaptureReason::kNoVertexShader);
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -2301,9 +5687,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
-    return true;
+    return finish_frame_capture_draw(true, diagnostic::DrawCaptureReason::kNoEffect, true);
   }
-  D3D12Shader* pixel_shader = nullptr;
   if (is_rasterization_done) {
     // See xenos::EdramMode for explanation why the pixel shader is only used
     // when it's kColorDepth here.
@@ -2321,24 +5706,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
-      return true;
+      return finish_frame_capture_draw(true, diagnostic::DrawCaptureReason::kNoEffect, true);
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  if (frame_input_prepared_draws_) {
+    DispatchFrameInputDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit,
+                           vertex_shader, pixel_shader, false,
+                           diagnostic::DrawCaptureExecutionStatus::kUnfinished,
+                           diagnostic::DrawCaptureReason::kNone, true);
+  }
+
   if (!BeginSubmission(true)) {
-    return false;
+    frame_capture_->Abort(device, "begin_submission_failure");
+    return finish_frame_capture_draw(false);
   }
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
-    return true;
+    return finish_frame_capture_draw(true, diagnostic::DrawCaptureReason::kNoEffect, true);
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -2366,7 +5759,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -2396,11 +5789,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    return finish_frame_capture_draw(true, diagnostic::DrawCaptureReason::kExecutionFailure);
   }
 
   // Update the textures - this may bind pipelines.
@@ -2471,7 +5864,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
-    return false;
+    return finish_frame_capture_draw(false);
   }
   // Must not call anything that can change the descriptor heap from now on!
 
@@ -2500,11 +5893,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               "This is incorrect behavior, but you can try bypassing this by "
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return finish_frame_capture_draw(false);
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return finish_frame_capture_draw(false);
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
@@ -2516,7 +5909,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
+        return finish_frame_capture_draw(false);
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -2541,7 +5934,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
-      return false;
+      return finish_frame_capture_draw(false);
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
@@ -2549,7 +5942,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
-      return false;
+      return finish_frame_capture_draw(false);
     }
   }
 
@@ -2582,7 +5975,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "processor is not supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -2611,12 +6004,123 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
+  const std::string frame_capture_draw_marker = draw_frame_capture.marker();
+  FrameCapture::HostDrawInfo frame_capture_host_info;
+  if (!frame_capture_draw_marker.empty()) {
+    frame_capture_host_info.used_texture_mask = used_texture_mask;
+    frame_capture_host_info.normalized_color_mask = normalized_color_mask;
+    frame_capture_host_info.vertex_shader_hash = vertex_shader->ucode_data_hash();
+    frame_capture_host_info.pixel_shader_hash =
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
+    frame_capture_host_info.guest_primitive_type =
+        static_cast<uint32_t>(primitive_processing_result.guest_primitive_type);
+    frame_capture_host_info.host_primitive_type =
+        static_cast<uint32_t>(primitive_processing_result.host_primitive_type);
+    frame_capture_host_info.host_vertex_shader_type =
+        static_cast<uint32_t>(primitive_processing_result.host_vertex_shader_type);
+    frame_capture_host_info.tessellation_mode =
+        static_cast<uint32_t>(primitive_processing_result.tessellation_mode);
+    frame_capture_host_info.guest_draw_vertex_count =
+        primitive_processing_result.guest_draw_vertex_count;
+    frame_capture_host_info.host_draw_vertex_count =
+        primitive_processing_result.host_draw_vertex_count;
+    frame_capture_host_info.line_loop_closing_index =
+        primitive_processing_result.line_loop_closing_index;
+    frame_capture_host_info.index_buffer_type =
+        static_cast<uint32_t>(primitive_processing_result.index_buffer_type);
+    frame_capture_host_info.guest_index_base = primitive_processing_result.guest_index_base;
+    frame_capture_host_info.host_index_format =
+        static_cast<uint32_t>(primitive_processing_result.host_index_format);
+    frame_capture_host_info.host_shader_index_endian =
+        static_cast<uint32_t>(primitive_processing_result.host_shader_index_endian);
+    frame_capture_host_info.host_primitive_reset_enabled =
+        primitive_processing_result.host_primitive_reset_enabled;
+    frame_capture_host_info.native_topology = static_cast<uint32_t>(primitive_topology);
+    if (primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+      frame_capture_host_info.native_vertex_count =
+          primitive_processing_result.host_draw_vertex_count;
+    } else {
+      frame_capture_host_info.native_index_count =
+          primitive_processing_result.host_draw_vertex_count;
+    }
+    frame_capture_host_info.half_pixel_offset =
+        REXCVAR_GET(half_pixel_offset) &&
+        regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
+  }
+
+  bool draw_capture_selected_this_draw = false;
+  if (live_frame_capture_ && draw_frame_capture.event_id()) {
+    const LiveFrameDrawScheduleResult capture_result =
+        ScheduleLiveFrameDraw(draw_frame_capture.event_id(), primitive_processing_result,
+                              index_buffer_info, vertex_shader, pixel_shader, used_texture_mask,
+                              memexport_used, active_pixel_shader_at_entry != nullptr);
+    draw_frame_capture.SetCaptureResult(capture_result.acquisition,
+                                        capture_result.acquisition_reason);
+    if (capture_result.fatal) {
+      FailLiveFrameCapture("owned_draw_capture_failed");
+    }
+  }
+  if (draw_capture_armed_ &&
+      (REXCVAR_GET(d3d12_capture_draw).empty() ||
+       (draw_capture_armed_mailbox_token_ &&
+        !diagnostic::GetDrawCaptureMailbox()->IsPending(draw_capture_armed_mailbox_token_)))) {
+    draw_capture_armed_ = false;
+    draw_capture_disarmed_ = true;
+  }
+  if (draw_capture_armed_ && !draw_capture_disarmed_ && !draw_capture_pending_) {
+    diagnostic::DrawCaptureEligibility eligibility;
+    eligibility.rov_path =
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+    eligibility.resolution_scale_is_one =
+        draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1;
+    eligibility.vertex_shader_present = vertex_shader != nullptr;
+    eligibility.pixel_shader_present = pixel_shader != nullptr;
+    eligibility.rasterized_triangle_list =
+        is_rasterization_done &&
+        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList &&
+        primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kTriangleList;
+    eligibility.color_target_written = normalized_color_mask != 0;
+    eligibility.memexport_unused = !memexport_used;
+    eligibility.tessellation_disabled = !primitive_processing_result.IsTessellated();
+    eligibility.original_index_source = primitive_processing_result.index_buffer_type ==
+                                            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+                                        primitive_processing_result.index_buffer_type ==
+                                            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+    eligibility.used_texture_mask = used_texture_mask;
+    if (const auto skip_reason = diagnostic::GetDrawCaptureSkipReason(eligibility)) {
+      RecordDrawCaptureSkip(*skip_reason);
+    } else {
+      const bool live_capture_requested = bool(draw_capture_armed_mailbox_token_);
+      diagnostic::DrawCaptureMailbox::Token mailbox_token;
+      if (live_capture_requested) {
+        mailbox_token = diagnostic::GetDrawCaptureMailbox()->Claim(
+            draw_capture_armed_mailbox_token_, draw_capture_path_, vertex_shader->ucode_data_hash(),
+            pixel_shader->ucode_data_hash());
+      }
+      if (!live_capture_requested || mailbox_token) {
+        const bool scheduled = ScheduleDrawCapture(
+            primitive_processing_result, primitive_type, index_count, index_buffer_info,
+            major_mode_explicit, primitive_topology, vertex_shader, pixel_shader, used_texture_mask,
+            normalized_color_mask, mailbox_token);
+        if (scheduled) {
+          draw_capture_disarmed_ = true;
+          draw_capture_armed_ = false;
+          draw_capture_selected_this_draw = true;
+        } else if (mailbox_token) {
+          draw_capture_disarmed_ = true;
+          draw_capture_armed_ = false;
+          diagnostic::GetDrawCaptureMailbox()->Fail(mailbox_token);
+        }
+      }
+    }
+  }
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -2628,8 +6132,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (!frame_capture_draw_marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(frame_capture_draw_marker.c_str());
+    }
     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
                                             0, 0);
+    draw_frame_capture.MarkHostIssued(frame_capture_host_info);
+    DispatchFrameInputDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit,
+                           vertex_shader, pixel_shader);
+    frame_input_draw_dispatched = true;
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -2650,7 +6161,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           scratch_index_buffer = RequestScratchGPUBuffer(index_buffer_view.SizeInBytes,
                                                          D3D12_RESOURCE_STATE_COPY_DEST);
           if (scratch_index_buffer == nullptr) {
-            return false;
+            return finish_frame_capture_draw(false);
           }
           shared_memory_->UseAsCopySource();
           SubmitBarriers();
@@ -2676,7 +6187,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return false;
+        return finish_frame_capture_draw(false);
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
     if (memexport_used) {
@@ -2687,14 +6198,43 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (!frame_capture_draw_marker.empty()) {
+      deferred_command_list_.InsertDebugMarker(frame_capture_draw_marker.c_str());
+    }
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    draw_frame_capture.MarkHostIssued(frame_capture_host_info);
+    DispatchFrameInputDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit,
+                           vertex_shader, pixel_shader);
+    frame_input_draw_dispatched = true;
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
 
+  // A pending readback survives later draws until swap; only this draw owns
+  // the after image, so later draws must not overwrite it.
+  if (draw_capture_selected_this_draw && draw_capture_pending_ &&
+      draw_capture_pending_->edram_after.buffer) {
+    if (!render_target_cache_->ScheduleEdramCapture(draw_capture_pending_->edram_after.buffer.Get(),
+                                                    draw_capture_pending_->edram_after.size,
+                                                    false)) {
+      draw_capture_failure_reason_ = "edram_after_schedule";
+      RecordDrawCaptureSkip(diagnostic::DrawCaptureSkipReason::kMalformedInput);
+    }
+  }
   if (memexport_used) {
+    // Later live input views may read geometry/textures from this range after
+    // the original GPU draw; keep the observer remainder conservative when
+    // exact export ranges are unavailable.
+    if (!memexport_ranges_.empty()) {
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        RecordFrameInputGuestMemoryDirtyRange(memexport_range.base_address_dwords << 2,
+                                              memexport_range.size_bytes);
+      }
+    } else {
+      RecordFrameInputGuestMemoryDirtyRange(0, SharedMemory::kBufferSize);
+    }
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
     // TODO(Triang3l): Find some PM4 command that can be used for indication of
@@ -2727,7 +6267,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
-  return true;
+  return finish_frame_capture_draw(true);
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -2848,12 +6388,12 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   readback.submission_written[write_index] = submission_current_;
   readback.written_size[write_index] = total_size;
 
-  CheckSubmissionFence(0);
-  bool previous_slot_ready = readback.buffers[read_index] && readback.mapped_data[read_index] &&
-                             total_size <= readback.sizes[read_index] &&
-                             total_size <= readback.written_size[read_index] &&
-                             readback.submission_written[read_index] &&
-                             readback.submission_written[read_index] <= submission_completed_;
+  bool fence_ready = CheckSubmissionFence(0);
+  bool previous_slot_ready =
+      fence_ready && readback.buffers[read_index] && readback.mapped_data[read_index] &&
+      total_size <= readback.sizes[read_index] && total_size <= readback.written_size[read_index] &&
+      readback.submission_written[read_index] &&
+      readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
@@ -2874,24 +6414,82 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  FrameCapture::CopyScope frame_capture_copy;
+  if (frame_capture_->IsActive()) {
+    frame_capture_copy = frame_capture_->BeginCopy(
+        frame_current_, submission_current_, register_file_->values, RegisterFile::kRegisterCount);
+  }
+  const ReadbackResolveMode readback_mode =
+      GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  const char* copy_mode =
+      readback_mode == ReadbackResolveMode::kDisabled ? "resolve" : "resolve_readback";
+  DispatchFrameInputCopy(copy_mode, false, 0, 0, true);
   if (!BeginSubmission(true)) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "begin_submission_failure");
+    FailLiveFrameCapture("begin_submission_failure");
+    frame_capture_copy.SetResult(false, "submission_failure");
+    // The prepared plan never reached a submitted owner when setup failed.
+    // Retain a rejected marker so the next frame cannot fall back to stale
+    // CPU bytes from the abandoned plan.
+    if (frame_input_native_sources_ && frame_input_native_source_address_ &&
+        frame_input_native_source_length_) {
+      frame_input_native_sources_->Reject(frame_input_native_source_address_,
+                                          frame_input_native_source_length_,
+                                          frame_input_native_source_generation_);
+      frame_input_native_source_address_ = frame_input_native_source_length_ = 0;
+      frame_input_native_source_generation_ = 0;
+    }
+    DispatchFrameInputCopy(copy_mode, false, 0, 0);
     return false;
   }
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+  if (live_frame_capture_ && frame_capture_copy.event_id()) {
+    const LiveFrameCopyScheduleResult capture_result =
+        ScheduleLiveFrameCopy(frame_capture_copy.event_id());
+    frame_capture_copy.SetCaptureResult(capture_result.acquisition,
+                                        capture_result.acquisition_reason);
+    if (capture_result.fatal) {
+      FailLiveFrameCapture("owned_copy_capture_failed");
+      // Owned capture is diagnostic-only; the guest resolve below still runs.
+    }
   }
-  return IssueCopy_ReadbackResolvePath();
+  const std::string frame_capture_copy_marker = frame_capture_copy.marker();
+  if (!frame_capture_copy_marker.empty()) {
+    deferred_command_list_.InsertDebugMarker(frame_capture_copy_marker.c_str());
+  }
+  bool copy_result;
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
+  if (readback_mode == ReadbackResolveMode::kDisabled) {
+    copy_result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                written_address, written_length);
+    if (copy_result) {
+      RecordFrameInputGuestMemoryDirtyRange(written_address, written_length);
+    } else {
+      frame_input_guest_memory_dirty_ranges_.clear();
+      frame_input_guest_memory_dirty_all_ = true;
+    }
+  } else {
+    copy_result = IssueCopy_ReadbackResolvePath(written_address, written_length);
+  }
+  frame_capture_copy.SetResult(copy_result, copy_mode);
+  DispatchFrameInputCopy(copy_mode, copy_result, written_address, written_length);
+  return copy_result;
 }
 
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(uint32_t& written_address_out,
+                                                          uint32_t& written_length_out) {
+  written_address_out = 0;
+  written_length_out = 0;
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
+    frame_input_guest_memory_dirty_ranges_.clear();
+    frame_input_guest_memory_dirty_all_ = true;
     return false;
   }
+  written_address_out = written_address;
+  written_length_out = written_length;
+  RecordFrameInputGuestMemoryDirtyRange(written_address, written_length);
 
   if (!written_length) {
     return true;
@@ -3102,10 +6700,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   return true;
 }
 
-void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+  if (device_removed_ || submission_fence_failed_) {
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+    FailLiveFrameCapture("fence_failure");
+    return false;
+  }
+
   if (await_submission >= submission_current_) {
-    if (submission_open_) {
-      EndSubmission(false);
+    if (submission_open_ && !EndSubmission(false)) {
+      return false;
     }
     // Ending an open submission should result in queue operations done directly
     // (like UpdateTileMappings) to be tracked within the scope of that
@@ -3114,39 +6718,99 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (queue_operations_done_since_submission_signal_) {
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
-                        fence_value, fence_completion_event_)))) {
-        PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
-        queue_operations_done_since_submission_signal_ = false;
-      } else {
-        REXGPU_ERROR(
-            "Failed to await an out-of-submission queue operation completion "
-            "Direct3D 12 fence");
+      HRESULT signal_result =
+          direct_queue->Signal(queue_operations_since_submission_fence_, fence_value);
+      if (FAILED(signal_result)) {
+        HandleFenceFailure("Out-of-submission queue operation fence Signal", signal_result, true);
+        FailLiveFrameCapture("fence_failure");
+        return false;
       }
+      HRESULT event_result = queue_operations_since_submission_fence_->SetEventOnCompletion(
+          fence_value, fence_completion_event_);
+      if (FAILED(event_result)) {
+        HandleFenceFailure("Out-of-submission queue operation fence event arming", event_result,
+                           false);
+        FailLiveFrameCapture("fence_failure");
+        return false;
+      }
+      PROFILE_CMD_BUFFER_STALL();
+      DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+      if (wait_result != WAIT_OBJECT_0) {
+        HRESULT wait_error =
+            wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+        HandleFenceFailure("Out-of-submission queue operation fence wait", wait_error, false);
+        FailLiveFrameCapture("fence_failure");
+        return false;
+      }
+      uint64_t queue_operations_completed =
+          queue_operations_since_submission_fence_->GetCompletedValue();
+      if (!diagnostic::IsFenceWaitReady(queue_operations_completed, fence_value, true, true,
+                                        true)) {
+        if (!diagnostic::IsFenceCompletionValueValid(queue_operations_completed)) {
+          HandleFenceFailure("Out-of-submission queue operation fence completion",
+                             DXGI_ERROR_DEVICE_REMOVED, true);
+        } else {
+          REXGPU_ERROR("Out-of-submission queue operation fence wait completed below {}",
+                       fence_value);
+          frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+        }
+        FailLiveFrameCapture("fence_failure");
+        return false;
+      }
+      queue_operations_done_since_submission_signal_ = false;
     }
-    // A submission won't be ended if it hasn't been started, or if ending
-    // has failed - clamp the index.
-    await_submission = submission_current_ - 1;
+    // If no submission was open, the current identity has not been signaled.
+    await_submission = submission_last_signaled_;
+  } else if (await_submission > submission_last_signaled_) {
+    REXGPU_ERROR("Submission {} was not successfully signaled", await_submission);
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_failure");
+    FailLiveFrameCapture("submission_failure");
+    return false;
   }
 
   uint64_t submission_completed_before = submission_completed_;
-  submission_completed_ = submission_fence_->GetCompletedValue();
-  if (submission_completed_ < await_submission) {
-    if (SUCCEEDED(
-            submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
-      PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
-      submission_completed_ = submission_fence_->GetCompletedValue();
+  uint64_t submission_completed = submission_fence_->GetCompletedValue();
+  if (!diagnostic::IsFenceCompletionValueValid(submission_completed)) {
+    HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
+    FailLiveFrameCapture("fence_failure");
+    return false;
+  }
+  if (submission_completed < await_submission) {
+    HRESULT event_result =
+        submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_);
+    if (FAILED(event_result)) {
+      HandleFenceFailure("Submission fence event arming", event_result, false);
+      FailLiveFrameCapture("fence_failure");
+      return false;
+    }
+    PROFILE_CMD_BUFFER_STALL();
+    DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) {
+      HRESULT wait_error = wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
+      HandleFenceFailure("Submission fence wait", wait_error, false);
+      FailLiveFrameCapture("fence_failure");
+      return false;
+    }
+    submission_completed = submission_fence_->GetCompletedValue();
+    if (!diagnostic::IsFenceWaitReady(submission_completed, await_submission, true, true, true)) {
+      if (!diagnostic::IsFenceCompletionValueValid(submission_completed)) {
+        HandleFenceFailure("Submission fence completion", DXGI_ERROR_DEVICE_REMOVED, true);
+      } else {
+        REXGPU_ERROR("Submission fence wait completed below {}", await_submission);
+        frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+      }
+      FailLiveFrameCapture("fence_failure");
+      return false;
     }
   }
-  if (submission_completed_ < await_submission) {
-    REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
+  if (submission_completed > submission_completed_) {
+    submission_completed_ = submission_completed;
   }
+  diagnostic::GetXenosFenceTrace().D3D12FenceCompleted(
+      reinterpret_cast<uint64_t>(submission_fence_), submission_completed_, true);
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
-    return;
+    return submission_completed_ >= await_submission;
   }
 
   // Reclaim command allocators.
@@ -3192,6 +6856,35 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+  return submission_completed_ >= await_submission;
+}
+
+void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
+                                               bool tracking_is_unrecoverable) {
+  REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
+  FailPendingDrawCaptureMailbox();
+  frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
+  FailLiveFrameCapture("fence_failure");
+  submission_fence_failed_ |= tracking_is_unrecoverable;
+
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  HRESULT device_removed_reason = device->GetDeviceRemovedReason();
+  if (SUCCEEDED(device_removed_reason) && operation_result == DXGI_ERROR_DEVICE_REMOVED) {
+    device_removed_reason = operation_result;
+  }
+  const bool device_is_removed = FAILED(device_removed_reason);
+  if (device_is_removed && !device_removed_) {
+    LogDeviceRemovalDiagnostics(device, device_removed_reason);
+  }
+  if (diagnostic::IsFenceFailureTerminal(tracking_is_unrecoverable, device_is_removed) &&
+      !device_removed_) {
+    device_removed_ = true;
+    if (graphics_system_) {
+      graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
+                                                   DXGI_ERROR_DEVICE_REMOVED);
+    }
+    rex::FatalError("Graphics submission completion tracking failed");
+  }
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3252,7 +6945,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  if (device_removed_) {
+  if (device_removed_ || submission_fence_failed_) {
     return false;
   }
 
@@ -3277,11 +6970,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
-  // TODO(Triang3l): If failed to await (completed submission < awaited frame
-  // submission), do something like dropping the draw command that wanted to
-  // open the frame.
+  if (!CheckSubmissionFence(
+          is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames] : 0)) {
+    return false;
+  }
   if (is_opening_frame) {
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
@@ -3373,6 +7065,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (device_removed_ || submission_fence_failed_) {
+    frame_capture_->Abort(provider.GetDevice(), "submission_failure");
+    FailLiveFrameCapture("submission_failure");
+    return false;
+  }
 
   // Make sure there is a command allocator to write commands to.
   if (submission_open_ && !command_allocator_writable_first_) {
@@ -3382,6 +7079,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to create a command allocator");
       // Try to submit later. Completely dropping the submission is not
       // permitted because resources would be left in an undefined state.
+      frame_capture_->Abort(provider.GetDevice(), "submission_allocator_failure");
+      FailLiveFrameCapture("submission_allocator_failure");
       return false;
     }
     command_allocator_writable_first_ = new CommandAllocator;
@@ -3442,13 +7141,30 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
-
+    const uint64_t submitted_submission = submission_current_++;
+    HRESULT signal_result = direct_queue->Signal(submission_fence_, submitted_submission);
     submission_open_ = false;
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
     // alongside the last submission if needed.
     queue_operations_done_since_submission_signal_ = false;
+    if (FAILED(signal_result)) {
+      // ExecuteCommandLists has already queued work. Its allocator and identity
+      // must remain submitted even though completion can no longer be tracked.
+      HandleFenceFailure("Submission fence Signal", signal_result, true);
+      frame_capture_->Abort(provider.GetDevice(), "submission_signal_failure");
+      FailLiveFrameCapture("submission_signal_failure");
+      return false;
+    }
+    submission_last_signaled_ = submitted_submission;
+    diagnostic::GetXenosFenceTrace().D3D12Submission(
+        submitted_submission, reinterpret_cast<uint64_t>(command_list_),
+        reinterpret_cast<uint64_t>(submission_fence_), submitted_submission);
+
+    for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {
+      resources_for_deletion_.emplace_back(submitted_submission, resource.Detach());
+    }
+    submission_retry_resources_.clear();
   }
 
   if (is_closing_frame) {
@@ -4883,7 +8599,9 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
     if (BeginSubmission(true)) {
       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                          host_index);
-      EndSubmission(false);
+      if (!EndSubmission(false)) {
+        REXGPU_WARN("Occlusion-query disable submission remains pending");
+      }
     }
   } else {
     active_occlusion_query_ = {};
@@ -4944,8 +8662,7 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   }
 
   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
-  CheckSubmissionFence(query_submission);
-  if (submission_completed_ < query_submission) {
+  if (!CheckSubmissionFence(query_submission)) {
     return false;
   }
   if (!occlusion_query_readback_mapping_) {

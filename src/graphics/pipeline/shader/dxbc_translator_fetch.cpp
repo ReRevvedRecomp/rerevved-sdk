@@ -454,9 +454,7 @@ uint32_t DxbcShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
                                                        bool is_signed) {
   // 1D and 2D textures (including stacked ones) are treated as 2D arrays for
   // binding and coordinate simplicity.
-  if (dimension == xenos::FetchOpDimension::k1D) {
-    dimension = xenos::FetchOpDimension::k2D;
-  }
+  dimension = ParsedTextureFetchInstruction::NormalizeBindingDimension(dimension);
   uint32_t srv_index = UINT32_MAX;
   for (uint32_t i = 0; i < uint32_t(texture_bindings_.size()); ++i) {
     const TextureBinding& texture_binding = texture_bindings_[i];
@@ -507,13 +505,13 @@ uint32_t DxbcShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
                                                        xenos::TextureFilter mip_filter,
                                                        xenos::AnisoFilter aniso_filter) {
   // In Direct3D 12, anisotropic filtering implies linear filtering.
-  if (aniso_filter != xenos::AnisoFilter::kDisabled &&
-      aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
-    mag_filter = xenos::TextureFilter::kLinear;
-    min_filter = xenos::TextureFilter::kLinear;
-    mip_filter = xenos::TextureFilter::kLinear;
-    aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
-  }
+  ParsedTextureFetchInstruction::SamplerOverrides overrides{mag_filter, min_filter, mip_filter,
+                                                            aniso_filter};
+  overrides.Normalize();
+  mag_filter = overrides.mag_filter;
+  min_filter = overrides.min_filter;
+  mip_filter = overrides.mip_filter;
+  aniso_filter = overrides.aniso_filter;
   uint32_t sampler_index = UINT32_MAX;
   for (uint32_t i = 0; i < uint32_t(sampler_bindings_.size()); ++i) {
     const SamplerBinding& sampler_binding = sampler_bindings_[i];
@@ -673,8 +671,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   uint32_t tfetch_index = instr.operands[1].storage_index;
 
   // Whether to use gradients (implicit or explicit) for LOD calculation.
-  bool use_computed_lod = instr.attributes.use_computed_lod &&
-                          (is_pixel_shader() || instr.attributes.use_register_gradients);
+  bool use_computed_lod = instr.UsesComputedLod(is_pixel_shader());
   if (instr.opcode == FetchOpcode::kGetTextureComputedLod &&
       (!use_computed_lod || instr.attributes.use_register_gradients)) {
     assert_always();

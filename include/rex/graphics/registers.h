@@ -17,6 +17,14 @@
 #include <rex/assert.h>
 #include <rex/graphics/xenos.h>
 
+#if defined(_WIN32) && defined(rexruntime_EXPORTS)
+#define REX_RUNTIME_DATA_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define REX_RUNTIME_DATA_API __declspec(dllimport)
+#else
+#define REX_RUNTIME_DATA_API
+#endif
+
 // Most 3D registers are the same as in the Qualcomm Adreno 200 (AMD Z430,
 // another R400 architecture family chip):
 //
@@ -747,7 +755,7 @@ union alignas(uint32_t) RB_COLOR_INFO {
   };
   static constexpr Register register_index = XE_GPU_REG_RB_COLOR_INFO;
   // RB_COLOR[1-3]_INFO also use this format.
-  static const Register rt_register_indices[4];
+  REX_RUNTIME_DATA_API static const Register rt_register_indices[4];
 };
 static_assert_size(RB_COLOR_INFO, sizeof(uint32_t));
 
@@ -791,7 +799,7 @@ union alignas(uint32_t) RB_BLENDCONTROL {
   };
   // RB_BLENDCONTROL[0-3] use this format.
   static constexpr Register register_index = XE_GPU_REG_RB_BLENDCONTROL0;
-  static const Register rt_register_indices[4];
+  REX_RUNTIME_DATA_API static const Register rt_register_indices[4];
 };
 static_assert_size(RB_BLENDCONTROL, sizeof(uint32_t));
 
@@ -963,3 +971,5 @@ static_assert_size(DC_LUT_30_COLOR, sizeof(uint32_t));
 }  // namespace reg
 
 }  // namespace rex::graphics
+
+#undef REX_RUNTIME_DATA_API
