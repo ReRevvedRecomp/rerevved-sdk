@@ -44,12 +44,9 @@ const CallEdge* findCallEdgeAt(const FunctionNode* node, uint32_t site) {
   return nullptr;
 }
 
-// A config boundary is an assertion the binary cannot make for itself, so one
-// the graph contradicts has to say so: otherwise the author sees a full rebuild
-// change nothing and has no way to tell why. Reported, never fatal. A PDATA
-// entry inside a config extent is the normal MSVC layout for a function with an
-// SEH funclet, so only discovery carving an entry point out of a declared range
-// is worth a warning.
+// Report contradictory config boundaries because the binary cannot assert them and
+// rebuilds otherwise lack an explanation. PDATA inside a config extent is normal for an
+// MSVC SEH funclet; warn only when discovery carves out an entry point.
 void validateConfigBoundaries(CodegenContext& ctx) {
   auto& graph = ctx.graph;
 

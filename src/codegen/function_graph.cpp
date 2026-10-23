@@ -434,6 +434,12 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
             case 'x':
               emit_print(out, "PPCXERRegister& xer");
               break;
+            // lr is a bare uint64_t in the context, not a PPCRegister. At a
+            // function-entry hook it still holds the caller's return address,
+            // which is the only way a hook can identify its caller.
+            case 'l':
+              emit_print(out, "uint64_t lr");
+              break;
             case 'r':
               emit_print(out, "PPCRegister& {}", reg);
               break;
@@ -1160,15 +1166,9 @@ bool FunctionGraph::isVacant(uint32_t fromAddr, uint32_t targetAddr) const {
 }
 
 size_t FunctionGraph::markFuncletRegisterSharing() {
-  // MSVC compiles __finally / __except bodies as funclets that run on the
-  // owner's frame with its non-volatiles still live, and reaches an inline one
-  // by bl from the middle of the owner. Localizing the funclet's copies hands it
-  // a zero. The scope table names each funclet, which is the only reliable way
-  // to tell one from a real function: every prologue reads its non-volatiles in
-  // order to spill them, so "reads before writes" cannot distinguish them. C++
-  // EH cleanup and catch funclets run the same way, so they are claimed too. The
-  // owner stays localized and syncs across the call site instead, so it keeps
-  // its isolation from its own callers.
+  // MSVC SEH and C++ EH cleanup/catch funclets share the owner
+  // frame/non-volatiles; localizing them supplies zeros. Keep the owner
+  // localized and synchronize at calls.
   std::vector<std::pair<uint32_t, uint32_t>> ranges;  // funclet [base, end)
 
   for (auto& entry : functions_) {
@@ -1183,6 +1183,9 @@ size_t FunctionGraph::markFuncletRegisterSharing() {
       ranges.emplace_back(it->second->base(), it->second->end());
     };
 
+    // Scope tables identify funclets: ordinary prologues also read
+    // non-volatiles before writes to spill them. Inline funclets are reached by
+    // bl inside the owner.
     if (const auto* seh = node->exceptionInfo()->asSeh()) {
       for (const auto& scope : seh->scopes) {
         claim(scope.handler);

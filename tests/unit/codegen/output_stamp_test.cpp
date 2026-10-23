@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -18,7 +19,9 @@
 #include <vector>
 
 #include <rex/codegen/config.h>
+#include <rex/codegen/manifest.h>
 #include <rex/codegen/output_stamp.h>
+#include "codegen/project_recompiler_inputs.h"
 
 namespace fs = std::filesystem;
 using namespace rex::codegen;
@@ -47,6 +50,18 @@ struct Scratch {
 };
 
 }  // namespace
+
+TEST_CASE("Writing an unchanged SDK stamp preserves the manifest", "[manifest_stamp]") {
+  Scratch scratch("manifest_stamp_stable");
+  auto manifest = scratch.WriteFile(
+      "rerevved_manifest.toml", "[project]\nname = \"rerevved\"\nsdk_version = \"0.10.0\"\n");
+  const auto original_time = fs::file_time_type::clock::now() - std::chrono::hours(1);
+  fs::last_write_time(manifest, original_time);
+
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
+
+  CHECK(fs::last_write_time(manifest) == original_time);
+}
 
 TEST_CASE("Identical inputs produce identical fingerprints", "[output_stamp]") {
   Scratch scratch("stable");
@@ -111,12 +126,37 @@ TEST_CASE("An unreadable input is not fingerprinted as empty content", "[output_
         ComputeInputFingerprint(asDirectory, "1.2.3", flags));
 }
 
-TEST_CASE("A missing input file still yields a usable fingerprint", "[output_stamp]") {
+TEST_CASE("Optional sibling patches participate in fingerprints and dependencies",
+          "[output_stamp]") {
   Scratch scratch("missing");
-  std::vector<fs::path> inputs{scratch.root / "absent.xex"};
+  auto optional = scratch.root / "game.xexp";
+  auto binary = scratch.WriteFile("game.xex", "binary bytes");
+  auto manifest = scratch.WriteFile("manifest.toml", "project = 'x'");
+  RecompilerConfig config;
+  config.filePath = "game.xex";
   std::vector<std::string> flags;
-
-  CHECK_FALSE(ComputeInputFingerprint(inputs, "1.2.3", flags).empty());
+  std::string missing;
+  for (std::string_view state : {"absent", "present", "removed"}) {
+    CAPTURE(state);
+    if (state == "present") {
+      scratch.WriteFile("game.xexp", "patch bytes");
+    } else if (state == "removed") {
+      REQUIRE(fs::remove(optional));
+    }
+    auto inputs = detail::CollectModuleInputs(config, scratch.root, manifest);
+    CHECK(inputs == std::vector<fs::path>{binary, optional, manifest});
+    CHECK(detail::CollectModuleDependencies(config, scratch.root, inputs) ==
+          std::vector<fs::path>{binary, state == "present" ? optional : scratch.root, manifest});
+    auto fingerprint = ComputeInputFingerprint(inputs, "1.2.3", flags);
+    CHECK_FALSE(fingerprint.empty());
+    if (state == "absent") {
+      missing = fingerprint;
+    } else if (state == "present") {
+      CHECK(fingerprint != missing);
+    } else {
+      CHECK(fingerprint == missing);
+    }
+  }
 }
 
 TEST_CASE("Stamp round-trips through Serialize and Load", "[output_stamp]") {
@@ -224,6 +264,6 @@ TEST_CASE("Depfile escapes characters make treats as syntax", "[output_stamp]") 
   std::ifstream in(depfile, std::ios::binary);
   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-  CHECK(content.find("has\ space.toml") != std::string::npos);
-  CHECK(content.find("hash\#.toml") != std::string::npos);
+  CHECK(content.find("has\\ space.toml") != std::string::npos);
+  CHECK(content.find("hash\\#.toml") != std::string::npos);
 }

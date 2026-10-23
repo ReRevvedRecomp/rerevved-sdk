@@ -40,6 +40,7 @@
 #include "codegen_flags.h"
 #include "codegen_logging.h"
 #include "file_io.h"
+#include "project_recompiler_inputs.h"
 #include "template_registry_internal.h"
 
 namespace rex::codegen {
@@ -54,13 +55,20 @@ std::string DeriveTargetNameFromFilePath(const std::string& file_path) {
   return name;
 }
 
+}  // namespace
+
+namespace detail {
+
 std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& cfg,
                                                        const std::filesystem::path& configDir,
                                                        const std::filesystem::path& manifestPath) {
   namespace fs = std::filesystem;
 
   std::vector<fs::path> inputs;
-  inputs.push_back(configDir / cfg.filePath);
+  fs::path modulePath = configDir / cfg.filePath;
+  inputs.push_back(modulePath);
+  modulePath += "p";
+  inputs.push_back(std::move(modulePath));
   inputs.push_back(manifestPath);
   for (const auto& loaded : cfg.loadedFiles) {
     inputs.emplace_back(loaded);
@@ -75,6 +83,29 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
   std::sort(inputs.begin(), inputs.end());
   return inputs;
 }
+
+std::vector<std::filesystem::path> CollectModuleDependencies(
+    const RecompilerConfig& cfg, const std::filesystem::path& configDir,
+    std::span<const std::filesystem::path> inputs) {
+  namespace fs = std::filesystem;
+  fs::path siblingPatch = configDir / cfg.filePath;
+  siblingPatch += "p";
+  std::error_code patchError;
+  bool patchExists = fs::exists(siblingPatch, patchError);
+  std::vector<fs::path> dependencies;
+  for (const auto& input : inputs) {
+    // A missing depfile input would keep the build rule perpetually dirty.
+    // Watch the containing directory until the optional sibling patch
+    // appears, while its missing marker still participates in the stamp.
+    dependencies.push_back(input == siblingPatch && !patchExists ? siblingPatch.parent_path()
+                                                                 : input);
+  }
+  return dependencies;
+}
+
+}  // namespace detail
+
+namespace {
 
 std::string FingerprintModule(const RecompilerConfig& cfg,
                               std::span<const std::filesystem::path> inputs,
@@ -358,10 +389,12 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
   for (size_t i = 0; i < contexts.size(); ++i) {
     auto& entry = contexts[i];
     auto outDir = entry.ctx.configDir() / entry.ctx.Config().outDirectoryPath;
-    auto inputs =
-        CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
+    auto inputs = detail::CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(),
+                                              manifest_.manifestPath);
     fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
-    allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
+    auto dependencies =
+        detail::CollectModuleDependencies(entry.ctx.Config(), entry.ctx.configDir(), inputs);
+    allInputs.insert(allInputs.end(), dependencies.begin(), dependencies.end());
 
     if (opts.ignoreStamp || opts.force)
       continue;
