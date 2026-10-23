@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -206,6 +208,8 @@ void ImGuiDrawer::Initialize() {
   if (style_setup_) {
     style_setup_(style, style_);
   }
+  base_imgui_style_ = style;
+  overlay_scale_ = 1.0f;
 
   frame_time_tick_frequency_ = double(rex::chrono::Clock::QueryHostTickFrequency());
   last_frame_time_ticks_ = rex::chrono::Clock::QueryHostTickCount();
@@ -411,6 +415,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+  UpdateOverlayScale(io.DisplaySize.y);
 
   ImGui::NewFrame();
 
@@ -443,6 +448,25 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
       presenter_->RequestUIPaintFromUIThread();
     }
   }
+}
+
+void ImGuiDrawer::UpdateOverlayScale(float output_height) {
+  const OverlayScaleStyle& config = style_.scale;
+  float scale = 1.0f;
+  if (config.reference_height > 0.0f && output_height > 0.0f) {
+    scale = std::clamp(output_height / config.reference_height, config.min_scale,
+                       std::max(config.min_scale, config.max_scale));
+    // Whole-percent steps avoid rescaling the style on every resize tick.
+    scale = std::round(scale * 100.0f) / 100.0f;
+  }
+  if (scale == overlay_scale_) {
+    return;
+  }
+  overlay_scale_ = scale;
+  ImGuiStyle& style = ImGui::GetStyle();
+  style = base_imgui_style_;
+  style.ScaleAllSizes(scale);
+  style.FontScaleMain = base_imgui_style_.FontScaleMain * scale;
 }
 
 void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context) {
@@ -621,19 +645,21 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
   }
+  // ImGui reads modifiers only from ImGuiMod_* events; shortcuts such as
+  // Ctrl+V need them in addition to the left/right key events.
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
       // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;

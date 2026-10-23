@@ -45,6 +45,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   Style& style() { return style_; }
   const Style& style() const { return style_; }
 
+  // Factor applied to fonts and ImGui sizes this frame (Style::scale). Dialogs
+  // multiply their own hard-coded sizes by it.
+  float overlay_scale() const { return overlay_scale_; }
+
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
 
@@ -78,6 +82,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void Initialize();
 
   void SetupFontTexture();
+  void UpdateOverlayScale(float output_height);
 
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
@@ -96,6 +101,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   FontSetupCallback font_setup_;
   StyleSetupCallback style_setup_;
   Style style_;
+  // ImGui style after consumer setup, before overlay scaling.
+  ImGuiStyle base_imgui_style_;
+  float overlay_scale_ = 1.0f;
 
   ImGuiContext* internal_state_ = nullptr;
 

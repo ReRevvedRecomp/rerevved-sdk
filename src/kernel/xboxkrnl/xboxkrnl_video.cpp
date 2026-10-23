@@ -33,6 +33,8 @@
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
 
+#include "video_routing.h"
+
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
 constexpr uint32_t kDisplayGammaType = 2;
@@ -76,12 +78,6 @@ uint32_t GetConfiguredVideoModeHeight() {
 float GetConfiguredVideoModeRefreshRate() {
   double refresh_rate_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 240.0);
   return float(refresh_rate_hz);
-}
-
-void WarnNoGpuEmulation(const char* export_name, std::atomic<bool>& warned) {
-  if (!warned.exchange(true)) {
-    REXKRNL_WARN("{}: no GPU emulation loaded (gpu_plugin not set); call ignored", export_name);
-  }
 }
 }  // namespace
 
@@ -316,37 +312,31 @@ void VdSetGraphicsInterruptCallback_entry(u32 callback, mapped_void user_data) {
   // callback takes 2 params
   // r3 = bool 0/1 - 0 is normal interrupt, 1 is some acquire/lock mumble
   // r4 = user_data (r4 of VdSetGraphicsInterruptCallback)
-  auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
-  if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdSetGraphicsInterruptCallback", warned);
-    return;
-  }
-  graphics_system->SetInterruptCallback(callback, user_data.guest_address());
+  auto* runtime = REX_KERNEL_STATE()->emulator();
+  auto video_delegate = runtime->detached_video_delegate();
+  static std::atomic<bool> warned{false};
+  RouteSetInterruptCallback(video_delegate.get(), runtime->graphics_system(), warned, callback,
+                            user_data.guest_address());
 }
 
 void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
   // r3 = result of MmGetPhysicalAddress
   // r4 = log2(size)
   // Buffer pointers are from MmAllocatePhysicalMemory with WRITE_COMBINE.
-  auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
-  if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdInitializeRingBuffer", warned);
-    return;
-  }
-  graphics_system->InitializeRingBuffer(ptr.guest_address(), size_log2);
+  auto* runtime = REX_KERNEL_STATE()->emulator();
+  auto video_delegate = runtime->detached_video_delegate();
+  static std::atomic<bool> warned{false};
+  RouteInitializeRingBuffer(video_delegate.get(), runtime->graphics_system(), warned,
+                            ptr.guest_address(), size_log2);
 }
 
 void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2) {
   // r4 = log2(block size), 6, usually --- <=19
-  auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
-  if (!graphics_system) {
-    static std::atomic<bool> warned{false};
-    WarnNoGpuEmulation("VdEnableRingBufferRPtrWriteBack", warned);
-    return;
-  }
-  graphics_system->EnableReadPointerWriteBack(ptr.guest_address(), block_size_log2);
+  auto* runtime = REX_KERNEL_STATE()->emulator();
+  auto video_delegate = runtime->detached_video_delegate();
+  static std::atomic<bool> warned{false};
+  RouteEnableReadPointerWriteBack(video_delegate.get(), runtime->graphics_system(), warned,
+                                  ptr.guest_address(), block_size_log2);
 }
 
 void VdGetSystemCommandBuffer_entry(mapped_void p0_ptr, mapped_void p1_ptr) {
@@ -453,71 +443,18 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert(width);
   assert(height);
 
-  namespace xenos = rex::graphics::xenos;
+  VdSwapInputs inputs{};
+  inputs.reservation_host = buffer_ptr.host_address();
+  inputs.reservation = buffer_ptr.guest_address();
+  inputs.fetch_host = fetch_ptr.host_address();
+  inputs.frontbuffer = frontbuffer_ptr.host_address();
+  inputs.texture_format = texture_format_ptr.host_address();
+  inputs.color_space = color_space_ptr.host_address();
+  inputs.width = width.host_address();
+  inputs.height = height.host_address();
 
-  xenos::xe_gpu_texture_fetch_t gpu_fetch;
-  memory::copy_and_swap_32_unaligned(&gpu_fetch,
-                                     reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
-
-  // The fetch constant passed is not a true GPU fetch constant, but rather, the
-  // fetch constant stored in the Direct3D 9 texture header, which contains the
-  // address in one of the virtual mappings of the physical memory rather than
-  // the physical address itself. We're emulating swapping in the GPU subsystem,
-  // which works with GPU memory addresses (physical addresses directly) from
-  // proper fetch constants like ones used to bind textures to shaders, not CPU
-  // MMU addresses, so translation from virtual to physical is needed.
-  uint32_t frontbuffer_virtual_address = gpu_fetch.base_address << 12;
-  assert_true(*frontbuffer_ptr == frontbuffer_virtual_address);
-  uint32_t frontbuffer_physical_address =
-      REX_KERNEL_MEMORY()->GetPhysicalAddress(frontbuffer_virtual_address);
-  assert_true(frontbuffer_physical_address != UINT32_MAX);
-  if (frontbuffer_physical_address == UINT32_MAX) {
-    // Xenia-specific safety check.
-    REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
-                  frontbuffer_virtual_address);
-    return;
-  }
-  gpu_fetch.base_address = frontbuffer_physical_address >> 12;
-
-  auto texture_format = rex::graphics::xenos::TextureFormat(texture_format_ptr.value());
-  auto color_space = *color_space_ptr;
-  assert_true(texture_format == rex::graphics::xenos::TextureFormat::k_8_8_8_8 ||
-              texture_format == rex::graphics::xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
-  assert_true(color_space == 0);  // RGB(0)
-  assert_true(*width == 1 + gpu_fetch.size_2d.width);
-  assert_true(*height == 1 + gpu_fetch.size_2d.height);
-
-  // The caller seems to reserve 64 words (256b) in the primary ringbuffer
-  // for this method to do what it needs. We just zero them out and send a
-  // token value. It'd be nice to figure out what this is really doing so
-  // that we could simulate it, though due to TCR I bet all games need to
-  // use this method.
-  buffer_ptr.Zero(64 * 4);
-
-  uint32_t offset = 0;
-  auto dwords = buffer_ptr.as_array<uint32_t>();
-
-  // Write in the GPU texture fetch.
-  dwords[offset++] =
-      xenos::MakePacketType0(rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
-  dwords[offset++] = gpu_fetch.dword_0;
-  dwords[offset++] = gpu_fetch.dword_1;
-  dwords[offset++] = gpu_fetch.dword_2;
-  dwords[offset++] = gpu_fetch.dword_3;
-  dwords[offset++] = gpu_fetch.dword_4;
-  dwords[offset++] = gpu_fetch.dword_5;
-
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
-  dwords[offset++] = rex::graphics::xenos::kSwapSignature;
-  dwords[offset++] = frontbuffer_physical_address;
-
-  dwords[offset++] = *width;
-  dwords[offset++] = *height;
-
-  // Fill the rest of the buffer with NOP packets.
-  for (uint32_t i = offset; i < 64; i++) {
-    dwords[i] = xenos::MakePacketType2();
-  }
+  auto video_delegate = REX_KERNEL_STATE()->emulator()->detached_video_delegate();
+  ProcessVdSwap(*REX_KERNEL_MEMORY(), video_delegate.get(), inputs);
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
