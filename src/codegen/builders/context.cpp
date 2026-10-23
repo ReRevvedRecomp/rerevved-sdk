@@ -198,20 +198,18 @@ void BuilderContext::emit_function_call(uint32_t address) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
 
-      // Handle save/restore helpers. Gated on the global setting, not this
-      // function's: the helper bodies are emitted under it too, so once they
-      // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
+      // Gate save/restore helpers on the global setting, not the function: when
+      // localized, their bodies scribble zeros on the caller frame. A
+      // share_registers function must still elide them.
       if (cfg.nonVolatileRegistersAsLocalVariables &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         // print nothing - these are handled by local variable tracking
         return;
       }
 
-      // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
-      // the owner left live, so hand it the localized copies through ctx and take
-      // them back afterwards. Only registers already localized here can be live at
-      // this point, so that set is the whole live-in the funclet can see.
+      // An SEH funclet runs on its owner's frame; pass localized non-volatiles
+      // through ctx and restore them so only registers localized here form its
+      // live-in set.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
         for (size_t i = 14; i < 32; ++i) {
           if (locals.r[i])
@@ -373,6 +371,9 @@ void BuilderContext::emit_mid_asm_hook() {
         break;
       case 'x':
         out += xer();
+        break;
+      case 'l':
+        out += "ctx.lr";
         break;
       case 'r':
         if (reg == "reserved")
