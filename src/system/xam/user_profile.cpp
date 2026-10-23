@@ -13,20 +13,52 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
+#include "../../kernel/xam/system_link_config.h"
+
+REXCVAR_DEFINE_BOOL(live_signin, false, "Kernel",
+                    "Report the profile as signed in to Xbox Live; no Live service is "
+                    "contacted")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace system {
 namespace xam {
+
+uint32_t UserProfile::signin_state() const {
+  return REXCVAR_GET(live_signin) ? 2 : 1;
+}
 
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
+  const auto config = kernel::xam::system_link::CurrentConfig();
+  const bool system_link = config.mode != kernel::xam::system_link::Mode::kOff;
+  if (system_link) {
+    const uint64_t configured_xuid = config.xuid;
+    if (configured_xuid) {
+      xuid_ = configured_xuid;
+    } else {
+      REXSYS_ERROR("System Link is enabled without a nonzero local XUID");
+    }
+  }
   name_ = "User";
+  if (system_link) {
+    const auto& configured_name = config.profile_name;
+    if (!configured_name.empty()) {
+      constexpr size_t kMaxProfileNameLength = 15;
+      name_ = configured_name.substr(0, kMaxProfileNameLength);
+      if (configured_name.size() > kMaxProfileNameLength) {
+        REXSYS_WARN("System Link profile name was truncated to 15 bytes");
+      }
+    }
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

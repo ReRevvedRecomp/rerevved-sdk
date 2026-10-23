@@ -218,7 +218,8 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  // 1 signed in locally; 2 signed in to Xbox Live when live_signin is set.
+  uint32_t signin_state() const;
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
