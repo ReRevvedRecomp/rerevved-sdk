@@ -102,14 +102,9 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     return;
   }
   if (event.type == paint_event_type_) {
-    // Cocoa may enqueue its quit request behind an already queued paint. Once
-    // termination has been requested, CAMetalLayer may stop supplying
-    // drawables, so entering the paint first can block forever in
-    // -[CAMetalLayer nextDrawable] and prevent the quit event from being
-    // processed. Give an already queued quit request priority over rendering.
-    // Pump explicitly because a continuous stream of custom paint events can
-    // otherwise keep SDL_WaitEvent from returning to Cocoa to collect the
-    // application-menu quit request.
+    // Prioritize Cocoa quit: termination can stop CAMetalLayer drawables,
+    // blocking nextDrawable forever. Pump SDL explicitly: custom paints can
+    // keep SDL_WaitEvent from returning to Cocoa to collect menu quit.
     SDL_PumpEvents();
     SDL_Event quit_event{};
     if (SDL_PeepEvents(&quit_event, 1, SDL_GETEVENT, SDL_EVENT_QUIT, SDL_EVENT_QUIT) > 0) {

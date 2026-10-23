@@ -71,6 +71,9 @@ class WindowSDL final : public Window {
   void PerformClose();
   void DestroySDLWindow();
 
+  // Shrinks the not-yet-shown window to the usable area of its display.
+  void ClampWindowToDisplay(int requested_width, int requested_height);
+
   void ApplyCursorVisibilityNow();
   void ApplyTextInputActiveNow();
   void RearmCursorAutoHideTimer();
