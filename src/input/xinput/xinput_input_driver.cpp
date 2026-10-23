@@ -249,7 +249,6 @@ X_RESULT XinputInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* v
 
 X_RESULT XinputInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
                                                X_INPUT_KEYSTROKE* out_keystroke) {
-  // We may want to filter flags before sending to native.
   // flags is reserved on desktop.
   uint32_t user_index = 0;
   if (!SlotForDevice(id, &user_index)) {

@@ -23,40 +23,68 @@
 #include <cstring>
 #include <string_view>
 
-REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input",
+                    "Keyboard and mouse. Enable keyboard/mouse controller emulation")
+    .audience(rex::cvar::Audience::kPlayer);
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
-                    "Use the mouse for the right stick. Off means the right stick comes "
-                    "from the keybind_rstick_* keys only");
+                    "Mouse aim. Use the mouse for the right stick. Off means the right stick "
+                    "comes from the keybind_rstick_* keys only")
+    .audience(rex::cvar::Audience::kPlayer);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
-    .range(0.01, 10.0);
+    .range(0.01, 10.0)
+    .audience(rex::cvar::Audience::kPlayer);
 
-REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
-REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
-REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
-REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button");
-REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger");
-REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger");
-REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder");
-REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder");
-REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
-REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down");
-REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
-REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
-REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press");
-REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up");
-REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down");
-REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left")
+    .audience(rex::cvar::Audience::kPlayer);
 REXCVAR_DEFINE_STRING(keybind_rstick_right, "Right", "Input/Keybinds/Controller",
-                      "Right stick right");
-REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press");
-REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up");
-REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down");
-REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left");
-REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller",
-                      "D-pad right");
-REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button");
-REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
-REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
+                      "Right stick right")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller", "D-pad right")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button")
+    .audience(rex::cvar::Audience::kPlayer);
 
 namespace rex::input::mnk {
 
@@ -65,12 +93,9 @@ namespace {
 // A single device, so its handle is a constant.
 constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x4D4E4B00);
 
-// Bind values are a comma-separated list of alternatives, each optionally
-// carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
-// so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
-// it. That is what lets the D-pad share the arrow keys. A consequence is
-// that binding a bare modifier name ("Shift") can never fire, since holding it
-// makes the live mask non-zero while the bind wants zero.
+// Bindings are comma-separated alternatives with optional prefixes ("Q,I",
+// "Shift+W"). Matching is exact ("Up" is silent with Shift; "Shift+Up" without
+// it), so bare modifiers never fire and D-pad bindings can share arrows.
 constexpr uint8_t kModShift = 1u << 0;
 constexpr uint8_t kModCtrl = 1u << 1;
 constexpr uint8_t kModAlt = 1u << 2;

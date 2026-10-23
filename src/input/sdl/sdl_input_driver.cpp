@@ -18,10 +18,18 @@
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
+#include <rex/string/numeric.h>
 #include <rex/ui/virtual_key.h>
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+
+// SDL drops gamepad input while no window of the process has focus unless
+// this hint is set; SDL watches the hint, so a change applies immediately.
+REXCVAR_DEFINE_BOOL(input_gamepad_in_background, false, "Input",
+                    "Gamepad in background. Accept gamepad input while the game window is not "
+                    "focused")
+    .audience(rex::cvar::Audience::kPlayer);
 
 namespace rex::input::sdl {
 
@@ -29,6 +37,10 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+void ApplyGamepadBackgroundHint(bool enabled) {
+  SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, enabled ? "1" : "0");
+}
 
 }  // namespace
 
@@ -88,6 +100,13 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           },
           this);
 
+      // SDL reads the hint when the subsystem starts and on every change.
+      ApplyGamepadBackgroundHint(REXCVAR_GET(input_gamepad_in_background));
+      rex::cvar::RegisterChangeCallback(
+          "input_gamepad_in_background", [](std::string_view, std::string_view value) {
+            ApplyGamepadBackgroundHint(rex::string::from_string<bool>(value, false));
+          });
+
       // Initialize game controller subsystem
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
@@ -128,6 +147,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       SDL_CloseGamepad(controller.sdl);
     }
     controllers_.clear();
+    rex::cvar::UnregisterChangeCallbacks("input_gamepad_in_background");
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
       SDL_Gamepad_initialized_ = false;

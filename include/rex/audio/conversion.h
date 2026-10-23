@@ -47,13 +47,9 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
     out[sample * 6 + 5] = sample2;
   }
 
-  // Second pass rather than fusing into the shuffle above, which stores as integers.
-  // 6 KB per 5.33 ms frame, so skipping it at unity gain is not worth the asymmetry.
-  //
-  // Six interleaved channels across four-float windows repeat every 12 floats,
-  // so three weight vectors cover every alignment the loop ever sees. The
-  // assert above makes the sample count even, which makes the float count a
-  // multiple of 12, so the cycle closes with no tail to handle.
+  // Keep the second pass after the integer shuffle even at unity (6 KB/5.33 ms).
+  // Six channels across four-float windows repeat every 12 floats; an even
+  // sample count needs no tail.
   const float c = mix.center * gain;
   const float s = mix.surround * gain;
   const float l = mix.lfe * gain;
