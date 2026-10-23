@@ -12,9 +12,12 @@
  * @remarks     ImGuiDrawer owns one Style; overlays read their own section
  *              through ImGuiDialog::imgui_drawer()->style(). Consumers patch
  *              it from ReXApp::OnConfigureStyle. Every default matches the
- *              value the corresponding overlay shipped with.
+ *              value used by the corresponding overlay; chrome and scale
+ *              default to off.
  */
 #pragma once
+#include <functional>
+
 #include <imgui.h>
 
 namespace rex::ui {
@@ -43,6 +46,9 @@ struct ToastStyle {
   float rounding = 6.0f;
   float background_alpha = 0.88f;
   float icon_size = 44.0f;
+  /// Fraction of the display height kept clear at the bottom, such as for a
+  /// title's HUD; both toasts sit above it.
+  float bottom_inset = 0.0f;
 };
 
 struct ConsoleStyle {
@@ -74,12 +80,56 @@ struct SettingsStyle {
   ImVec4 lifecycle_unknown{1.00f, 1.00f, 1.00f, 1.00f};
 };
 
+/// Interaction state passed to the button and selection skins.
+enum class ChromeState { kNormal, kHovered, kActive, kSelected };
+
+/// Optional skin for top-level overlay windows, their inner panels, buttons
+/// and list selections. Empty callbacks keep the plain ImGui look.
+struct ChromeStyle {
+  /// Draws the window frame and background over [min, max]. title_height is
+  /// zero for untitled windows.
+  std::function<void(ImDrawList* draw_list, ImVec2 min, ImVec2 max, float title_height)>
+      draw_window;
+  /// Draws an inner panel, such as a list or the FPS counter background.
+  std::function<void(ImDrawList* draw_list, ImVec2 min, ImVec2 max)> draw_panel;
+  /// Draws a button background under its label, through OverlayButton. A
+  /// disabled button arrives with ImGui::GetStyle().Alpha already reduced.
+  std::function<void(ImDrawList* draw_list, ImVec2 min, ImVec2 max, ChromeState state)> draw_button;
+  /// Draws a hovered, pressed or selected list row under its label, through
+  /// OverlaySelectable. Never called with kNormal.
+  std::function<void(ImDrawList* draw_list, ImVec2 min, ImVec2 max, ChromeState state)>
+      draw_selection;
+  /// Title band height in multiples of the current font size.
+  float title_height_em = 1.8f;
+  /// Extra title text indent past the window padding, in multiples of the
+  /// current font size, for frames with wide corners.
+  float title_indent_em = 0.0f;
+};
+
+/// Scales overlay fonts and sizes with the output height.
+struct OverlayScaleStyle {
+  /// Output height drawn at 1x. Zero disables scaling.
+  float reference_height = 0.0f;
+  float min_scale = 1.0f;
+  float max_scale = 4.0f;
+};
+
+struct FpsCounterStyle {
+  ImVec4 text{1.00f, 1.00f, 1.00f, 1.00f};
+  float background_alpha = 0.55f;
+  /// Distance from the top-right corner, before overlay scale.
+  ImVec2 margin{12.0f, 12.0f};
+};
+
 struct Style {
   AchievementsStyle achievements;
   ToastStyle toast;
   ConsoleStyle console;
   DebugOverlayStyle debug;
   SettingsStyle settings;
+  ChromeStyle chrome;
+  OverlayScaleStyle scale;
+  FpsCounterStyle fps_counter;
 };
 
 }  // namespace rex::ui

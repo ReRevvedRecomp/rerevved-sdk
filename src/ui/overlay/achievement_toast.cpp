@@ -60,12 +60,13 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
     alpha = (kDisplaySeconds - age) / 0.5f;
   alpha = std::max(0.0f, std::min(1.0f, alpha));
 
+  const ToastStyle& s = imgui_drawer()->style().toast;
   const float pad = 16.0f;
   const float w = 320.0f;
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - pad, io.DisplaySize.y - 80.0f - pad),
-                          ImGuiCond_Always);
+  const float inset = io.DisplaySize.y * std::clamp(s.bottom_inset, 0.0f, 0.5f);
+  ImGui::SetNextWindowPos(
+      ImVec2(io.DisplaySize.x - w - pad, io.DisplaySize.y - inset - 80.0f - pad), ImGuiCond_Always);
   ImGui::SetNextWindowSize(ImVec2(w, 70.0f), ImGuiCond_Always);
-  const ToastStyle& s = imgui_drawer()->style().toast;
   ImGui::SetNextWindowBgAlpha(s.background_alpha * alpha);
 
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |

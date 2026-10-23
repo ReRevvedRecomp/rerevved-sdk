@@ -14,31 +14,77 @@
 #include <rex/string.h>
 #include <rex/string/numeric.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/monitors.h>
+#include <rex/ui/overlay/window_chrome.h>
 #include <imgui.h>
 
+#include "settings_rows.h"
+
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <set>
+#include <string_view>
 #include <string>
 #include <vector>
 
+REXCVAR_DEFINE_BOOL(settings_show_advanced, false, "UI/Settings",
+                    "Show advanced settings in the settings overlay")
+    .audience(rex::cvar::Audience::kHidden);
+
+REXCVAR_DEFINE_BOOL(settings_show_developer, false, "UI/Settings",
+                    "Show developer settings in the settings overlay")
+    .audience(rex::cvar::Audience::kHidden);
+
 namespace rex::ui {
 
-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+template <typename T>
+static void InputInteger(const rex::cvar::FlagEntry& entry, const std::string& text,
+                         ImGuiDataType type) {
+  T value{};
+  std::from_chars(text.data(), text.data() + text.size(), value);
+  const T step = 1, fast_step = 100;
+  if (!ImGui::InputScalar("##v", type, &value, &step, &fast_step))
+    return;
+  auto bound = [](double limit) -> T {
+    // Comparing before conversion also handles rounded double representations
+    // of INT64_MAX and UINT64_MAX without an out-of-range integer cast.
+    if (limit <= static_cast<double>(std::numeric_limits<T>::lowest()))
+      return std::numeric_limits<T>::lowest();
+    if (limit >= static_cast<double>(std::numeric_limits<T>::max()))
+      return std::numeric_limits<T>::max();
+    return static_cast<T>(limit);
+  };
+  if (entry.constraints.min)
+    value = std::max(value, bound(std::ceil(*entry.constraints.min)));
+  if (entry.constraints.max)
+    value = std::min(value, bound(std::floor(*entry.constraints.max)));
+  rex::cvar::SetFlagByName(entry.name, std::to_string(value));
+}
+
+SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
+                               std::function<void()> close_callback, SettingsLayout layout)
+    : ImGuiDialog(imgui_drawer),
+      config_path_(std::move(config_path)),
+      close_callback_(std::move(close_callback)),
+      layout_(std::move(layout)) {
+  if (!layout_.choice_labels.contains("monitor")) {
+    layout_.choice_labels["monitor"] = MonitorChoiceLabels();
+  }
+  SnapshotSavedValues();
+}
 
 SettingsDialog::~SettingsDialog() {}
 
-static const char* LifecycleBadge(rex::cvar::Lifecycle lc) {
-  switch (lc) {
-    case rex::cvar::Lifecycle::kHotReload:
-      return " [live]";
-    case rex::cvar::Lifecycle::kRequiresRestart:
-      return " [restart]";
-    case rex::cvar::Lifecycle::kInitOnly:
-      return " [init-only]";
+void SettingsDialog::SnapshotSavedValues() {
+  saved_values_.clear();
+  for (auto& entry : rex::cvar::GetRegistry()) {
+    if (settings_rows::IsSaved(entry)) {
+      saved_values_[entry.name] = entry.getter();
+    }
   }
-  return "";
 }
 
 static ImVec4 LifecycleColor(rex::cvar::Lifecycle lc, const SettingsStyle& style) {
@@ -51,6 +97,35 @@ static ImVec4 LifecycleColor(rex::cvar::Lifecycle lc, const SettingsStyle& style
       return style.lifecycle_init_only;
   }
   return style.lifecycle_unknown;
+}
+
+static bool IsKeybindCategory(std::string_view cat) {
+  return cat == "Input/Keybinds" || cat.starts_with("Input/Keybinds/");
+}
+
+// Custom text or default details, with lifecycle coloring; see PlanRowTooltip.
+static void RowTooltip(const rex::cvar::FlagEntry& entry, const SettingsStyle& style,
+                       const settings_rows::RowTooltipPlan& plan) {
+  if (!plan.visible || !ImGui::BeginTooltip()) {
+    return;
+  }
+  ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+  if (plan.text) {
+    ImGui::TextUnformatted(plan.text->data(), plan.text->data() + plan.text->size());
+  }
+  if (plan.details) {
+    if (!entry.description.empty()) {
+      ImGui::TextUnformatted(entry.description.c_str());
+    }
+    ImGui::TextDisabled("%s", entry.name.c_str());
+    ImGui::SameLine();
+  }
+  if (plan.lifecycle) {
+    ImGui::TextColored(LifecycleColor(entry.lifecycle, style), "%s",
+                       settings_rows::LifecycleText(entry.lifecycle));
+  }
+  ImGui::PopTextWrapPos();
+  ImGui::EndTooltip();
 }
 
 static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
@@ -156,190 +231,221 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
   }
 }
 
-void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+void SettingsDialog::OnDraw(ImGuiIO& io) {
   auto& registry = rex::cvar::GetRegistry();
-
-  // Collect sorted unique category paths.
-  std::set<std::string> category_set;
-  for (auto& entry : registry) {
-    category_set.insert(entry.category);
-  }
-
-  // Build tree: for each category path like "Input/Keybinds/Controller",
-  // also register the parent paths "Input" and "Input/Keybinds" as nodes.
-  struct CatNode {
-    std::string full_path;
-    std::string label;  // leaf segment (e.g. "Controller")
-    std::map<std::string, CatNode> children;
-    bool has_direct_entries = false;
-  };
-  std::map<std::string, CatNode> tree;
-
-  for (auto& cat : category_set) {
-    std::map<std::string, CatNode>* level = &tree;
-    std::string path_so_far;
-    size_t start = 0;
-    while (start < cat.size()) {
-      size_t slash = cat.find('/', start);
-      std::string segment =
-          (slash == std::string::npos) ? cat.substr(start) : cat.substr(start, slash - start);
-      if (!path_so_far.empty())
-        path_so_far += "/";
-      path_so_far += segment;
-      auto& node = (*level)[segment];
-      node.full_path = path_so_far;
-      node.label = segment;
-      if (path_so_far == cat)
-        node.has_direct_entries = true;
-      level = &node.children;
-      start = (slash == std::string::npos) ? cat.size() : slash + 1;
-    }
-  }
+  const auto inline_toggles = settings_rows::ResolveInlineToggles(registry, layout_);
+  const Style& ui_style = imgui_drawer()->style();
+  const SettingsStyle& settings_style = ui_style.settings;
+  const float scale = imgui_drawer()->overlay_scale();
+  const bool show_advanced = REXCVAR_GET(settings_show_advanced);
+  const bool show_developer = REXCVAR_GET(settings_show_developer);
 
   const std::string search(search_buf_);
   const bool searching = !search.empty();
 
-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowBgAlpha(0.85f);
-  if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+  // Visible rows in registration order. The advanced toggle appears only when
+  // it would show something.
+  std::vector<const rex::cvar::FlagEntry*> rows;
+  bool has_advanced = false;
+  for (auto& entry : registry) {
+    const auto audience = settings_rows::EffectiveAudience(entry, layout_);
+    if (settings_rows::IsVisibleRow(entry, layout_, inline_toggles, show_advanced,
+                                    show_developer)) {
+      rows.push_back(&entry);
+    }
+    has_advanced =
+        has_advanced || (audience == rex::cvar::Audience::kAdvanced &&
+                         settings_rows::IsVisibleRow(entry, layout_, inline_toggles, true, false));
+  }
+
+  // Unsaved rows compare against the values at open or the last save.
+  std::vector<const rex::cvar::FlagEntry*> changed;
+  for (auto& entry : registry) {
+    if (!settings_rows::IsSaved(entry)) {
+      continue;
+    }
+    auto it = saved_values_.find(entry.name);
+    if (it != saved_values_.end() && it->second != entry.getter()) {
+      changed.push_back(&entry);
+    }
+  }
+
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                          ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(760.0f * scale, 520.0f * scale), ImGuiCond_FirstUseEver);
+  bool open = true;
+  const bool was_capturing = !capturing_bind_name_.empty();
+  if (!BeginOverlayWindow(ui_style, "Settings##rex", close_callback_ ? &open : nullptr,
+                          ImGuiWindowFlags_NoCollapse, 0.92f)) {
     ImGui::End();
     return;
+  }
+  // Escape cancels a key capture or closes a popup first.
+  if (close_callback_ && !was_capturing &&
+      ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() &&
+      !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+      ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    open = false;
   }
 
   // Search bar at the top (full width).
   ImGui::SetNextItemWidth(-1.0f);
-  ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
-  ImGui::SameLine(0, 0);
-  ImGui::Dummy(ImVec2(0, 0));
+  ImGui::InputTextWithHint("##search", "Search settings", search_buf_, sizeof(search_buf_));
 
-  ImGui::Separator();
+  const float footer_height = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+  const float panel_width = 200.0f * scale;
+  bool capture_row_drawn = false;
+  float label_width = 0.0f;
+  // A command may change the registry, so it runs after the frame stops using
+  // registry entries.
+  std::string clicked_command;
 
-  const float panel_width = 160.0f;
-  ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f), true);
-
-  // Recursive lambda to draw the category tree.
-  std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
-  draw_tree = [&](const std::map<std::string, CatNode>& nodes, int depth) {
-    for (auto& [key, node] : nodes) {
-      if (node.children.empty()) {
-        // Leaf node - selectable
-        bool selected = (selected_category_ == node.full_path);
-        if (depth > 0)
-          ImGui::Indent(8.0f);
-        if (ImGui::Selectable(node.label.c_str(), selected)) {
-          selected_category_ = node.full_path;
-        }
-        if (depth > 0)
-          ImGui::Unindent(8.0f);
-      } else {
-        // Parent node with children - use tree node
-        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow;
-        if (node.has_direct_entries) {
-          // Can be selected as well as expanded
-          if (selected_category_ == node.full_path)
-            flags |= ImGuiTreeNodeFlags_Selected;
-        }
-        bool open = ImGui::TreeNodeEx(node.label.c_str(), flags);
-        if (ImGui::IsItemClicked() && node.has_direct_entries) {
-          selected_category_ = node.full_path;
-        }
-        if (open) {
-          draw_tree(node.children, depth + 1);
-          ImGui::TreePop();
+  auto draw_value = [&](const rex::cvar::FlagEntry& entry) {
+    const std::string current_val = entry.getter();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (entry.type == rex::cvar::FlagType::Boolean) {
+      bool v = rex::string::from_string<bool>(current_val, false);
+      if (ImGui::Checkbox("##v", &v)) {
+        rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
+      }
+    } else if (entry.type == rex::cvar::FlagType::String &&
+               !entry.constraints.allowed_values.empty()) {
+      const auto& opts = entry.constraints.allowed_values;
+      int cur_idx = 0;
+      for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
+        if (opts[i] == current_val) {
+          cur_idx = i;
+          break;
         }
       }
-    }
-  };
-  // Root node named after the config file
-  std::string root_label = config_path_.stem().string();
-  ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen;
-  if (selected_category_.empty())
-    root_flags |= ImGuiTreeNodeFlags_Selected;
-  bool root_open = ImGui::TreeNodeEx(root_label.c_str(), root_flags);
-  if (ImGui::IsItemClicked()) {
-    selected_category_.clear();
-  }
-  if (root_open) {
-    draw_tree(tree, 1);
-    ImGui::TreePop();
-  }
-
-  ImGui::EndChild();
-
-  ImGui::SameLine();
-
-  // Helper: check if a CVAR's category matches the selected category.
-  // Exact match or prefix match (e.g. selecting "Input" shows all "Input/*").
-  auto category_matches = [&](const std::string& cat) -> bool {
-    if (selected_category_.empty())
-      return true;  // Root selected - show all
-    if (cat == selected_category_)
-      return true;
-    if (cat.size() > selected_category_.size() &&
-        cat.compare(0, selected_category_.size(), selected_category_) == 0 &&
-        cat[selected_category_.size()] == '/') {
-      return true;
-    }
-    return false;
-  };
-
-  // Helper: check if a category is a keybind category.
-  auto is_keybind_category = [](const std::string& cat) -> bool {
-    return cat == "Input/Keybinds" ||
-           (cat.size() > 15 && cat.compare(0, 15, "Input/Keybinds/") == 0);
-  };
-
-  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
-  for (auto& entry : registry) {
-    // Filter by category (unless searching).
-    if (!searching) {
-      if (!category_matches(entry.category)) {
-        continue;
+      const std::string preview = settings_rows::ChoiceLabel(entry, opts[cur_idx], layout_);
+      if (ImGui::BeginCombo("##v", preview.c_str())) {
+        for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
+          bool sel = (i == cur_idx);
+          ImGui::PushID(i);
+          const bool picked = OverlaySelectable(
+              ui_style, settings_rows::ChoiceLabel(entry, opts[i], layout_).c_str(), sel);
+          ImGui::PopID();
+          if (picked) {
+            rex::cvar::SetFlagByName(entry.name, opts[i]);
+          }
+          if (sel)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+    } else if (const auto int_choices = settings_rows::IntegerChoices(entry, layout_);
+               !int_choices.empty()) {
+      const size_t cur_idx = settings_rows::IntegerChoiceIndex(int_choices, current_val);
+      const std::string preview = settings_rows::IntegerChoicePreview(int_choices, current_val);
+      if (ImGui::BeginCombo("##v", preview.c_str())) {
+        for (size_t i = 0; i < int_choices.size(); ++i) {
+          const bool sel = (i == cur_idx);
+          ImGui::PushID(static_cast<int>(i));
+          const bool picked = OverlaySelectable(ui_style, int_choices[i].label.c_str(), sel);
+          ImGui::PopID();
+          if (picked) {
+            rex::cvar::SetFlagByName(entry.name, std::to_string(int_choices[i].value));
+          }
+          if (sel)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+    } else if (entry.type == rex::cvar::FlagType::Int32) {
+      InputInteger<int32_t>(entry, current_val, ImGuiDataType_S32);
+    } else if (entry.type == rex::cvar::FlagType::Int64) {
+      InputInteger<int64_t>(entry, current_val, ImGuiDataType_S64);
+    } else if (entry.type == rex::cvar::FlagType::Uint32) {
+      InputInteger<uint32_t>(entry, current_val, ImGuiDataType_U32);
+    } else if (entry.type == rex::cvar::FlagType::Uint64) {
+      InputInteger<uint64_t>(entry, current_val, ImGuiDataType_U64);
+    } else if (entry.type == rex::cvar::FlagType::Double) {
+      double v = std::atof(current_val.c_str());
+      const std::string format = settings_rows::FloatFormat(entry, layout_);
+      if (ImGui::InputDouble("##v", &v, 0.0, 0.0, format.c_str())) {
+        if (entry.constraints.min)
+          v = std::max(v, *entry.constraints.min);
+        if (entry.constraints.max)
+          v = std::min(v, *entry.constraints.max);
+        const std::string edited = layout_.float_decimals.contains(entry.name)
+                                       ? settings_rows::FloatEditText(v)
+                                       : std::to_string(v);
+        rex::cvar::SetFlagByName(entry.name, edited);
       }
     } else {
-      // Search matches name or description (case-insensitive substring).
-      std::string name_lower = entry.name;
-      std::string search_lower = search;
-      auto to_lower = [](std::string& s) {
-        for (auto& c : s)
-          c = static_cast<char>(std::tolower(c));
-      };
-      to_lower(name_lower);
-      to_lower(search_lower);
-      if (name_lower.find(search_lower) == std::string::npos &&
-          entry.description.find(search_lower) == std::string::npos) {
-        continue;
+      char buf[1024];
+      rex::string::copy_truncating(buf, current_val, sizeof(buf));
+      const bool enter =
+          ImGui::InputText("##v", buf, sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue);
+      if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
+        rex::cvar::SetFlagByName(entry.name, buf);
       }
     }
+  };
 
-    bool read_only = (entry.lifecycle == rex::cvar::Lifecycle::kInitOnly);
+  auto draw_row = [&](const rex::cvar::FlagEntry& entry) {
+    const auto* pair = settings_rows::FindInlineToggle(entry, inline_toggles);
+    const auto tooltip_text = settings_rows::RowTooltipText(entry, layout_, pair);
+    const auto tooltip_plan = settings_rows::PlanRowTooltip(entry.lifecycle, layout_, tooltip_text);
+    // A command row is a single button; it changes no value, so it is never
+    // saved and never counts as an unsaved change.
+    if (entry.type == rex::cvar::FlagType::Command) {
+      ImGui::PushID(entry.name.c_str());
+      const std::string label = settings_rows::Label(entry, layout_);
+      if (OverlayButton(ui_style, (label + "##v").c_str())) {
+        clicked_command = entry.name;
+      }
+      if (ImGui::IsItemHovered()) {
+        RowTooltip(entry, settings_style, tooltip_plan);
+      }
+      ImGui::PopID();
+      return;
+    }
+    const bool read_only = (entry.lifecycle == rex::cvar::Lifecycle::kInitOnly);
+    const std::string label = settings_rows::Label(entry, layout_);
+    const std::string current_val = entry.getter();
 
     ImGui::PushID(entry.name.c_str());
-
     if (read_only)
       ImGui::BeginDisabled();
 
-    std::string current_val = entry.getter();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      RowTooltip(entry, settings_style, tooltip_plan);
+    ImGui::SameLine(label_width);
 
-    // Use description as display label if available, otherwise CVAR name
-    const char* display_label =
-        (!entry.description.empty()) ? entry.description.c_str() : entry.name.c_str();
-
-    if (is_keybind_category(entry.category)) {
+    if (pair) {
+      // The bool and value retain separate lifecycle locks, as separate rows do.
+      draw_value(entry);
+      if (read_only)
+        ImGui::EndDisabled();
+      const bool checked = rex::string::from_string<bool>(entry.getter(), false);
+      ImGui::SameLine();
+      ImGui::PushID(pair->value->name.c_str());
+      ImGui::BeginDisabled(!settings_rows::InlineValueEnabled(*pair, checked));
+      draw_value(*pair->value);
+      // Custom text stays on the label; only default details reach the field.
+      if (!tooltip_text && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        RowTooltip(*pair->value, settings_style,
+                   settings_rows::PlanRowTooltip(pair->value->lifecycle, layout_));
+      }
+      ImGui::EndDisabled();
+      ImGui::PopID();
+      ImGui::PopID();
+      return;
+    } else if (IsKeybindCategory(entry.category)) {
       // Grey out controller keybinds when MnK mode is disabled
-      bool mnk_disabled =
+      const bool mnk_disabled =
           (entry.category == "Input/Keybinds/Controller" && !REXCVAR_QUERY(bool, mnk_mode));
       if (mnk_disabled)
         ImGui::BeginDisabled();
 
-      // Show description as label (e.g. "A button"), not the raw CVAR name
-      ImGui::Text("%-20s", entry.description.c_str());
-      ImGui::SameLine(240.0f);
-
-      bool is_capturing = (capturing_bind_name_ == entry.name);
-
-      if (is_capturing) {
-        ImGui::Button("Press any key...##v", ImVec2(140.0f, 0));
+      const ImVec2 bind_size(160.0f * scale, 0.0f);
+      if (capturing_bind_name_ == entry.name) {
+        capture_row_drawn = true;
+        OverlayButton(ui_style, "Press a key...##v", bind_size);
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
           capturing_bind_name_.clear();
@@ -368,15 +474,20 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           }
         }
       } else {
-        ImGui::SetNextItemWidth(80.0f);
-        ImGui::Text("%-10s", current_val.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Rebind##v")) {
+        const std::string shown =
+            current_val.empty() ? "(none)" : settings_rows::FormatBinding(current_val);
+        if (OverlayButton(ui_style, (shown + "##v").c_str(), bind_size)) {
           capturing_bind_name_ = entry.name;
+          capture_row_drawn = true;
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Reset##v")) {
-          rex::cvar::SetFlagByName(entry.name, entry.default_value);
+        if (!tooltip_text && ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("Click, then press a key");
+        }
+        if (current_val != entry.default_value) {
+          ImGui::SameLine();
+          if (OverlayButton(ui_style, "Reset##v", ImVec2(0, 0), true)) {
+            rex::cvar::SetFlagByName(entry.name, entry.default_value);
+          }
         }
       }
 
@@ -384,131 +495,282 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       if (!current_val.empty()) {
         int conflict_count = 0;
         for (auto& other : registry) {
-          if (is_keybind_category(other.category) && other.name != entry.name &&
+          if (IsKeybindCategory(other.category) && other.name != entry.name &&
               other.getter() == current_val) {
             conflict_count++;
           }
         }
         if (conflict_count > 0) {
           ImGui::SameLine();
-          ImGui::TextColored(imgui_drawer()->style().settings.warning, "(!)");
+          ImGui::TextColored(settings_style.warning, "(!)");
           if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Key '%s' is also bound to %d other action(s)", current_val.c_str(),
-                              conflict_count);
+            ImGui::SetTooltip("Also bound to %d other action%s", conflict_count,
+                              conflict_count == 1 ? "" : "s");
           }
         }
       }
 
-      // Skip the generic name + lifecycle badge rendering for keybinds
       if (mnk_disabled)
         ImGui::EndDisabled();
-      if (read_only)
-        ImGui::EndDisabled();
-      ImGui::PopID();
-      continue;
     } else {
-      // Non-keybind CVARs: colored label on left, value widget on right
-      ImGui::TextColored(LifecycleColor(entry.lifecycle, imgui_drawer()->style().settings), "%-20s",
-                         entry.name.c_str());
-      if (ImGui::IsItemHovered()) {
-        const char* lifecycle_label = "";
-        switch (entry.lifecycle) {
-          case rex::cvar::Lifecycle::kHotReload:
-            lifecycle_label = "Live - changes apply immediately";
-            break;
-          case rex::cvar::Lifecycle::kRequiresRestart:
-            lifecycle_label = "Requires restart to take effect";
-            break;
-          case rex::cvar::Lifecycle::kInitOnly:
-            lifecycle_label = "Read-only - set at initialization only";
-            break;
-        }
-        if (!entry.description.empty()) {
-          ImGui::SetTooltip("%s\n[%s]", entry.description.c_str(), lifecycle_label);
-        } else {
-          ImGui::SetTooltip("[%s]", lifecycle_label);
-        }
-      }
-      ImGui::SameLine(240.0f);
-
-      ImGui::SetNextItemWidth(160.0f);
-      if (entry.type == rex::cvar::FlagType::Boolean) {
-        bool v = rex::string::from_string<bool>(current_val, false);
-        if (ImGui::Checkbox("##v", &v)) {
-          rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
-        }
-      } else if (entry.type == rex::cvar::FlagType::String &&
-                 !entry.constraints.allowed_values.empty()) {
-        const auto& opts = entry.constraints.allowed_values;
-        int cur_idx = 0;
-        for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-          if (opts[i] == current_val) {
-            cur_idx = i;
-            break;
-          }
-        }
-        if (ImGui::BeginCombo("##v", opts[cur_idx].c_str())) {
-          for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-            bool sel = (i == cur_idx);
-            if (ImGui::Selectable(opts[i].c_str(), sel)) {
-              rex::cvar::SetFlagByName(entry.name, opts[i]);
-            }
-            if (sel)
-              ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-      } else if (entry.type == rex::cvar::FlagType::Int32 ||
-                 entry.type == rex::cvar::FlagType::Int64 ||
-                 entry.type == rex::cvar::FlagType::Uint32 ||
-                 entry.type == rex::cvar::FlagType::Uint64) {
-        int v = std::atoi(current_val.c_str());
-        int vmin =
-            entry.constraints.min.has_value() ? static_cast<int>(*entry.constraints.min) : INT_MIN;
-        int vmax =
-            entry.constraints.max.has_value() ? static_cast<int>(*entry.constraints.max) : INT_MAX;
-        if (ImGui::InputInt("##v", &v)) {
-          v = std::clamp(v, vmin, vmax);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v));
-        }
-      } else if (entry.type == rex::cvar::FlagType::Double) {
-        double v = std::atof(current_val.c_str());
-        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
-          if (entry.constraints.min)
-            v = std::max(v, *entry.constraints.min);
-          if (entry.constraints.max)
-            v = std::min(v, *entry.constraints.max);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v));
-        }
-      } else if (entry.type == rex::cvar::FlagType::Command) {
-        if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
-          entry.command_callback("");
-        }
-      } else {
-        char buf[256];
-        rex::string::copy_truncating(buf, current_val, sizeof(buf));
-        if (ImGui::InputText("##v", buf, sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
-          rex::cvar::SetFlagByName(entry.name, buf);
-        }
-      }
+      draw_value(entry);
     }
 
     if (read_only)
       ImGui::EndDisabled();
-
     ImGui::PopID();
-  }
-  ImGui::EndChild();
+  };
 
-  // Bottom bar: Save button.
-  ImGui::Separator();
-  if (ImGui::Button("Save to config")) {
-    rex::cvar::SaveConfig(config_path_);
+  auto header_text = [](std::string text) {
+    for (size_t pos = 0; (pos = text.find('/', pos)) != std::string::npos; pos += 3) {
+      text.replace(pos, 1, " / ");
+    }
+    return text;
+  };
+
+  auto matches_search = [&](const rex::cvar::FlagEntry& entry) {
+    const auto* pair = settings_rows::FindInlineToggle(entry, inline_toggles);
+    return pair ? settings_rows::MatchesSearch(*pair, search, layout_)
+                : settings_rows::MatchesSearch(entry, search, layout_);
+  };
+
+  if (!layout_.tabs.empty()) {
+    const auto tabs = settings_rows::PlaceRows(rows, layout_);
+    // Hiding advanced rows can remove the selected tab.
+    if (std::none_of(tabs.begin(), tabs.end(),
+                     [this](const auto& tab) { return tab.title == selected_category_; })) {
+      selected_category_ = tabs.empty() ? std::string() : tabs.front().title;
+    }
+
+    if (BeginOverlayPanel(ui_style, "##tabs", ImVec2(panel_width, -footer_height))) {
+      for (const auto& tab : tabs) {
+        if (OverlaySelectable(ui_style, tab.title.c_str(),
+                              !searching && selected_category_ == tab.title)) {
+          selected_category_ = tab.title;
+          search_buf_[0] = '\0';
+        }
+      }
+    }
+    EndOverlayPanel();
+    ImGui::SameLine();
+
+    if (BeginOverlayPanel(ui_style, "##cvars", ImVec2(0, -footer_height))) {
+      label_width = std::max(220.0f * scale, ImGui::GetContentRegionAvail().x * 0.45f);
+      size_t drawn = 0;
+      for (const auto& tab : tabs) {
+        if (!searching && tab.title != selected_category_) {
+          continue;
+        }
+        for (size_t section_index = 0; section_index < tab.sections.size(); ++section_index) {
+          const auto& section = tab.sections[section_index];
+          bool header_drawn = false;
+          bool section_open = true;
+          for (const auto* row : section.rows) {
+            if (searching && !matches_search(*row)) {
+              continue;
+            }
+            if (!header_drawn) {
+              header_drawn = true;
+              const std::string title =
+                  searching
+                      ? (section.title.empty() ? tab.title : tab.title + " / " + section.title)
+                      : section.title;
+              // Titles may repeat, so the header ID uses the tab and section position.
+              ImGui::PushID(tab.title.c_str());
+              ImGui::PushID(static_cast<int>(section_index));
+              if (section.collapsed && !searching && !title.empty()) {
+                section_open = ImGui::CollapsingHeader(title.c_str());
+              } else if (!title.empty()) {
+                ImGui::SeparatorText(title.c_str());
+              }
+              ImGui::PopID();
+              ImGui::PopID();
+            }
+            if (!section_open) {
+              break;
+            }
+            ++drawn;
+            draw_row(*row);
+          }
+        }
+      }
+      if (drawn == 0 && searching) {
+        ImGui::TextDisabled("No settings match the search.");
+      }
+    }
+    EndOverlayPanel();
+  } else {
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const auto* a, const auto* b) { return a->category < b->category; });
+
+    // Build tree: for each category path like "Input/Keybinds/Controller",
+    // also register the parent paths "Input" and "Input/Keybinds" as nodes.
+    struct CatNode {
+      std::string full_path;
+      std::string label;  // leaf segment (e.g. "Controller")
+      std::map<std::string, CatNode> children;
+    };
+    std::map<std::string, CatNode> tree;
+    std::set<std::string> node_paths;
+    for (const auto* row : rows) {
+      const std::string& cat = row->category;
+      std::map<std::string, CatNode>* level = &tree;
+      std::string path_so_far;
+      size_t start = 0;
+      while (start < cat.size()) {
+        size_t slash = cat.find('/', start);
+        std::string segment =
+            (slash == std::string::npos) ? cat.substr(start) : cat.substr(start, slash - start);
+        if (!path_so_far.empty())
+          path_so_far += "/";
+        path_so_far += segment;
+        auto& node = (*level)[segment];
+        node.full_path = path_so_far;
+        node.label = segment;
+        node_paths.insert(path_so_far);
+        level = &node.children;
+        start = (slash == std::string::npos) ? cat.size() : slash + 1;
+      }
+    }
+    // Hiding advanced rows can remove the selected category.
+    if (!selected_category_.empty() && !node_paths.contains(selected_category_)) {
+      selected_category_.clear();
+    }
+
+    if (BeginOverlayPanel(ui_style, "##cats", ImVec2(panel_width, -footer_height))) {
+      if (OverlaySelectable(ui_style, "All", selected_category_.empty() && !searching)) {
+        selected_category_.clear();
+        search_buf_[0] = '\0';
+      }
+
+      std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
+      draw_tree = [&](const std::map<std::string, CatNode>& nodes, int depth) {
+        for (auto& [key, node] : nodes) {
+          const bool selected = !searching && selected_category_ == node.full_path;
+          if (node.children.empty()) {
+            if (depth > 0)
+              ImGui::Indent(8.0f * scale);
+            if (OverlaySelectable(ui_style, node.label.c_str(), selected)) {
+              selected_category_ = node.full_path;
+              search_buf_[0] = '\0';
+            }
+            if (depth > 0)
+              ImGui::Unindent(8.0f * scale);
+          } else {
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen |
+                                       ImGuiTreeNodeFlags_OpenOnArrow |
+                                       ImGuiTreeNodeFlags_SpanAvailWidth;
+            if (selected)
+              flags |= ImGuiTreeNodeFlags_Selected;
+            bool node_open = ImGui::TreeNodeEx(node.label.c_str(), flags);
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+              selected_category_ = node.full_path;
+              search_buf_[0] = '\0';
+            }
+            if (node_open) {
+              draw_tree(node.children, depth + 1);
+              ImGui::TreePop();
+            }
+          }
+        }
+      };
+      draw_tree(tree, 0);
+    }
+    EndOverlayPanel();
+
+    ImGui::SameLine();
+
+    // Exact match or prefix match (e.g. selecting "Input" shows all "Input/*").
+    auto category_matches = [&](const std::string& cat) -> bool {
+      if (selected_category_.empty())
+        return true;
+      if (cat == selected_category_)
+        return true;
+      return cat.size() > selected_category_.size() &&
+             cat.compare(0, selected_category_.size(), selected_category_) == 0 &&
+             cat[selected_category_.size()] == '/';
+    };
+
+    if (BeginOverlayPanel(ui_style, "##cvars", ImVec2(0, -footer_height))) {
+      label_width = std::max(220.0f * scale, ImGui::GetContentRegionAvail().x * 0.45f);
+      const std::string* last_category = nullptr;
+      size_t drawn = 0;
+      for (const auto* entry_ptr : rows) {
+        const auto& entry = *entry_ptr;
+        if (searching ? !matches_search(entry) : !category_matches(entry.category)) {
+          continue;
+        }
+        ++drawn;
+        if (!last_category || *last_category != entry.category) {
+          ImGui::SeparatorText(header_text(entry.category).c_str());
+          last_category = &entry.category;
+        }
+        draw_row(entry);
+      }
+      if (drawn == 0) {
+        ImGui::TextDisabled(
+            "%s", searching ? "No settings match the search." : "No settings in this category.");
+      }
+    }
+    EndOverlayPanel();
+  }
+  // A capture whose row left the view (search, tab or advanced toggle)
+  // would otherwise swallow Escape and the next key press.
+  if (!capture_row_drawn) {
+    capturing_bind_name_.clear();
+  }
+
+  if (OverlayButton(ui_style, "Save")) {
+    save_failed_ = !rex::cvar::TrySaveConfig(config_path_);
+    if (!save_failed_) {
+      SnapshotSavedValues();
+    }
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Write to %s", config_path_.filename().string().c_str());
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+  ImGui::BeginDisabled(changed.empty());
+  if (OverlayButton(ui_style, "Revert")) {
+    for (const auto* entry : changed) {
+      rex::cvar::SetFlagByName(entry->name, saved_values_[entry->name]);
+    }
+  }
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::AlignTextToFramePadding();
+  if (save_failed_) {
+    ImGui::TextColored(settings_style.warning, "Could not save %s",
+                       config_path_.filename().string().c_str());
+  } else if (changed.empty()) {
+    ImGui::TextDisabled("No unsaved changes");
+  } else {
+    ImGui::Text("%zu unsaved change%s", changed.size(), changed.size() == 1 ? "" : "s");
+  }
+
+  if (has_advanced) {
+    const char* advanced_label = "Show advanced settings";
+    const float advanced_width = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                                 ImGui::CalcTextSize(advanced_label).x;
+    ImGui::SameLine();
+    const float advanced_offset = ImGui::GetContentRegionAvail().x - advanced_width;
+    if (advanced_offset > 0.0f) {
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + advanced_offset);
+    }
+    bool advanced = show_advanced;
+    if (ImGui::Checkbox(advanced_label, &advanced)) {
+      rex::cvar::SetFlagByName("settings_show_advanced", advanced ? "true" : "false");
+    }
+  }
 
   ImGui::End();
+
+  if (!clicked_command.empty()) {
+    rex::cvar::InvokeCommand(clicked_command, "");
+  }
+  if (!open && close_callback_) {
+    close_callback_();
+  }
 }
 
 }  // namespace rex::ui

@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/achievements_overlay.h>
+#include <rex/ui/overlay/window_chrome.h>
 
 #include <imgui.h>
 
@@ -20,10 +21,12 @@ namespace rex::ui {
 AchievementsOverlayDialog::AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer,
                                                      ImmediateDrawer* immediate_drawer,
                                                      rex::Runtime* runtime,
-                                                     rex::system::AchievementManager* achievements)
+                                                     rex::system::AchievementManager* achievements,
+                                                     std::function<void()> close_callback)
     : ImGuiDialog(imgui_drawer),
       achievements_(achievements),
-      icon_cache_(immediate_drawer, runtime) {}
+      icon_cache_(immediate_drawer, runtime),
+      close_callback_(std::move(close_callback)) {}
 
 AchievementsOverlayDialog::~AchievementsOverlayDialog() {}
 
@@ -35,15 +38,24 @@ ImmediateTexture* AchievementsOverlayDialog::GetIcon(
 void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
   const AchievementsStyle& style = imgui_drawer()->style().achievements;
 
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f), ImGuiCond_FirstUseEver,
+  const float scale = imgui_drawer()->overlay_scale();
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f * scale), ImGuiCond_FirstUseEver,
                           ImVec2(0.5f, 0.0f));
-  ImGui::SetNextWindowSize(ImVec2(640.0f, 560.0f), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowBgAlpha(0.92f);
+  ImGui::SetNextWindowSize(ImVec2(640.0f * scale, 560.0f * scale), ImGuiCond_FirstUseEver);
 
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, style.window_padding);
-  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, style.item_spacing);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                      ImVec2(style.window_padding.x * scale, style.window_padding.y * scale));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                      ImVec2(style.item_spacing.x * scale, style.item_spacing.y * scale));
 
-  if (ImGui::Begin("Achievements##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+  bool open = true;
+  if (BeginOverlayWindow(imgui_drawer()->style(), "Achievements##overlay",
+                         close_callback_ ? &open : nullptr, ImGuiWindowFlags_NoCollapse, 0.92f)) {
+    if (close_callback_ && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      open = false;
+    }
     const auto achievements = achievements_->ListAchievements();
 
     int unlocked_count = 0;
@@ -67,7 +79,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
 
     float frac = total_count > 0 ? static_cast<float>(unlocked_count) / total_count : 0.0f;
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, style.progress_bar);
-    ImGui::ProgressBar(frac, ImVec2(-1.0f, 6.0f), "");
+    ImGui::ProgressBar(frac, ImVec2(-1.0f, 6.0f * scale), "");
     ImGui::PopStyleColor();
 
     ImGui::TextDisabled("Unlock progress is saved automatically");
@@ -98,10 +110,10 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
       if (icon) {
         ImVec4 tint = is_unlocked ? style.unlocked_icon_tint : style.locked_icon_tint;
         ImGui::ImageWithBg(reinterpret_cast<ImTextureID>(icon),
-                           ImVec2(style.icon_size, style.icon_size), ImVec2(0, 0), ImVec2(1, 1),
-                           ImVec4(0, 0, 0, 0), tint);
+                           ImVec2(style.icon_size * scale, style.icon_size * scale), ImVec2(0, 0),
+                           ImVec2(1, 1), ImVec4(0, 0, 0, 0), tint);
       } else {
-        ImGui::Dummy(ImVec2(style.icon_size, style.icon_size));
+        ImGui::Dummy(ImVec2(style.icon_size * scale, style.icon_size * scale));
       }
       ImGui::SameLine();
 
@@ -141,6 +153,9 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 
   ImGui::PopStyleVar(2);
+  if (!open && close_callback_) {
+    close_callback_();
+  }
 }
 
 }  // namespace rex::ui

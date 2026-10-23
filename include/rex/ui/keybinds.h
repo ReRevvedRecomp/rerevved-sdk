@@ -57,12 +57,26 @@ std::string VirtualKeyToString(VirtualKey vk);
  * binding is visible in the settings overlay and persisted to config.
  *
  * @param name         CVAR name for this bind (e.g. "bind_console").
- * @param default_key  Default key name (e.g. "Backtick", "F3").
+ * @param default_key  Default key name (e.g. "Backtick", "F3"). A key set
+ *                     with SetBindDefault for @p name replaces it.
  * @param description  Human-readable description for the settings UI.
  * @param callback     Function to invoke when the bound key is pressed.
  */
 void RegisterBind(std::string_view name, std::string_view default_key, std::string_view description,
                   std::function<void()> callback);
+
+/**
+ * Replace the default key of a bind that is registered later.
+ *
+ * Lets an application choose its own defaults for binds registered by the
+ * SDK, such as the overlay binds. Call it before registration, for example
+ * in ReXApp::OnPreSetup; it does not change a bind that is already
+ * registered. A key saved in config still takes precedence.
+ *
+ * @param name         CVAR name of the bind (e.g. "bind_settings").
+ * @param default_key  Default key name to register it with.
+ */
+void SetBindDefault(std::string_view name, std::string_view default_key);
 
 /**
  * Remove a previously registered keybind.
