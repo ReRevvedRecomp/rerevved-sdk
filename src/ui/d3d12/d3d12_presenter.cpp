@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <climits>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <utility>
 
@@ -35,6 +37,122 @@ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D
 
 namespace rex::ui::d3d12 {
 
+GpuGuestOutputTicket::~GpuGuestOutputTicket() {
+  if (completion_event_) {
+    if (!fence_ || FAILED(device_->GetDeviceRemovedReason()) ||
+        (fence_->GetCompletedValue() != UINT64_MAX &&
+         fence_->GetCompletedValue() >= fence_value_)) {
+      CloseHandle(completion_event_);
+    } else {
+      // Retain the registered completion event and fence if the queue drain cannot be confirmed.
+      (void)fence_.Detach();
+      (void)device_.Detach();
+    }
+  }
+}
+
+GpuGuestOutputTicket::Status GpuGuestOutputTicket::status() const {
+  std::lock_guard lock(mutex_);
+  if (status_ == Status::kSubmitted) {
+    const uint64_t completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX || FAILED(device_->GetDeviceRemovedReason())) {
+      status_ = Status::kFailed;
+    } else if (completed >= fence_value_) {
+      status_ = Status::kCompleted;
+    }
+  }
+  return status_;
+}
+
+uint64_t GpuGuestOutputTicket::copy_fence_value() const {
+  std::lock_guard lock(mutex_);
+  return fence_value_;
+}
+
+void GpuGuestOutputTicket::Claim() {
+  std::lock_guard lock(mutex_);
+  assert_true(status_ == Status::kPending);
+  status_ = Status::kClaimed;
+}
+
+void GpuGuestOutputTicket::Cancel() {
+  std::lock_guard lock(mutex_);
+  assert_true(status_ == Status::kPending || status_ == Status::kClaimed);
+  status_ = Status::kCanceled;
+  changed_.notify_all();
+}
+
+void GpuGuestOutputTicket::Fail() {
+  std::lock_guard lock(mutex_);
+  status_ = Status::kFailed;
+  changed_.notify_all();
+}
+
+void GpuGuestOutputTicket::Submit(ID3D12Device* device, ID3D12Fence* fence, uint64_t value) {
+  std::lock_guard lock(mutex_);
+  assert_true(status_ == Status::kClaimed);
+  device_ = device;
+  fence_ = fence;
+  fence_value_ = value;
+  status_ = Status::kSubmitted;
+  changed_.notify_all();
+}
+
+bool GpuGuestOutputTicket::AwaitRetirement(uint32_t timeout_ms) {
+  if (timeout_ms == INFINITE) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  HANDLE event;
+  Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+  uint64_t value;
+  {
+    std::unique_lock lock(mutex_);
+    if (!changed_.wait_until(lock, deadline, [&] {
+          return status_ != Status::kPending && status_ != Status::kClaimed;
+        })) {
+      return false;
+    }
+    if (status_ == Status::kCompleted || status_ == Status::kCanceled) {
+      return true;
+    }
+    if (status_ != Status::kSubmitted) {
+      return false;
+    }
+    if (!completion_event_) {
+      completion_event_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    }
+    event = completion_event_;
+    fence = fence_;
+    value = fence_value_;
+  }
+  if (status() == Status::kCompleted) {
+    return true;
+  }
+  if (!event || FAILED(fence->SetEventOnCompletion(value, event))) {
+    Fail();
+    return false;
+  }
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - std::chrono::steady_clock::now())
+                             .count();
+  if (remaining > 0) {
+    WaitForSingleObject(event, static_cast<DWORD>(remaining));
+  }
+  return status() == Status::kCompleted;
+}
+
+namespace {
+bool HasDevice(ID3D12DeviceChild* child, ID3D12Device* device) {
+  Microsoft::WRL::ComPtr<ID3D12Device> owner;
+  Microsoft::WRL::ComPtr<IUnknown> expected, actual;
+  return child && SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&owner))) &&
+         SUCCEEDED(owner.As(&actual)) &&
+         SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&expected))) &&
+         actual.Get() == expected.Get();
+}
+}  // namespace
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
@@ -52,15 +170,383 @@ namespace shaders {
 }  // namespace shaders
 
 D3D12Presenter::~D3D12Presenter() {
+  ClearGuestOutputFrames();
+  gpu_guest_output_owner_.reset();
+  DrainGpuGuestOutputCopies();
   // Await completion of the usage of everything before destroying anything.
   // From most likely the latest to most likely the earliest to be signaled, so
   // just one sleep will likely be needed.
   paint_context_.AwaitSwapChainUsageCompletion();
   guest_output_resource_refresher_submission_tracker_.Shutdown();
+  // Upload buffers, allocators, and command lists are retained until the
+  // provider queue tracker has drained all guest refresh submissions.
+  cpu_guest_output_uploads_.clear();
   ui_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
 #endif
+}
+
+uint64_t D3D12Presenter::QueueCpuGuestOutputFrame(CpuGuestOutputFrame frame) {
+  if (!detail::IsCpuGuestOutputFrameValid(frame, kMaxCpuGuestOutputDimension,
+                                          kMaxCpuGuestOutputPayloadBytes)) {
+    REXLOG_WARN("D3D12Presenter: Rejected an invalid CPU guest output frame");
+    return 0;
+  }
+  uint64_t token = guest_output_frame_queue_.Push(
+      PendingGuestOutputFrame{std::move(frame), {}, {}},
+      [&](PendingGuestOutputFrame&, uint64_t) { return !gpu_guest_output_failed_; });
+  if (!token) {
+    REXLOG_WARN("D3D12Presenter: CPU guest output FIFO is full");
+    return 0;
+  }
+  REXLOG_INFO("D3D12Presenter: Queued CPU guest output frame token {}", token);
+  return token;
+}
+
+void D3D12Presenter::ClearCpuGuestOutputFrames() {
+  guest_output_frame_queue_.ClearIf(
+      [](PendingGuestOutputFrame& frame) {
+        return std::holds_alternative<CpuGuestOutputFrame>(frame.frame);
+      },
+      [] {});
+}
+
+std::shared_ptr<GpuGuestOutputStream> D3D12Presenter::CreateGpuGuestOutputStream() {
+  return std::shared_ptr<GpuGuestOutputStream>(new GpuGuestOutputStream(gpu_guest_output_owner_));
+}
+
+std::shared_ptr<GpuGuestOutputTicket> D3D12Presenter::QueueGpuGuestOutputFrame(
+    const std::shared_ptr<GpuGuestOutputStream>& stream, GpuGuestOutputFrame frame) {
+  auto* device = provider_.GetDevice();
+  if (!stream || stream->owner_.lock() != gpu_guest_output_owner_ || !frame.resource ||
+      !frame.ready_fence || !frame.ready_value || frame.ready_value == UINT64_MAX || !frame.width ||
+      !frame.height || frame.width > kMaxCpuGuestOutputDimension ||
+      frame.height > kMaxCpuGuestOutputDimension || FAILED(device->GetDeviceRemovedReason()) ||
+      !HasDevice(frame.resource.Get(), device) || !HasDevice(frame.ready_fence.Get(), device) ||
+      !HasDevice(provider_.GetDirectQueue(), device)) {
+    return nullptr;
+  }
+  const uint64_t ready = frame.ready_fence->GetCompletedValue();
+  const auto desc = frame.resource->GetDesc();
+  if (ready == UINT64_MAX || ready < frame.ready_value ||
+      desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Format != kGuestOutputFormat ||
+      desc.Width != frame.width || desc.Height != frame.height || desc.MipLevels != 1 ||
+      desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+      desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+    return nullptr;
+  }
+  UINT rows = 0;
+  UINT64 row_bytes = 0, footprint_bytes = 0;
+  device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, &rows, &row_bytes, &footprint_bytes);
+  if (rows != frame.height || row_bytes != uint64_t(frame.width) * 4 ||
+      footprint_bytes > kMaxCpuGuestOutputPayloadBytes) {
+    return nullptr;
+  }
+  auto ticket = std::shared_ptr<GpuGuestOutputTicket>(new GpuGuestOutputTicket);
+  const uint64_t token =
+      guest_output_frame_queue_.Push(PendingGuestOutputFrame{std::move(frame), stream, ticket},
+                                     [&](PendingGuestOutputFrame&, uint64_t token) {
+                                       if (gpu_guest_output_failed_ || !stream->accepting_) {
+                                         return false;
+                                       }
+                                       ticket->token_.store(token, std::memory_order_release);
+                                       return true;
+                                     });
+  return token ? ticket : nullptr;
+}
+
+void D3D12Presenter::CloseGpuGuestOutputStream(
+    const std::shared_ptr<GpuGuestOutputStream>& stream) {
+  if (!stream || stream->owner_.lock() != gpu_guest_output_owner_) {
+    return;
+  }
+  guest_output_frame_queue_.ClearIf(
+      [&](PendingGuestOutputFrame& frame) {
+        if (frame.stream == stream) {
+          frame.ticket->Cancel();
+          return true;
+        }
+        return false;
+      },
+      [&] { stream->accepting_ = false; });
+}
+
+void D3D12Presenter::ClearGuestOutputFrames(bool failed) {
+  guest_output_frame_queue_.ClearIf(
+      [](PendingGuestOutputFrame& frame) {
+        if (frame.ticket) {
+          frame.ticket->Cancel();
+        }
+        return true;
+      },
+      [&] { gpu_guest_output_failed_ |= failed; });
+}
+
+void D3D12Presenter::ReclaimGpuGuestOutputCopies() {
+  while (!gpu_guest_output_copies_.empty() &&
+         gpu_guest_output_copies_.front().pending.ticket->status() ==
+             GpuGuestOutputTicket::Status::kCompleted) {
+    gpu_guest_output_copies_.pop_front();
+  }
+}
+
+bool D3D12Presenter::AwaitGuestOutputTransferSlot(bool gpu_offer) {
+  ReclaimCpuGuestOutputUploads();
+  ReclaimGpuGuestOutputCopies();
+  while (cpu_guest_output_uploads_.size() + gpu_guest_output_copies_.size() >=
+         kMaxCpuGuestOutputFrames) {
+    if (!gpu_guest_output_copies_.empty()) {
+      if (!gpu_guest_output_copies_.front().pending.ticket->AwaitRetirement(5000)) {
+        return false;
+      }
+      ReclaimGpuGuestOutputCopies();
+    } else {
+      // A GPU offer must not enter the CPU tracker's unbounded fallback wait.
+      if (gpu_offer ||
+          !guest_output_resource_refresher_submission_tracker_.AwaitSubmissionCompletion(
+              cpu_guest_output_uploads_.front().submission)) {
+        return false;
+      }
+    }
+    ReclaimCpuGuestOutputUploads();
+  }
+  return true;
+}
+
+void D3D12Presenter::ReclaimCpuGuestOutputUploads() {
+  UINT64 completed_submission =
+      guest_output_resource_refresher_submission_tracker_.GetCompletedSubmission();
+  while (!cpu_guest_output_uploads_.empty() &&
+         completed_submission >= cpu_guest_output_uploads_.front().submission) {
+    cpu_guest_output_uploads_.pop_front();
+  }
+}
+
+bool D3D12Presenter::UploadCpuGuestOutputFrame(const CpuGuestOutputFrame& frame, uint64_t token,
+                                               ID3D12Resource* guest_output_resource) {
+  if (!AwaitGuestOutputTransferSlot()) {
+    REXLOG_ERROR("D3D12Presenter: Failed to await an output transfer slot");
+    return false;
+  }
+
+  if (!guest_output_resource) {
+    REXLOG_ERROR("D3D12Presenter: Cannot upload CPU guest output without a guest texture");
+    return false;
+  }
+  const D3D12_RESOURCE_DESC guest_output_resource_desc = guest_output_resource->GetDesc();
+  if (guest_output_resource_desc.Width != frame.width ||
+      guest_output_resource_desc.Height != frame.height ||
+      guest_output_resource_desc.Format != kGuestOutputFormat) {
+    REXLOG_ERROR("D3D12Presenter: CPU guest output frame {} does not match the guest texture",
+                 token);
+    return false;
+  }
+
+  ID3D12Device* device = provider_.GetDevice();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT copyable_rows = 0;
+  UINT64 copyable_row_size = 0;
+  UINT64 upload_size = 0;
+  device->GetCopyableFootprints(&guest_output_resource_desc, 0, 1, 0, &footprint, &copyable_rows,
+                                &copyable_row_size, &upload_size);
+  const UINT64 required_upload_size =
+      footprint.Offset + uint64_t(footprint.Footprint.RowPitch) * uint64_t(frame.height - 1) +
+      frame.row_pitch;
+  if (copyable_rows != frame.height || copyable_row_size < frame.row_pitch ||
+      footprint.Footprint.RowPitch < frame.row_pitch || upload_size < required_upload_size) {
+    REXLOG_ERROR(
+        "D3D12Presenter: Failed to determine the CPU guest output upload footprint "
+        "(rows={} expected_rows={} row_size={} expected_row_size={} footprint_row_pitch={} "
+        "upload_size={} required_size={})",
+        copyable_rows, frame.height, copyable_row_size, frame.row_pitch,
+        footprint.Footprint.RowPitch, upload_size, required_upload_size);
+    return false;
+  }
+
+  D3D12_RESOURCE_DESC upload_buffer_desc = {};
+  util::FillBufferResourceDesc(upload_buffer_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+  if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE,
+                                             &upload_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, IID_PPV_ARGS(&upload_buffer)))) {
+    REXLOG_ERROR("D3D12Presenter: Failed to create the CPU guest output upload buffer");
+    return false;
+  }
+
+  void* mapped_upload_buffer = nullptr;
+  D3D12_RANGE read_range = {0, 0};
+  if (FAILED(upload_buffer->Map(0, &read_range, &mapped_upload_buffer)) || !mapped_upload_buffer) {
+    REXLOG_ERROR("D3D12Presenter: Failed to map the CPU guest output upload buffer");
+    return false;
+  }
+  uint8_t* mapped_upload_bytes = static_cast<uint8_t*>(mapped_upload_buffer) + footprint.Offset;
+  for (uint32_t row = 0; row < frame.height; ++row) {
+    std::memcpy(mapped_upload_bytes + size_t(row) * footprint.Footprint.RowPitch,
+                frame.pixels.data() + size_t(row) * frame.row_pitch, frame.row_pitch);
+  }
+  upload_buffer->Unmap(0, nullptr);
+
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator> command_allocator;
+  if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                            IID_PPV_ARGS(&command_allocator)))) {
+    REXLOG_ERROR("D3D12Presenter: Failed to create the CPU guest output upload allocator");
+    return false;
+  }
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+  if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, command_allocator.Get(),
+                                       nullptr, IID_PPV_ARGS(&command_list)))) {
+    REXLOG_ERROR("D3D12Presenter: Failed to create the CPU guest output upload command list");
+    return false;
+  }
+
+  D3D12_RESOURCE_BARRIER resource_barrier_to_copy = {};
+  resource_barrier_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  resource_barrier_to_copy.Transition.pResource = guest_output_resource;
+  resource_barrier_to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  resource_barrier_to_copy.Transition.StateBefore = kGuestOutputInternalState;
+  resource_barrier_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  command_list->ResourceBarrier(1, &resource_barrier_to_copy);
+
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = upload_buffer.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source_location.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION destination_location = {};
+  destination_location.pResource = guest_output_resource;
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination_location.SubresourceIndex = 0;
+  command_list->CopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+
+  D3D12_RESOURCE_BARRIER resource_barrier_to_internal = {};
+  resource_barrier_to_internal.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  resource_barrier_to_internal.Transition.pResource = guest_output_resource;
+  resource_barrier_to_internal.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  resource_barrier_to_internal.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  resource_barrier_to_internal.Transition.StateAfter = kGuestOutputInternalState;
+  command_list->ResourceBarrier(1, &resource_barrier_to_internal);
+
+  if (FAILED(command_list->Close())) {
+    REXLOG_ERROR("D3D12Presenter: Failed to close the CPU guest output upload command list");
+    return false;
+  }
+  ID3D12CommandList* execute_command_list = command_list.Get();
+  provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+
+  CpuGuestOutputUpload upload;
+  upload.token = token;
+  upload.submission = guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
+  upload.upload_buffer = std::move(upload_buffer);
+  upload.command_allocator = std::move(command_allocator);
+  upload.command_list = std::move(command_list);
+  cpu_guest_output_uploads_.push_back(std::move(upload));
+  return true;
+}
+
+bool D3D12Presenter::CopyGpuGuestOutputFrame(PendingGuestOutputFrame pending,
+                                             ID3D12Resource* destination) {
+  const auto& frame = std::get<GpuGuestOutputFrame>(pending.frame);
+  Microsoft::WRL::ComPtr<IUnknown> source_identity, destination_identity;
+  if (!destination || FAILED(frame.resource.As(&source_identity)) ||
+      FAILED(destination->QueryInterface(IID_PPV_ARGS(&destination_identity))) ||
+      source_identity.Get() == destination_identity.Get() || !AwaitGuestOutputTransferSlot(true) ||
+      gpu_guest_output_copy_value_ >= UINT64_MAX - 1 ||
+      FAILED(provider_.GetDevice()->GetDeviceRemovedReason())) {
+    pending.ticket->Cancel();
+    return false;
+  }
+  GpuGuestOutputCopy copy;
+  copy.pending = std::move(pending);
+  copy.destination = destination;
+  auto* device = provider_.GetDevice();
+  if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                            IID_PPV_ARGS(&copy.allocator))) ||
+      FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copy.allocator.Get(),
+                                       nullptr, IID_PPV_ARGS(&copy.list)))) {
+    copy.pending.ticket->Cancel();
+    return false;
+  }
+  D3D12_RESOURCE_BARRIER barrier{};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition = {destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        kGuestOutputInternalState, D3D12_RESOURCE_STATE_COPY_DEST};
+  copy.list->ResourceBarrier(1, &barrier);
+  D3D12_TEXTURE_COPY_LOCATION source{}, target{};
+  source.pResource = std::get<GpuGuestOutputFrame>(copy.pending.frame).resource.Get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  target.pResource = destination;
+  target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy.list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  copy.list->ResourceBarrier(1, &barrier);
+  if (FAILED(copy.list->Close())) {
+    copy.pending.ticket->Cancel();
+    return false;
+  }
+  const auto& ready = std::get<GpuGuestOutputFrame>(copy.pending.frame);
+  if (FAILED(gpu_guest_output_copy_queue_->Wait(ready.ready_fence.Get(), ready.ready_value))) {
+    copy.pending.ticket->Cancel();
+    return false;
+  }
+  // Ownership is retained before Execute, including when the following Signal fails.
+  gpu_guest_output_copies_.push_back(std::move(copy));
+  auto& submitted = gpu_guest_output_copies_.back();
+  ID3D12CommandList* execute = submitted.list.Get();
+  gpu_guest_output_copy_queue_->ExecuteCommandLists(1, &execute);
+  const uint64_t value = ++gpu_guest_output_copy_value_;
+  return FinishGpuGuestOutputCopy(
+      value, gpu_guest_output_copy_queue_->Signal(gpu_guest_output_copy_fence_.Get(), value));
+}
+
+bool D3D12Presenter::FinishGpuGuestOutputCopy(uint64_t value, HRESULT signal_result) {
+  auto& submitted = gpu_guest_output_copies_.back();
+  if (FAILED(signal_result)) {
+    submitted.pending.ticket->Fail();
+    ClearGuestOutputFrames(true);
+    return false;
+  }
+  submitted.pending.ticket->Submit(provider_.GetDevice(), gpu_guest_output_copy_fence_.Get(),
+                                   value);
+  REXLOG_INFO("D3D12Presenter: Applied GPU guest output frame token {} copy fence {}",
+              submitted.pending.ticket->token(), value);
+  return true;
+}
+
+void D3D12Presenter::DrainGpuGuestOutputCopies() {
+  if (gpu_guest_output_copies_.empty()) {
+    return;
+  }
+  auto* device = provider_.GetDevice();
+  bool drained = FAILED(device->GetDeviceRemovedReason());
+  if (!drained && gpu_guest_output_copy_value_ < UINT64_MAX - 1) {
+    const uint64_t value = ++gpu_guest_output_copy_value_;
+    if (SUCCEEDED(
+            gpu_guest_output_copy_queue_->Signal(gpu_guest_output_copy_fence_.Get(), value))) {
+      auto ticket = std::shared_ptr<GpuGuestOutputTicket>(new GpuGuestOutputTicket);
+      ticket->Claim();
+      ticket->Submit(device, gpu_guest_output_copy_fence_.Get(), value);
+      drained = ticket->AwaitRetirement(5000);
+    }
+  }
+  if (!drained && SUCCEEDED(device->GetDeviceRemovedReason())) {
+    REXLOG_ERROR("D3D12Presenter: Retaining GPU output owners after unproved copy drain");
+    for (auto& copy : gpu_guest_output_copies_) {
+      auto& frame = std::get<GpuGuestOutputFrame>(copy.pending.frame);
+      (void)frame.resource.Detach();
+      (void)frame.ready_fence.Detach();
+      (void)copy.destination.Detach();
+      (void)copy.allocator.Detach();
+      (void)copy.list.Detach();
+    }
+    (void)gpu_guest_output_copy_fence_.Detach();
+    (void)gpu_guest_output_copy_queue_.Detach();
+  }
+  for (auto& copy : gpu_guest_output_copies_) {
+    if (copy.pending.ticket->status() != GpuGuestOutputTicket::Status::kCompleted) {
+      copy.pending.ticket->Fail();
+    }
+  }
+  gpu_guest_output_copies_.clear();
 }
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -491,6 +977,11 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
   assert_not_zero(frontbuffer_width);
   assert_not_zero(frontbuffer_height);
+  const uint64_t previous_cpu_guest_output_token = guest_output_mailbox_tokens_[mailbox_index];
+  guest_output_mailbox_tokens_[mailbox_index] = 0;
+  guest_output_mailbox_gpu_[mailbox_index] = false;
+  ReclaimCpuGuestOutputUploads();
+  ReclaimGpuGuestOutputCopies();
   std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>& guest_output_resource_ref =
       guest_output_resources_[mailbox_index];
   if (guest_output_resource_ref.second) {
@@ -525,6 +1016,7 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
             IID_PPV_ARGS(&guest_output_resource_ref.second)))) {
       REXLOG_ERROR("D3D12Presenter: Failed to create the guest output {}x{} texture",
                    frontbuffer_width, frontbuffer_height);
+      ClearGuestOutputFrames();
       return false;
     }
   }
@@ -534,10 +1026,67 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
   // some commands referencing the resource. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
   // than to destroy the resource while it's still in use.
+  if (!refresher_succeeded) {
+    guest_output_resource_ref.first =
+        guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
+    guest_output_resource_refresher_submission_tracker_.NextSubmission();
+    ClearGuestOutputFrames();
+    return false;
+  }
+
+  auto entry = guest_output_frame_queue_.Pop([](PendingGuestOutputFrame& frame) {
+    if (frame.ticket) {
+      frame.ticket->Claim();
+    }
+  });
+  uint64_t applied_token = 0;
+  bool applied_gpu = false;
+  if (entry) {
+    const bool compatible = std::visit(
+        [&](const auto& frame) {
+          return frame.width == frontbuffer_width && frame.height == frontbuffer_height;
+        },
+        entry->frame.frame);
+    if (!compatible) {
+      if (entry->frame.ticket) {
+        entry->frame.ticket->Cancel();
+      }
+      REXLOG_INFO("D3D12Presenter: Dropped guest output token {} for incompatible refresh extent",
+                  entry->token);
+      ClearGuestOutputFrames();
+    } else if (auto* cpu = std::get_if<CpuGuestOutputFrame>(&entry->frame.frame)) {
+      if (UploadCpuGuestOutputFrame(*cpu, entry->token, guest_output_resource_ref.second.Get())) {
+        applied_token = entry->token;
+        is_8bpc_out_ref = false;
+        REXLOG_INFO("D3D12Presenter: Applied CPU guest output frame token {}", applied_token);
+      } else {
+        REXLOG_ERROR("D3D12Presenter: Failed to apply CPU guest output token {}", entry->token);
+        ClearGuestOutputFrames();
+      }
+    } else if (CopyGpuGuestOutputFrame(std::move(entry->frame),
+                                       guest_output_resource_ref.second.Get())) {
+      applied_token = entry->token;
+      applied_gpu = true;
+      is_8bpc_out_ref = false;
+    } else if (gpu_guest_output_failed_) {
+      guest_output_resource_ref.first =
+          guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
+      guest_output_resource_refresher_submission_tracker_.NextSubmission();
+      return false;
+    }
+  }
+  guest_output_mailbox_tokens_[mailbox_index] = applied_token;
+  guest_output_mailbox_gpu_[mailbox_index] = applied_gpu;
+  if (!applied_token && previous_cpu_guest_output_token) {
+    REXLOG_INFO(
+        "D3D12Presenter: Guest output override token {} ended; original output was published",
+        previous_cpu_guest_output_token);
+  }
+
   guest_output_resource_ref.first =
       guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
   guest_output_resource_refresher_submission_tracker_.NextSubmission();
-  return refresher_succeeded;
+  return true;
 }
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {
@@ -588,12 +1137,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  uint64_t cpu_guest_output_token = 0;
+  bool gpu_guest_output = false;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+      cpu_guest_output_token = guest_output_mailbox_tokens_[guest_output_mailbox_index];
+      gpu_guest_output = guest_output_mailbox_gpu_[guest_output_mailbox_index];
     }
     // Incremented the reference count of the guest output resource - safe to
     // leave the consumer critical section now as everything here either will be
@@ -1162,6 +1715,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  if (cpu_guest_output_token != guest_output_last_successful_present_token_) {
+    guest_output_frame_stats_.Record(cpu_guest_output_token, present_result,
+                                     detail::GuestOutputFrameStats::Clock::now());
+  }
+  if (present_result == S_OK) {
+    if (cpu_guest_output_token &&
+        cpu_guest_output_token != guest_output_last_successful_present_token_) {
+      REXLOG_INFO(
+          "D3D12Presenter: {} guest output frame token {} reached a successful swapchain Present",
+          gpu_guest_output ? "GPU" : "CPU", cpu_guest_output_token);
+    } else if (!cpu_guest_output_token && guest_output_last_successful_present_token_) {
+      REXLOG_INFO(
+          "D3D12Presenter: Guest output override token {} ended; original "
+          "output reached a successful swapchain Present",
+          guest_output_last_successful_present_token_);
+    }
+    guest_output_last_successful_present_token_ = cpu_guest_output_token;
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
@@ -1170,6 +1741,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     default:
       return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
   }
+}
+
+FrameStats D3D12Presenter::GetGuestOutputFrameStats() const {
+  return guest_output_frame_stats_.Snapshot(detail::GuestOutputFrameStats::Clock::now());
 }
 
 bool D3D12Presenter::InitializeSurfaceIndependent() {
@@ -1504,6 +2079,12 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   if (!guest_output_resource_refresher_submission_tracker_.Initialize(device, direct_queue)) {
     return false;
   }
+
+  if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                 IID_PPV_ARGS(&gpu_guest_output_copy_fence_)))) {
+    return false;
+  }
+  gpu_guest_output_copy_queue_ = direct_queue;
 
   if (!ui_submission_tracker_.Initialize(device, direct_queue)) {
     return false;

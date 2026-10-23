@@ -17,15 +17,21 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <rex/image_info.h>
 #include <rex/runtime.h>
+#include <rex/system/mod_plugin.h>
+#include <rex/system/mod_catalog.h>
+#include <rex/system/profile.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/fps_counter_overlay.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
@@ -33,6 +39,10 @@
 namespace rex {
 
 class LogCaptureSink;
+
+namespace input {
+class InputSystem;
+}  // namespace input
 
 /// Content path configuration, passed to OnConfigurePaths().
 /// All paths start with sensible defaults derived from CLI args and cvars.
@@ -44,12 +54,17 @@ struct PathConfig {
   std::filesystem::path cache_root;
   std::filesystem::path metadata_root;
   std::filesystem::path config_path;
+  // Shared base root (B). user_data_root remains the active root (P).
+  std::filesystem::path base_user_data_root;
+  // Empty denotes the established default environment.
+  std::string profile_id;
 };
 
 namespace ui {
 class AchievementNotificationDialog;
 class ConsoleDialog;
 class SettingsDialog;
+struct SettingsLayout;
 }  // namespace ui
 
 /// Base class for recompiled Xbox 360 applications.
@@ -110,9 +125,31 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
+  /// Called on the UI thread after close is accepted, mod plugins shut down and
+  /// the title is terminated, immediately before the hard exit. Default does
+  /// nothing. Straggler guest threads may still poll input, so only drain and
+  /// release the title's own presentation resources here; do not call
+  /// ShutdownOverlays. For asynchronous draining, first veto
+  /// OnWindowCloseRequested and call window()->RequestClose() once ready.
+  /// Not called when a detached title closes without a Runtime; that path quits
+  /// the UI loop and ordinary teardown runs OnShutdown, ShutdownOverlays and
+  /// OnDestroy.
+  virtual void OnBeforeHardExit() {}
+
   /// Called after path defaults are computed, before Runtime is constructed.
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
+
+  /// Returns the default base user-data root when no cvar override is set.
+  virtual std::filesystem::path GetDefaultUserDataRoot() const;
+
+  /// Supplies the title-specific facts used by an explicitly requested copy
+  /// from the default environment. The SDK derives every generic allowlist
+  /// path from these facts. Return nullopt when the title does not support the
+  /// copy operation.
+  virtual std::optional<system::ProfileCopySpecification> GetProfileCopySpecification() const {
+    return std::nullopt;
+  }
 
   /// Called after SetupPresentation returns (window and ImGui drawer are live)
   /// and before Runtime construction. Override to resolve paths from user
@@ -145,6 +182,16 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
     (void)imgui_style;
     (void)ui_style;
   }
+
+  /// Called each time the settings overlay opens. Fill `layout` with tabs,
+  /// audience overrides and labels; leaving it empty keeps the category tree.
+  virtual void OnConfigureSettings(ui::SettingsLayout& layout) { (void)layout; }
+
+  /// Called after the config is loaded and logging is up, immediately before
+  /// the online startup settings freeze. Set session options such as
+  /// `live_invite` here, for example after waiting for a chat client's join
+  /// event; later changes take effect only after a restart.
+  virtual void OnPreSystemLinkInit() {}
 
   /// Called after logging is initialized. Add log sinks here.
   virtual void OnPostInitLogging() {}
@@ -253,21 +300,48 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   system::AchievementManager& achievements() const;
 
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
+  const std::filesystem::path& base_user_data_root() const { return base_user_data_root_; }
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
+  const std::string& active_profile_id() const { return active_profile_id_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
   const std::filesystem::path& cache_root() const { return cache_root_; }
   const std::filesystem::path& metadata_root() const { return metadata_root_; }
 
-  /// Set a callback that provides guest frame stats to the debug overlay.
+  /// Set a callback that provides guest frame stats to the debug overlay and
+  /// FPS counter. An empty provider restores the presenter's guest output
+  /// refresh rate.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
 
+  /// Release overlay binds, runtime input/drawer references, SDK dialogs and
+  /// both drawers. Safe to call again from OnDestroy, and re-armed by the next
+  /// overlay setup. Call on the UI thread after stopping input polling and
+  /// draining UI/GPU work, while the host device lives. Release title/mod-owned
+  /// dialogs before calling this. Not for OnBeforeHardExit, where guest threads
+  /// may still poll input.
+  void ShutdownOverlays();
+
+  /// Whether attached ImGui dialogs capture mouse or keyboard input. Used by
+  /// the runtime input drivers' active callback; does not guarantee controller
+  /// isolation or gate input paths that do not consult that callback.
+  bool IsOverlayInputCaptured() const;
+
  private:
+  friend struct ReXAppTestAccess;
+
   std::function<void(PathConfig)> MakeResumeCallback();
+  void ShutdownModPlugins();
+  void ShutdownOverlays(input::InputSystem* input_system);
 
   // Stand up the ImGui overlay stack (drawer, F3/Backtick/F4 binds, dialogs)
   // independently of how the presenter/drawer were obtained. `presenter` may be
   // null (detached mode).
   void SetupOverlays(ui::Presenter* presenter, ui::ImmediateDrawer* drawer);
+  // The title provider when set, otherwise the overlay presenter's rate.
+  ui::DebugOverlayDialog::FrameStatsProvider EffectiveFrameStatsProvider() const;
+  // Creates or destroys the FPS counter to match show_fps_counter.
+  void SyncFpsCounter();
+  // Runs fn on the UI thread unless ShutdownOverlays runs first.
+  void DeferWhileOverlaysAlive(std::function<void()> fn);
 
   // WindowedApp overrides
   bool OnInitialize() override;
@@ -290,7 +364,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   PathConfig resolved_defaults_;
   RuntimeConfig config_;
   std::filesystem::path game_data_root_;
+  std::filesystem::path base_user_data_root_;
   std::filesystem::path user_data_root_;
+  std::string active_profile_id_;
   std::filesystem::path update_data_root_;
   std::filesystem::path cache_root_;
   std::filesystem::path metadata_root_;
@@ -300,6 +376,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+  bool overlays_shutdown_ = false;
+  // Revoked by ShutdownOverlays so queued overlay work never runs afterwards.
+  std::shared_ptr<int> overlay_lifetime_;
 
   // Built-in overlays
   std::shared_ptr<LogCaptureSink> log_sink_;
@@ -307,10 +386,22 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> mod_manager_overlay_;
+  std::unique_ptr<ui::FpsCounterDialog> fps_counter_overlay_;
+  // Draws rex::ui::PostNotification toasts.
+  std::unique_ptr<ui::ImGuiDialog> notification_toast_;
+  // Borrowed from the graphics system; null in detached mode.
+  ui::Presenter* overlay_presenter_ = nullptr;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
+
+  // These values back the borrowed strings passed through ModHostContext.
+  std::vector<system::ModPackage> mod_infos_;
+  std::vector<std::string> mod_root_strings_;
+  std::vector<std::unique_ptr<system::IModPlugin>> mod_plugins_;
+  std::vector<std::string> mod_plugin_ids_;
 };
 
 }  // namespace rex

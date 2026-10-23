@@ -79,6 +79,10 @@ class IGraphicsSystem {
     (void)blocking;
   }
 
+  // Optional command-processor controls used while repairing guest GPU state.
+  virtual bool PauseAndResetGpuWritePointer() { return false; }
+  virtual void ResumeGpu() {}
+
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {

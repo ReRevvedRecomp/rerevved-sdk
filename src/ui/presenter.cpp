@@ -41,10 +41,11 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "Display",
+                      "Upscaling. Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .audience(rex::cvar::Audience::kPlayer);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -567,6 +568,7 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    guest_output_refresh_meter_.Record(FrameRateMeter::Clock::now());
   } else {
     // Request presenting a blank image if there was a true image previously,
     // but not now.
