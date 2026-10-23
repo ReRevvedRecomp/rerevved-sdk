@@ -13,6 +13,11 @@ set(REXKERNEL_SOURCES
     xam/xam_input.cpp
     xam/xam_locale.cpp
     xam/xam_msg.cpp
+    xam/host_session_data.cpp
+    xam/lan_system_link.cpp
+    xam/live_sessions.cpp
+    xam/relay_system_link.cpp
+    xam/system_link_config.cpp
     xam/xam_net.cpp
     xam/xam_notify.cpp
     xam/xam_nui.cpp
@@ -52,6 +57,7 @@ set(REXKERNEL_SOURCES
     xboxkrnl/xboxkrnl_threading.cpp
     # xboxkrnl/xboxkrnl_usbcam.cpp  # TODO: lol eventually.
     xboxkrnl/xboxkrnl_video.cpp
+    xboxkrnl/video_routing.cpp
     xboxkrnl/xboxkrnl_xconfig.cpp
     xboxkrnl/xboxkrnl_audio.cpp
     xboxkrnl/xboxkrnl_audio_xma.cpp
@@ -66,4 +72,4 @@ set(REXKERNEL_SOURCES
 list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
-target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput rexdiscord imgui)

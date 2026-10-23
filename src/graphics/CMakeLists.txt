@@ -5,19 +5,15 @@
 # target. The Xenos format layer is compiled into rexcore.
 
 set(REXGPU_XENOS_SOURCES
-    plugin_main.cpp
-
     # Core GPU types
     flags.cpp
-    register_file.cpp
-    registers.cpp
     pipeline/shader/shader.cpp
     format/ucode.cpp
     sampler_info.cpp
 
     # GPU system
     graphics_system.cpp
-    command_processor.cpp
+    diagnostic_util.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
@@ -75,6 +71,9 @@ if(REXGLUE_USE_D3D12)
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
+        d3d12/frame_input_draw_builder.cpp
+        d3d12/frame_input_sampler.cpp
+        d3d12/frame_capture.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
         d3d12/shader.cpp
@@ -96,7 +95,7 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
-add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
+add_library(rexgpu-xenos SHARED plugin_main.cpp ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 
 set_target_properties(rexgpu-xenos PROPERTIES
@@ -157,4 +156,5 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
     )
+
 endif()

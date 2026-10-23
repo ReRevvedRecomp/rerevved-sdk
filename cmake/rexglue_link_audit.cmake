@@ -1,10 +1,6 @@
-# Enforces the single-rexcore-copy invariant.
-#
-# rexcore is an OBJECT library whose globals (the cvar registry, the logging
-# singletons) must live in exactly one loaded module. rexruntime is that module.
-# A linkable target that links rexruntime and also links an OBJECT library
-# carrying rexcore objects ends up with two registries, which is what produced
-# the duplicate cvar registrations and the codegen SIGSEGV on exit.
+# Single rexcore OBJECT copy: globals live in rexruntime; another copy
+# duplicates registries and can reproduce duplicate cvar registrations and the
+# codegen exit crash.
 
 set(REXGLUE_CORE_OBJECT_LIBS rexcore rexfilesystem rexinput rexui rexaudio)
 

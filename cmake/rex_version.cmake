@@ -78,12 +78,9 @@ function(rex_compute_version out_var)
     endif()
 endfunction()
 
-#==========================================================
-# rex_version_channel(<out_var> VERSION <string>)
-#
-# release = exact v* tag, rc = release/* branch, dev = anything else.
-# Stable across commits, unlike the full version, so it is safe in cache keys.
-#==========================================================
+# rex_version_channel(<out_var> VERSION <string>) returns
+# release for exact v* tags, rc for release/* branches, else
+# dev; stable across commits for cache keys.
 function(rex_version_channel out_var)
     set(one_value VERSION)
     cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
@@ -169,4 +166,57 @@ function(rex_resolve_version out_var)
         GIT_DESCRIBE_EXACT "${describe_exact}"
         BRANCH_NAME "${branch_name}")
     set(${out_var} "${result}" PARENT_SCOPE)
+endfunction()
+
+# rex_resolve_git_provenance(<revision_var> <dirty_var>
+# [SOURCE_DIR <path>]): exact commit and tracked dirtiness;
+# SOURCE_DIR=CMAKE_SOURCE_DIR; ignored/untracked stay clean.
+function(rex_resolve_git_provenance revision_var dirty_var)
+    set(one_value SOURCE_DIR)
+    cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
+
+    if(NOT ARG_SOURCE_DIR)
+        set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+    endif()
+
+    find_program(GIT_EXECUTABLE git)
+    if(NOT GIT_EXECUTABLE)
+        message(FATAL_ERROR "rex_resolve_git_provenance: git was not found")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --verify HEAD
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE revision
+        ERROR_VARIABLE revision_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE revision_rc)
+    string(LENGTH "${revision}" revision_length)
+    if(NOT revision_rc EQUAL 0 OR
+       NOT revision_length EQUAL 40 OR
+       NOT revision MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "rex_resolve_git_provenance: could not resolve HEAD: ${revision_error}")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE tracked_status
+        ERROR_VARIABLE status_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE status_rc)
+    if(NOT status_rc EQUAL 0)
+        message(FATAL_ERROR
+            "rex_resolve_git_provenance: could not inspect tracked state: ${status_error}")
+    endif()
+
+    if(tracked_status STREQUAL "")
+        set(dirty_state "clean")
+    else()
+        set(dirty_state "dirty")
+    endif()
+
+    set(${revision_var} "${revision}" PARENT_SCOPE)
+    set(${dirty_var} "${dirty_state}" PARENT_SCOPE)
 endfunction()

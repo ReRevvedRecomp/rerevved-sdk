@@ -1,5 +1,6 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    profile.cpp
     embedded_metadata.cpp
     achievement_manager.cpp
     achievements.cpp
@@ -21,6 +22,13 @@ set(REXSYSTEM_SOURCES
     xobject.cpp
     xmodule.cpp
     guest_path.cpp
+    game_data_selector.cpp
+
+    # Shared CPU-side Xenos command decoding and register ownership. These
+    # sources belong to the runtime so CPU consumers need no GPU plugin.
+    ${REXGLUE_ROOT}/src/graphics/command_processor.cpp
+    ${REXGLUE_ROOT}/src/graphics/register_file.cpp
+    ${REXGLUE_ROOT}/src/graphics/registers.cpp
 
     # Utilities
     util/object_table.cpp
@@ -43,6 +51,14 @@ set(REXSYSTEM_SOURCES
     module.cpp
     function_dispatcher.cpp
     gpu_plugin_loader.cpp
+    mod_catalog.cpp
+    mod_script.cpp
+    mod_script_dispatch.cpp
+    asset_overlay.cpp
+    asset_overlay_catalog.cpp
+    asset_overlay_loadout.cpp
+    mod_loadout.cpp
+    mod_plugin_loader.cpp
     thread.cpp
     thread_state.cpp
     xex_module.cpp
@@ -84,10 +100,11 @@ target_link_libraries(rexruntime
         spdlog::spdlog
         tomlplusplus
         SDL3::SDL3
+        xxHash::xxhash
     PRIVATE
+        rex_lua
         aes128
         mspack
-        xxHash::xxhash
 )
 
 if(REXGLUE_ENABLE_TRACY)

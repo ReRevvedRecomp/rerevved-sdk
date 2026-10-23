@@ -10,6 +10,8 @@ set(REXUI_CORE_SOURCES
     immediate_drawer.cpp
     keybinds.cpp
     menu_item.cpp
+    monitors.cpp
+    notifications.cpp
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
@@ -26,9 +28,14 @@ set(REXUI_OVERLAY_SOURCES
     overlay/achievement_toast.cpp
     overlay/achievements_overlay.cpp
     overlay/debug_overlay.cpp
+    overlay/fps_counter_overlay.cpp
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
+    overlay/mod_manager_overlay.cpp
+    overlay/notification_toast.cpp
+    overlay/asset_overlay_manager.cpp
     overlay/settings_overlay.cpp
+    overlay/window_chrome.cpp
 )
 
 # Vulkan UI backend
@@ -173,4 +180,3 @@ endif()
 if(REXGLUE_USE_D3D12)
     target_link_libraries(rexui PUBLIC dxc-headers)
 endif()
-
