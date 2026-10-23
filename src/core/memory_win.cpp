@@ -185,6 +185,13 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   if (!h) {
     return kFileMappingHandleInvalid;
   }
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    // Windows opens the existing section instead of failing; sharing it would
+    // alias another mapping's memory, so report the collision to the caller.
+    CloseHandle(h);
+    SetLastError(ERROR_ALREADY_EXISTS);
+    return kFileMappingHandleInvalid;
+  }
   return reinterpret_cast<FileMappingHandle>(h);
 }
 

@@ -102,12 +102,14 @@
 #pragma once
 
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -125,6 +127,15 @@ void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();
 void SaveConfig(const std::filesystem::path& config_path);
+// Updates existing saved keys even at their effective defaults, and adds
+// missing keys only for non-default values. Flags whose current value came from
+// the command line or environment are skipped, leaving their saved line as is.
+// Returns false on write failure.
+bool TrySaveConfig(const std::filesystem::path& config_path);
+
+// Patch named flags while preserving every other config line verbatim.
+void SaveConfigSubset(const std::filesystem::path& config_path,
+                      const std::vector<std::string>& names);
 
 //=============================================================================
 // Flag Registry
@@ -139,14 +150,33 @@ enum class Lifecycle {
   kRequiresRestart  // Can be changed, but only takes effect after restart
 };
 
-// Where a flag's current value came from, in ascending priority. A source
-// never overwrites a value a higher-priority source already set.
+// Where a flag's current value came from. Numeric values are kept stable for
+// existing callers; runtime priority is assigned explicitly in cvar.cpp.
 enum class Source {
   kDefault,      // Compiled-in default
   kConfig,       // TOML config file
   kEnvironment,  // REX_* environment variable
   kCommandLine,  // --flag on the command line
-  kRuntime       // SetFlagByName from the console, settings UI, or code
+  kRuntime,      // SetFlagByName from the console, settings UI, or code
+  // Follows kRuntime to preserve the numeric values used by native callers.
+  // Its runtime priority is immediately above kDefault.
+  kApplicationDefault
+};
+
+// Which host surface should present a flag. The uint8_t representation is
+// intentional: these fields occupy padding in the legacy FlagEntry layout.
+enum class Audience : uint8_t {
+  kPlayer,
+  kAdvanced,
+  kDeveloper,
+  kHidden,
+};
+
+// Whether a flag participates in the generic config file surface.
+enum class Persistence : uint8_t {
+  kConfig,
+  kSessionOnly,
+  kNeverPersist,
 };
 
 // Validation constraints
@@ -170,10 +200,65 @@ struct FlagEntry {
   std::function<void(std::string_view args)> command_callback;
   Lifecycle lifecycle = Lifecycle::kHotReload;
   Constraints constraints;
+  // Effective default: the application default when set, otherwise compiled.
   std::string default_value;
   bool is_debug_only = false;
+  Audience audience = Audience::kAdvanced;
+  Persistence persistence = Persistence::kConfig;
   Source source = Source::kDefault;
 };
+
+// Keep this mirror in the public header so every consumer compilation checks
+// the ABI, including consumers that only include cvar.h. The two policy bytes
+// must fit in the padding between is_debug_only and source.
+namespace abi_detail {
+struct LegacyFlagEntry {
+  std::string name;
+  FlagType type;
+  std::string category;
+  std::string description;
+  std::function<bool(std::string_view)> setter;
+  std::function<std::string()> getter;
+  std::function<void(std::string_view args)> command_callback;
+  Lifecycle lifecycle;
+  Constraints constraints;
+  std::string default_value;
+  bool is_debug_only;
+  Source source;
+};
+}  // namespace abi_detail
+
+static_assert(std::is_same_v<std::underlying_type_t<Audience>, uint8_t>);
+static_assert(std::is_same_v<std::underlying_type_t<Persistence>, uint8_t>);
+static_assert(static_cast<int>(Source::kDefault) == 0);
+static_assert(static_cast<int>(Source::kConfig) == 1);
+static_assert(static_cast<int>(Source::kEnvironment) == 2);
+static_assert(static_cast<int>(Source::kCommandLine) == 3);
+static_assert(static_cast<int>(Source::kRuntime) == 4);
+static_assert(static_cast<int>(Source::kApplicationDefault) == 5);
+static_assert(sizeof(Audience) == sizeof(uint8_t));
+static_assert(sizeof(Persistence) == sizeof(uint8_t));
+static_assert(alignof(FlagEntry) == alignof(abi_detail::LegacyFlagEntry));
+static_assert(sizeof(FlagEntry) == sizeof(abi_detail::LegacyFlagEntry));
+#define REXCVAR_ASSERT_LEGACY_OFFSET(field) \
+  static_assert(offsetof(FlagEntry, field) == offsetof(abi_detail::LegacyFlagEntry, field))
+REXCVAR_ASSERT_LEGACY_OFFSET(name);
+REXCVAR_ASSERT_LEGACY_OFFSET(type);
+REXCVAR_ASSERT_LEGACY_OFFSET(category);
+REXCVAR_ASSERT_LEGACY_OFFSET(description);
+REXCVAR_ASSERT_LEGACY_OFFSET(setter);
+REXCVAR_ASSERT_LEGACY_OFFSET(getter);
+REXCVAR_ASSERT_LEGACY_OFFSET(command_callback);
+REXCVAR_ASSERT_LEGACY_OFFSET(lifecycle);
+REXCVAR_ASSERT_LEGACY_OFFSET(constraints);
+REXCVAR_ASSERT_LEGACY_OFFSET(default_value);
+REXCVAR_ASSERT_LEGACY_OFFSET(is_debug_only);
+REXCVAR_ASSERT_LEGACY_OFFSET(source);
+#undef REXCVAR_ASSERT_LEGACY_OFFSET
+static_assert(offsetof(FlagEntry, audience) == offsetof(FlagEntry, is_debug_only) + sizeof(bool));
+static_assert(offsetof(FlagEntry, persistence) == offsetof(FlagEntry, audience) + sizeof(Audience));
+static_assert(offsetof(FlagEntry, persistence) + sizeof(Persistence) <=
+              offsetof(FlagEntry, source));
 
 std::vector<FlagEntry>& GetRegistry();
 
@@ -182,6 +267,21 @@ std::vector<FlagEntry>& GetRegistry();
  * registered (logged at ERROR).
  */
 std::optional<size_t> RegisterFlag(FlagEntry entry);
+
+// Registers a flag with explicit policy metadata. The metadata is installed
+// before any deferred startup values are replayed.
+std::optional<size_t> RegisterFlag(FlagEntry entry, Audience audience, Persistence persistence);
+
+// Applies a title/application-provided default between the compiled default
+// and config sources. It does not outrank config, environment, CLI, or
+// runtime values. On success, FlagEntry::default_value becomes the normalized
+// application default used by resets, modified-value queries and config saving.
+// TrySaveConfig writes a missing key only when it differs from this default
+// and updates existing keys even when equal, as with compiled defaults;
+// SaveConfigSubset writes its named keys regardless.
+// Call it before config, environment and CLI values apply; a flag already set
+// by one of them keeps its compiled default as the baseline.
+bool SetFlagAsApplicationDefault(std::string_view name, std::string_view value);
 
 /**
  * Removes a flag from the registry. Used by `FlagRegistrar`'s destructor so
@@ -234,6 +334,7 @@ std::vector<std::string> ListFlagsByLifecycle(Lifecycle lc);
 const FlagEntry* GetFlagInfo(std::string_view name);
 std::vector<std::string> GetPendingRestartFlags();
 void ClearPendingRestartFlags();
+// Resets and modified-value queries use FlagEntry::default_value.
 void ResetToDefault(std::string_view name);
 void ResetAllToDefaults();
 bool HasNonDefaultValue(std::string_view name);
@@ -262,7 +363,16 @@ struct FlagRegistrar {
 
   explicit FlagRegistrar(FlagEntry e) {
     std::string name = e.name;
-    if (RegisterFlag(std::move(e)).has_value()) {
+    const Audience audience = e.audience;
+    const Persistence persistence = e.persistence;
+    if (RegisterFlag(std::move(e), audience, persistence).has_value()) {
+      owned_name_ = std::move(name);
+    }
+  }
+
+  FlagRegistrar(FlagEntry e, Audience audience, Persistence persistence) {
+    std::string name = e.name;
+    if (RegisterFlag(std::move(e), audience, persistence).has_value()) {
       owned_name_ = std::move(name);
     }
   }
@@ -306,6 +416,19 @@ struct FlagRegistrar {
     apply_([fn = std::move(fn)](FlagEntry& entry) mutable {
       entry.constraints.custom_validator = std::move(fn);
     });
+    return std::move(*this);
+  }
+
+  FlagRegistrar&& audience(Audience a) && {
+    apply_([=](FlagEntry& entry) { entry.audience = a; });
+    return std::move(*this);
+  }
+
+  // Static definitions chain this before config loading. A flag registered
+  // after initialization has already replayed config, so a late flag that
+  // must ignore config passes its persistence to the constructor instead.
+  FlagRegistrar&& persistence(Persistence p) && {
+    apply_([=](FlagEntry& entry) { entry.persistence = p; });
     return std::move(*this);
   }
 

@@ -249,11 +249,9 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 }
 
 #if defined(__APPLE__)
-// macOS does not implement unnamed POSIX semaphores (sem_init fails with
-// ENOSYS). Emulate one with a named semaphore that is unlinked immediately
-// after creation: the name is released but the descriptor stays valid until
-// sem_close, and sem_wait/sem_post remain async-signal-safe (needed because
-// WaitSuspended() runs from a signal handler).
+// macOS sem_init returns ENOSYS, so emulate unnamed semaphores with named ones
+// unlinked after creation; the descriptor lasts to sem_close, and
+// sem_wait/sem_post stay async-signal-safe for WaitSuspended().
 static sem_t* RexCreateAnonymousSemaphore() {
   static std::atomic<uint64_t> counter{0};
   char name[64];
@@ -1420,11 +1418,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
-    // Arm the suspend counter in the SAME critical section that publishes the
-    // started state. Resume() only waits for state_ != kUninitialized, so if it
-    // observed the state published here while suspend_count_ was still 0 it
-    // would take the "not suspended" path, return false without decrementing,
-    // and the wait below would then never be satisfied.
+    // Publish suspend_count_ and started state under one critical section.
+    // Resume() waits for state_ != kUninitialized; publishing state first can
+    // skip its decrement and leave the wait unsatisfied.
     if (create_suspended) {
       thread->handle_.suspend_count_ = 1;
     }

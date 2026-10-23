@@ -131,6 +131,38 @@ struct ArgTranslator {
         *rex::memory::GuestPtr<uint32_t*>(base, ctx.r1.u32 + 0x54 + ((arg - 8) * 8)));
   }
 
+  // Get a 64-bit integer argument: the whole register or 8-byte stack slot.
+  // Narrower arguments keep the low word because the guest may leave
+  // sign-extension bits in the upper half (for example after lis).
+  static constexpr uint64_t GetInteger64ArgumentValue(const PPCContext& ctx, uint8_t* base,
+                                                      size_t arg) noexcept {
+    if (arg <= 7) {
+      switch (arg) {
+        case 0:
+          return ctx.r3.u64;
+        case 1:
+          return ctx.r4.u64;
+        case 2:
+          return ctx.r5.u64;
+        case 3:
+          return ctx.r6.u64;
+        case 4:
+          return ctx.r7.u64;
+        case 5:
+          return ctx.r8.u64;
+        case 6:
+          return ctx.r9.u64;
+        case 7:
+          return ctx.r10.u64;
+        default:
+          break;
+      }
+    }
+    // The slot starts 4 bytes before the low word read above.
+    return __builtin_bswap64(
+        *rex::memory::GuestPtr<uint64_t*>(base, ctx.r1.u32 + 0x50 + ((arg - 8) * 8)));
+  }
+
   // Get float/double argument value from FPR
   static double GetPrecisionArgumentValue(const PPCContext& ctx, [[maybe_unused]] uint8_t* base,
                                           size_t arg) noexcept {
@@ -205,6 +237,17 @@ struct ArgTranslator {
         __builtin_bswap32(static_cast<uint32_t>(value));
   }
 
+  // Set a 64-bit integer argument (mirrors GetInteger64ArgumentValue layout)
+  static constexpr void SetInteger64ArgumentValue(PPCContext& ctx, uint8_t* base, size_t arg,
+                                                  uint64_t value) noexcept {
+    if (arg <= 7) {
+      SetIntegerArgumentValue(ctx, base, arg, value);
+      return;
+    }
+    *rex::memory::GuestPtr<uint64_t*>(base, ctx.r1.u32 + 0x50 + ((arg - 8) * 8)) =
+        __builtin_bswap64(value);
+  }
+
   // Set float/double argument value
   static void SetPrecisionArgumentValue(PPCContext& ctx, [[maybe_unused]] uint8_t* base, size_t arg,
                                         double value) noexcept {
@@ -257,7 +300,11 @@ struct ArgTranslator {
   template <BigEndianType T>
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
     T result;
-    result.value = static_cast<decltype(result.value)>(GetIntegerArgumentValue(ctx, base, idx));
+    if constexpr (sizeof(result.value) == 8) {
+      result.value = static_cast<decltype(result.value)>(GetInteger64ArgumentValue(ctx, base, idx));
+    } else {
+      result.value = static_cast<decltype(result.value)>(GetIntegerArgumentValue(ctx, base, idx));
+    }
     return result;
   }
 
@@ -279,6 +326,8 @@ struct ArgTranslator {
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
     if constexpr (is_precise_v<T>) {
       return static_cast<T>(GetPrecisionArgumentValue(ctx, base, idx));
+    } else if constexpr (sizeof(T) == 8) {
+      return static_cast<T>(GetInteger64ArgumentValue(ctx, base, idx));
     } else {
       return static_cast<T>(GetIntegerArgumentValue(ctx, base, idx));
     }
@@ -307,6 +356,8 @@ struct ArgTranslator {
       SetIntegerArgumentValue(ctx, base, idx,
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(value) -
                                                     reinterpret_cast<uintptr_t>(base)));
+    } else if constexpr (sizeof(T) == 8) {
+      SetInteger64ArgumentValue(ctx, base, idx, static_cast<uint64_t>(value));
     } else {
       SetIntegerArgumentValue(ctx, base, idx, value);
     }

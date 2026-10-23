@@ -38,10 +38,9 @@ uint64_t Clock::host_tick_frequency_platform() {
 
 uint64_t Clock::host_tick_count_platform() {
 #ifdef __APPLE__
-  // mach_absolute_time() returns raw hardware ticks; host_tick_frequency_platform()
-  // expresses the rate of these same ticks via mach_timebase_info.
-  // clock_gettime(CLOCK_MONOTONIC_RAW) returns nanoseconds, which would be
-  // inconsistent with the 24 MHz mach frequency and cause ~41x time acceleration.
+  // mach_absolute_time() returns hardware ticks; host_tick_frequency_platform()
+  // gets their rate via mach_timebase_info. Nanoseconds with the 24 MHz
+  // frequency would accelerate time about 41x.
   return mach_absolute_time();
 #else
   timespec tp;

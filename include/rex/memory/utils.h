@@ -145,6 +145,9 @@ void AlignedFree(T* ptr) {
 using FileMappingHandle = intptr_t;
 constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
 
+// Creates a new named mapping. Fails with kFileMappingHandleInvalid if `path` already names a
+// mapping (ERROR_ALREADY_EXISTS or EEXIST is left in the platform error), so two mappings never
+// share memory by name. Android ashmem names are labels only and never collide.
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit);
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path);

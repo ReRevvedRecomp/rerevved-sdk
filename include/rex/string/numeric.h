@@ -120,10 +120,9 @@ inline std::from_chars_result portable_float_from_chars(const char* first, const
                                                         T& value) {
   static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>);
 
-  // AppleClang's libc++ does not provide floating-point std::from_chars on all
-  // supported SDK versions. Match from_chars semantics with a C-locale parser:
-  // no leading whitespace or '+', no global locale dependency, and distinct
-  // invalid-input and range errors.
+  // Some AppleClang SDKs lack floating-point from_chars. A C-locale parser
+  // rejects leading whitespace/+ without global locale dependence and
+  // distinguishes invalid-input from range errors.
   if (first == last || *first == '+' || *first == ' ' || *first == '\f' || *first == '\n' ||
       *first == '\r' || *first == '\t' || *first == '\v') {
     return {first, std::errc::invalid_argument};

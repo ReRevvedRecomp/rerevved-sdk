@@ -217,11 +217,9 @@ class PosixFileHandle : public FileHandle {
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
                                                      uint32_t desired_access,
                                                      bool /*allow_share_delete*/) {
-  // POSIX allows unlinking/replacing an open file, so there is no share-delete
-  // analog to thread through here.
-  // O_RDONLY/O_WRONLY/O_RDWR are an enumeration in the O_ACCMODE bits, not
-  // independent flags. kGenericExecute grants neither right, matching
-  // GENERIC_EXECUTE on the Windows path.
+  // POSIX permits unlink/replacement of open files. O_RDONLY/O_WRONLY/O_RDWR
+  // enumerate O_ACCMODE, not independent flags; kGenericExecute grants neither
+  // right, matching GENERIC_EXECUTE.
   constexpr uint32_t kReadRights =
       FileAccess::kGenericRead | FileAccess::kGenericAll | FileAccess::kFileReadData;
   constexpr uint32_t kWriteRights = FileAccess::kGenericWrite | FileAccess::kGenericAll |

@@ -27,6 +27,8 @@
 #include <rex/platform.h>
 #include <rex/platform/env.h>
 
+#include "crash_report.h"
+
 #if REX_PLATFORM_WIN32
 #include <spdlog/sinks/msvc_sink.h>
 #else
@@ -63,6 +65,7 @@ namespace {
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
+std::filesystem::path g_file_path;
 spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
@@ -217,21 +220,27 @@ void InitLogging(const LogConfig& config) {
   }
 
   // File sink (rotating) with sequential naming fallback
-  std::string resolved_path;
+  std::filesystem::path resolved_path;
   if (config.log_file) {
     resolved_path = config.log_file;
   } else if (!config.app_name.empty()) {
     auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
                                           : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+    resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+        resolved_path.string(),
+        static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
+    std::error_code ec;
+    g_file_path = std::filesystem::absolute(resolved_path, ec);
+    if (ec) {
+      g_file_path = resolved_path;
+    }
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -255,6 +264,12 @@ void InitLogging(const LogConfig& config) {
     }
   }
   g_initialized = true;
+  std::vector<spdlog::sink_ptr> crash_sinks;
+  for (const auto& sink : {g_file_sink, g_console_sink}) {
+    if (sink)
+      crash_sinks.push_back(sink);
+  }
+  detail::InstallCrashReport(g_file_path, std::move(crash_sinks));
 
   // Periodic flush
   int flush_interval = REXCVAR_GET(log_flush_interval);
@@ -278,10 +293,12 @@ void ShutdownLogging() {
     if (entry.logger)
       entry.logger->flush();
 
+  detail::ClearCrashReportTargets();
   spdlog::shutdown();
   g_registry.clear();
   g_console_sink.reset();
   g_file_sink.reset();
+  g_file_path.clear();
   g_early_sink.reset();
   g_extra_sinks.clear();
   g_initialized = false;
@@ -293,6 +310,11 @@ void FlushLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+}
+
+std::filesystem::path GetLogFilePath() {
+  std::lock_guard lock(g_mutex);
+  return g_file_path;
 }
 
 LogCategoryId RegisterLogCategory(const char* name) {
