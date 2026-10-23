@@ -7,13 +7,12 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   build:
     uses: ./.github/workflows/_build-platform.yaml
     with:
       platform: linux-arm64
-      ref: ${{ github.ref }}
+      ref: ${{ github.sha }}
       publish_mode: release
     secrets: inherit
