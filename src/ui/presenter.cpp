@@ -551,8 +551,18 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  return RefreshGuestOutput(frontbuffer_width, frontbuffer_height, display_aspect_ratio_x,
+                            display_aspect_ratio_y, 0, 0, std::move(refresher));
+}
+
+bool Presenter::RefreshGuestOutput(
+    uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+    uint32_t display_aspect_ratio_y, uint32_t source_width, uint32_t source_height,
+    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
+  writable_properties.source_width = source_width;
+  writable_properties.source_height = source_height;
   writable_properties.frontbuffer_width = frontbuffer_width;
   writable_properties.frontbuffer_height = frontbuffer_height;
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
@@ -1019,6 +1029,15 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   if (!output_width || !output_height || output_right <= 0 || output_bottom <= 0 ||
       flow.output_x >= int32_t(host_rt_width) || flow.output_y >= int32_t(host_rt_height)) {
     return flow;
+  }
+
+  if (properties.source_width && properties.source_height) {
+    static std::atomic<bool> logged_display_output = false;
+    if (!logged_display_output.exchange(true)) {
+      REXLOG_INFO("Display: swap_source={}x{} output={},{},{},{}", properties.source_width,
+                  properties.source_height, flow.output_x, flow.output_y, output_width,
+                  output_height);
+    }
   }
 
   // The output image may have a part of it outside the final render target (if

@@ -15,11 +15,13 @@ add_executable(unit_tests
     graphics/frame_input_native_sources_test.cpp
     graphics/shared_memory_test.cpp
     graphics/texture_memory_version_test.cpp
+    graphics/draw_resolution_scale_test.cpp
     test_memory.cpp
     memory/heap_allocation_test.cpp
     memory/physical_write_watch_test.cpp
     kernel/object_table_test.cpp
     kernel/video_delegate_test.cpp
+    kernel/video_mode_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp

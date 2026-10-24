@@ -348,5 +348,6 @@ reports worker construction or creation failure, and `Shutdown()` tolerates
 partial startup. The common CPU command processor, register file and register
 definitions are runtime-owned and accept borrowed CPU owners plus an explicit
 legacy interrupt bridge; GPU plugin providers, MMIO, vblank and exports remain
-plugin-owned. GPU plugin ABI 4 is unchanged: `GpuCreateInfo`, `IGraphicsSystem`
-and its callback view layouts retain their documented structures.
+plugin-owned. The GPU plugin ABI covers `GpuCreateInfo`, `IGraphicsSystem`
+and its callback view layouts; see
+[`gpu_plugin.h`](../include/rex/system/gpu_plugin.h).

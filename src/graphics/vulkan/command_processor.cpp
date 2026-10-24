@@ -916,15 +916,30 @@ bool VulkanCommandProcessor::SetupContext() {
           device_properties.maxStorageBufferRange);
   uint32_t shared_memory_binding_count = UINT32_C(1) << shared_memory_binding_count_log2;
 
+  system::X_VIDEO_MODE guest_video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&guest_video_mode);
+  DisplayGeometry display_geometry;
+  display_geometry.guest_width = guest_video_mode.display_width;
+  display_geometry.guest_height = guest_video_mode.display_height;
+  display_geometry.surface_width = graphics_system_->display_surface_width();
+  display_geometry.surface_height = graphics_system_->display_surface_height();
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  DrawResolutionScaleRequest draw_resolution_scale_request;
   bool draw_resolution_scale_not_clamped =
-      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y);
+      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y,
+                                                 display_geometry, &draw_resolution_scale_request);
+  if (!VulkanTextureCache::ClampDrawResolutionScaleToMaxSupported(
+          draw_resolution_scale_x, draw_resolution_scale_y, GetVulkanDevice())) {
+    draw_resolution_scale_not_clamped = false;
+  }
   if (!draw_resolution_scale_not_clamped) {
     REXGPU_WARN(
-        "The requested draw resolution scale is not supported by the "
-        "emulator, reducing to {}x{}",
+        "The requested draw resolution scale is not supported by the device or "
+        "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  TextureCache::LogDisplayScale(display_geometry, draw_resolution_scale_request,
+                                draw_resolution_scale_x, draw_resolution_scale_y);
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     REXGPU_WARN(
         "Vulkan draw resolution scaling is experimental and may not affect all "
@@ -2417,6 +2432,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
+      frontbuffer_width_scaled, frontbuffer_height_scaled,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {

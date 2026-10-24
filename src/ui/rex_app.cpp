@@ -552,6 +552,14 @@ bool ReXApp::SetupPresentation() {
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();
+  // Report the surface size before the Runtime creates size-dependent GPU caches.
+  if (graphics_system) {
+    uint32_t surface_width = 0;
+    uint32_t surface_height = 0;
+    if (window_->GetPresentationPixelSize(surface_width, surface_height)) {
+      graphics_system->SetDisplaySurfaceSize(surface_width, surface_height);
+    }
+  }
   if (graphics_system && graphics_system->presenter()) {
     // SDK mode: the emulated-Xenos presenter drives the overlays.
     auto* presenter = graphics_system->presenter();

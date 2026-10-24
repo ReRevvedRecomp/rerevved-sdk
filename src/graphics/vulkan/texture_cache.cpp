@@ -2069,6 +2069,89 @@ VulkanTextureCache::VulkanTextureCache(const RegisterFile& register_file,
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
+bool VulkanTextureCache::ClampDrawResolutionScaleToMaxSupported(
+    uint32_t& scale_x, uint32_t& scale_y, const ui::vulkan::VulkanDevice* vulkan_device) {
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkPhysicalDeviceMemoryProperties memory_properties;
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties(
+      vulkan_device->physical_device(), &memory_properties);
+
+  // A single allocation is also capped by maxMemoryAllocationSize where it can be queried
+  // (Vulkan 1.1); otherwise only the heap check below applies.
+  VkDeviceSize max_allocation_size = UINT64_MAX;
+  if (vulkan_device->properties().apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+      vulkan_device->vulkan_instance()->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+    VkPhysicalDeviceMaintenance3Properties maintenance3_properties = {};
+    maintenance3_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties2 = {};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties2.pNext = &maintenance3_properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties2(
+        vulkan_device->physical_device(), &properties2);
+    if (maintenance3_properties.maxMemoryAllocationSize) {
+      max_allocation_size = maintenance3_properties.maxMemoryAllocationSize;
+    }
+  }
+
+  // As in InitializeScaledResolveBuffer, a sparse buffer needs no backing up front.
+  // Otherwise, limit the dedicated device-local allocation to half its heap
+  // to leave space for other resources.
+  auto is_supported = [&](VkDeviceSize size) {
+    VkBufferCreateInfo buffer_create_info;
+    buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_create_info.pNext = nullptr;
+    buffer_create_info.size = size;
+    buffer_create_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    buffer_create_info.queueFamilyIndexCount = 0;
+    buffer_create_info.pQueueFamilyIndices = nullptr;
+    for (bool sparse : {true, false}) {
+      if (sparse && !vulkan_device->properties().sparseResidencyBuffer) {
+        continue;
+      }
+      buffer_create_info.flags =
+          sparse ? VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT : 0;
+      VkBuffer buffer;
+      if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer) != VK_SUCCESS) {
+        continue;
+      }
+      VkMemoryRequirements memory_requirements;
+      dfn.vkGetBufferMemoryRequirements(device, buffer, &memory_requirements);
+      dfn.vkDestroyBuffer(device, buffer, nullptr);
+      uint32_t memory_type;
+      if (!rex::bit_scan_forward(
+              memory_requirements.memoryTypeBits & vulkan_device->memory_types().device_local,
+              &memory_type)) {
+        continue;
+      }
+      if (sparse ||
+          (memory_requirements.size <= max_allocation_size &&
+           memory_requirements.size <=
+               memory_properties.memoryHeaps[memory_properties.memoryTypes[memory_type].heapIndex]
+                       .size /
+                   2)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  bool was_clamped = false;
+  while (scale_x > 1 || scale_y > 1) {
+    if (is_supported(uint64_t(SharedMemory::kBufferSize) * scale_x * scale_y)) {
+      break;
+    }
+    was_clamped = true;
+    if (scale_x >= scale_y) {
+      --scale_x;
+    } else {
+      --scale_y;
+    }
+  }
+  return !was_clamped;
+}
+
 bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   assert_true(IsDrawResolutionScaled());
 

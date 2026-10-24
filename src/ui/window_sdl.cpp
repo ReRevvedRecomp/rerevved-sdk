@@ -49,7 +49,7 @@ namespace {
 
 // window_size ranks below an explicit window_width/window_height and above
 // the resolution preset. Only the startup window reads it; the guest video
-// mode derives from window_width and resolution alone.
+// mode never follows the window.
 WindowSize ConfiguredWindowSize() {
   return EffectiveWindowSize(REXCVAR_GET(window_size), REXCVAR_GET(window_width),
                              REXCVAR_GET(window_height));
@@ -261,6 +261,21 @@ void WindowSDL::ClampWindowToDisplay(int requested_width, int requested_height) 
   SDL_SetWindowSize(sdl_window_, int(fitted.width), int(fitted.height));
   SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
                         SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+}
+
+bool WindowSDL::GetPresentationPixelSize(uint32_t& width_out, uint32_t& height_out) const {
+  if (sdl_window_ && IsFullscreen()) {
+    // The window size can lag behind a fullscreen request. Use the display's
+    // desktop mode for borderless fullscreen.
+    const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(sdl_window_));
+    if (mode && mode->w > 0 && mode->h > 0) {
+      const float density = mode->pixel_density > 0.0f ? mode->pixel_density : 1.0f;
+      width_out = uint32_t(std::lround(float(mode->w) * density));
+      height_out = uint32_t(std::lround(float(mode->h) * density));
+      return true;
+    }
+  }
+  return Window::GetPresentationPixelSize(width_out, height_out);
 }
 
 void WindowSDL::RequestCloseImpl() {

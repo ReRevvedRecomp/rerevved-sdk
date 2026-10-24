@@ -49,9 +49,24 @@ applying. `audio_play_in_background` (default true) silences output like
 that state through `rex::audio::SetOutputFocused(bool)` and
 `rex::audio::IsOutputFocused()` (`rex/audio/output_state.h`), and a title with
 its own window may call them. `window_size` (`UI/Window`, requires restart) sets
-the startup window to a listed `WxH` or `maximized`; explicit
-`window_width`/`window_height` outrank it, it outranks `resolution`, and it
-never changes the guest video mode.
+the startup window to a listed `WxH` or `maximized`; any other size comes from
+`window_width`/`window_height` (logical pixels, up to 8192), which outrank it.
+`window_size` outranks `resolution`, and the host window size never changes the
+guest video mode: only `video_mode_width`/`video_mode_height` and the
+`resolution` preset do.
+`resolution_scale` 0 (`Display`, requires restart) is Auto: it selects the
+smallest whole-number draw scale that covers the height of the guest-aspect
+image fitted inside the presented surface, then clamps it to 1 through 7.
+A non-default `draw_resolution_scale_x`/`draw_resolution_scale_y` overrides
+its axis.
+`ReXApp` reports the surface (the selected display's pixel size in fullscreen,
+otherwise the window's pixel size after creation) with
+`IGraphicsSystem::SetDisplaySurfaceSize` before the Runtime creates the GPU
+caches, so the scale is chosen once at startup. The GPU plugin uses ABI 5.
+After device limits apply, the plugin logs
+`Display: guest=WxH scale_requested=<auto|XxY> scale_effective=XxY surface=WxH`,
+and on the first presented frame
+`Display: swap_source=WxH output=x,y,w,h`.
 `input_gamepad_in_background` (default false, hot reload) sets SDL's background
 joystick hint so the SDL input backend keeps reading gamepads while the window
 is unfocused.
@@ -299,7 +314,7 @@ a delegate the registration exports forward to the graphics system, or log one
 warning per export when none is loaded.
 
 The delegate is part of Runtime's public C++ layout. Build the SDK and consumers
-with matching headers. The GPU plugin uses ABI 4.
+with matching headers.
 
 ## Physical write notices
 

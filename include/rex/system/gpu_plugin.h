@@ -29,7 +29,7 @@
 namespace rex::system {
 
 // Bump on changes to GpuCreateInfo, IGraphicsSystem, or its callback view layout.
-inline constexpr uint32_t kGpuPluginAbiVersion = 4;
+inline constexpr uint32_t kGpuPluginAbiVersion = 5;
 
 inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
 inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";

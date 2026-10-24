@@ -269,6 +269,10 @@ class Window {
   uint32_t GetActualLogicalWidth() const { return SizeToLogical(GetActualPhysicalWidth()); }
   uint32_t GetActualLogicalHeight() const { return SizeToLogical(GetActualPhysicalHeight()); }
 
+  // Physical pixel size of the presentation target: the display in fullscreen
+  // when available, otherwise the window. Returns false if the size is unknown.
+  virtual bool GetPresentationPixelSize(uint32_t& width_out, uint32_t& height_out) const;
+
   // Desired state stored by the common Window, modifiable both externally and
   // by the implementation (including from SetFullscreen itself).
   bool IsFullscreen() const { return fullscreen_; }

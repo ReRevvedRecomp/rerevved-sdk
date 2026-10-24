@@ -57,6 +57,14 @@ class IGraphicsSystem {
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
 
+  // Physical pixel size of the target the presenter will draw to. Reported
+  // before SetupGuestGpu so size-dependent choices (automatic draw resolution)
+  // can be made before the GPU caches are created; 0x0 means unknown.
+  virtual void SetDisplaySurfaceSize(uint32_t width, uint32_t height) {
+    (void)width;
+    (void)height;
+  }
+
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
     (void)callback;

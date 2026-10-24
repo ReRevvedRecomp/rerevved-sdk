@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -83,8 +84,9 @@ REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y
 
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "Display",
                      "Resolution scale. Draw resolution scale for both X and Y axes (same as "
-                     "setting draw_resolution_scale_x and draw_resolution_scale_y)")
-    .range(1, 8)
+                     "setting draw_resolution_scale_x and draw_resolution_scale_y). 0 = auto: "
+                     "choose an integer scale for the presented image height")
+    .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
     .audience(rex::cvar::Audience::kPlayer);
 
@@ -680,20 +682,67 @@ TextureCache::~TextureCache() {
   }
 }
 
-bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
-  uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
-  bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
-  uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_x)));
-  uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
+uint32_t AutoDrawResolutionScale(uint32_t surface_width, uint32_t surface_height,
+                                 uint32_t guest_width, uint32_t guest_height, uint32_t max_scale) {
+  if (!surface_width || !surface_height || !guest_width || !guest_height) {
+    return 1;
+  }
+  // The guest-aspect image fitted inside the surface is limited by the tighter axis.
+  const uint64_t scale = std::min((uint64_t(surface_height) + guest_height - 1) / guest_height,
+                                  (uint64_t(surface_width) + guest_width - 1) / guest_width);
+  return uint32_t(std::clamp<uint64_t>(scale, 1, std::max<uint32_t>(1, max_scale)));
+}
+
+bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out,
+                                                const DisplayGeometry& display,
+                                                DrawResolutionScaleRequest* request_out) {
+  const int32_t shared_value = REXCVAR_GET(resolution_scale);
+  // Auto applies even as an application default, which HasNonDefaultValue reports as default.
+  const bool shared_auto = shared_value <= 0;
+  const bool use_shared_scale = shared_auto || rex::cvar::HasNonDefaultValue("resolution_scale");
+  const uint32_t shared_scale =
+      shared_auto ? AutoDrawResolutionScale(display.surface_width, display.surface_height,
+                                            display.guest_width, display.guest_height,
+                                            kMaxDrawResolutionScaleAlongAxis)
+                  : uint32_t(std::max(INT32_C(1), shared_value));
+  auto axis_scale = [&](const char* axis_name, int32_t axis_value, bool& auto_out) {
+    if (use_shared_scale && !rex::cvar::HasNonDefaultValue(axis_name)) {
+      auto_out = shared_auto;
+      return shared_scale;
+    }
+    auto_out = false;
+    return uint32_t(std::max(INT32_C(1), axis_value));
+  };
+  DrawResolutionScaleRequest request;
+  const uint32_t config_x =
+      axis_scale("draw_resolution_scale_x", REXCVAR_GET(draw_resolution_scale_x), request.auto_x);
+  const uint32_t config_y =
+      axis_scale("draw_resolution_scale_y", REXCVAR_GET(draw_resolution_scale_y), request.auto_y);
+  request.x = config_x;
+  request.y = config_y;
+  if (request_out) {
+    *request_out = request;
+  }
   uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
   uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
   x_out = clamped_x;
   y_out = clamped_y;
   return clamped_x == config_x && clamped_y == config_y;
+}
+
+void TextureCache::LogDisplayScale(const DisplayGeometry& display,
+                                   const DrawResolutionScaleRequest& request, uint32_t effective_x,
+                                   uint32_t effective_y) {
+  auto axis_text = [](bool is_auto, uint32_t value) {
+    return is_auto ? std::string("auto") : std::to_string(value);
+  };
+  const std::string requested =
+      request.auto_x && request.auto_y
+          ? std::string("auto")
+          : axis_text(request.auto_x, request.x) + "x" + axis_text(request.auto_y, request.y);
+  REXGPU_INFO("Display: guest={}x{} scale_requested={} scale_effective={}x{} surface={}x{}",
+              display.guest_width, display.guest_height, requested, effective_x, effective_y,
+              display.surface_width, display.surface_height);
 }
 
 void TextureCache::ClearCache() {

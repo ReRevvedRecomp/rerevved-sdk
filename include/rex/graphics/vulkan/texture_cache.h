@@ -57,6 +57,11 @@ class VulkanTextureCache final : public TextureCache {
     bool operator!=(const SamplerParameters& parameters) const { return value != parameters.value; }
   };
 
+  // Reduces the scale to fit device buffer and memory limits.
+  // Returns whether the scale is unchanged.
+  static bool ClampDrawResolutionScaleToMaxSupported(uint32_t& scale_x, uint32_t& scale_y,
+                                                     const ui::vulkan::VulkanDevice* vulkan_device);
+
   // Transient descriptor set layouts must be initialized in the command
   // processor.
   static std::unique_ptr<VulkanTextureCache> Create(

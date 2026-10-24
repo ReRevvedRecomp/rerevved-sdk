@@ -42,17 +42,15 @@ constexpr uint32_t kDisplayGammaType = 2;
 constexpr double kDisplayGammaPower = 2.22222233;
 
 uint32_t GetConfiguredVideoModeWidth() {
+  // The host window size never selects the guest mode; only video_mode_* and the
+  // resolution preset do.
   int32_t configured_width = REXCVAR_GET(video_mode_width);
   if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
-    if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
-      configured_width = REXCVAR_GET(window_width);
-    } else {
-      int32_t preset_width = 0;
-      int32_t preset_height = 0;
-      if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
-                                                                         preset_height)) {
-        configured_width = preset_width;
-      }
+    int32_t preset_width = 0;
+    int32_t preset_height = 0;
+    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
+                                                                       preset_height)) {
+      configured_width = preset_width;
     }
   }
   return uint32_t(std::clamp(configured_width, 640, 0x0FFF));
@@ -61,15 +59,11 @@ uint32_t GetConfiguredVideoModeWidth() {
 uint32_t GetConfiguredVideoModeHeight() {
   int32_t configured_height = REXCVAR_GET(video_mode_height);
   if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
-    if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
-      configured_height = REXCVAR_GET(window_height);
-    } else {
-      int32_t preset_width = 0;
-      int32_t preset_height = 0;
-      if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
-                                                                         preset_height)) {
-        configured_height = preset_height;
-      }
+    int32_t preset_width = 0;
+    int32_t preset_height = 0;
+    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
+                                                                       preset_height)) {
+      configured_height = preset_height;
     }
   }
   return uint32_t(std::clamp(configured_height, 480, 0x0FFF));

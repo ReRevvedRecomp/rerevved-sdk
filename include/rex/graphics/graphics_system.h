@@ -62,6 +62,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
   X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
                          system::KernelState* kernel_state) override;
   bool has_presentation() const override { return presenter_ != nullptr; }
+  void SetDisplaySurfaceSize(uint32_t width, uint32_t height) override {
+    display_surface_width_ = width;
+    display_surface_height_ = height;
+  }
+  uint32_t display_surface_width() const { return display_surface_width_; }
+  uint32_t display_surface_height() const { return display_surface_height_; }
   void Shutdown() override;
 
   // May be called from any thread any number of times, even during recovery
@@ -116,6 +122,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   ::rex::ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<::rex::ui::GraphicsProvider> provider_;
   bool provider_supports_presentation_ = false;
+  uint32_t display_surface_width_ = 0;
+  uint32_t display_surface_height_ = 0;
 
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;

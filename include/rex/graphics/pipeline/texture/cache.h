@@ -30,6 +30,30 @@
 
 namespace rex::graphics {
 
+/// Smallest integer draw scale covering the guest-aspect image fitted inside
+/// `surface_width` x `surface_height`, capped at max(1, max_scale).
+/// Uses the smaller of ceil(surface height / guest height) and
+/// ceil(surface width / guest width). A zero surface or guest size gives 1.
+uint32_t AutoDrawResolutionScale(uint32_t surface_width, uint32_t surface_height,
+                                 uint32_t guest_width, uint32_t guest_height, uint32_t max_scale);
+
+/// Guest and presentation surface sizes in pixels. Zero means unknown.
+struct DisplayGeometry {
+  uint32_t guest_width = 0;
+  uint32_t guest_height = 0;
+  uint32_t surface_width = 0;
+  uint32_t surface_height = 0;
+};
+
+/// The draw resolution scale as configured, before device limits. An auto axis
+/// holds the value resolved from the display geometry.
+struct DrawResolutionScaleRequest {
+  bool auto_x = false;
+  bool auto_y = false;
+  uint32_t x = 1;
+  uint32_t y = 1;
+};
+
 // Manages host copies of guest textures, performing untiling, format and endian
 // conversion of textures stored in the shared memory, and also handling
 // invalidation.
@@ -69,7 +93,16 @@ class TextureCache {
   virtual ~TextureCache();
 
   // Returns whether the actual scale is not smaller than the requested one.
-  static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out);
+  // `resolution_scale` 0 resolves from `display`; `request_out`, if given,
+  // receives the configuration before the emulator limit is applied.
+  static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out,
+                                           const DisplayGeometry& display = {},
+                                           DrawResolutionScaleRequest* request_out = nullptr);
+  // Logs the one-line summary of the final scale; call once the device limits
+  // have been applied to `effective_x` x `effective_y`.
+  static void LogDisplayScale(const DisplayGeometry& display,
+                              const DrawResolutionScaleRequest& request, uint32_t effective_x,
+                              uint32_t effective_y);
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   bool IsDrawResolutionScaled() const {

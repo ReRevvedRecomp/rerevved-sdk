@@ -22,12 +22,14 @@
 #include <imgui.h>
 
 REXCVAR_DEFINE_INT32(window_width, 0, "UI/Window",
-                     "Startup window width in logical pixels (0 = use app default)")
+                     "Startup window width in logical pixels (0 = use app default). "
+                     "Does not change the guest video mode")
     .range(0, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
-                     "Startup window height in logical pixels (0 = use app default)")
+                     "Startup window height in logical pixels (0 = use app default). "
+                     "Does not change the guest video mode")
     .range(0, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -107,6 +109,12 @@ Window::~Window() {
     innermost_destruction_receiver_->window_ = nullptr;
     innermost_destruction_receiver_ = innermost_destruction_receiver_->outer_receiver_;
   }
+}
+
+bool Window::GetPresentationPixelSize(uint32_t& width_out, uint32_t& height_out) const {
+  width_out = GetActualPhysicalWidth();
+  height_out = GetActualPhysicalHeight();
+  return width_out && height_out;
 }
 
 void Window::AddListener(WindowListener* listener) {

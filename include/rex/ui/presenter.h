@@ -359,6 +359,12 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Also carries the source texture size with the frame for the one-time
+  // "Display:" log line.
+  bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                          uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
+                          uint32_t source_width, uint32_t source_height,
+                          std::function<bool(GuestOutputRefreshContext& context)> refresher);
   // Rate of successful refreshes that carried a guest image, one per guest
   // frame swap. Callable from any thread.
   FrameStats GetGuestOutputRefreshStats() const {
@@ -413,6 +419,9 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    // Size of the swap source texture, for logging only; 0 if not reported.
+    uint32_t source_width;
+    uint32_t source_height;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -427,6 +436,8 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      source_width = 0;
+      source_height = 0;
     }
   };
 

@@ -1481,9 +1481,18 @@ bool D3D12CommandProcessor::SetupContext() {
 
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
+  system::X_VIDEO_MODE guest_video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&guest_video_mode);
+  DisplayGeometry display_geometry;
+  display_geometry.guest_width = guest_video_mode.display_width;
+  display_geometry.guest_height = guest_video_mode.display_height;
+  display_geometry.surface_width = graphics_system_->display_surface_width();
+  display_geometry.surface_height = graphics_system_->display_surface_height();
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  DrawResolutionScaleRequest draw_resolution_scale_request;
   bool draw_resolution_scale_not_clamped =
-      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y);
+      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y,
+                                                 display_geometry, &draw_resolution_scale_request);
   if (!D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(
           draw_resolution_scale_x, draw_resolution_scale_y, provider)) {
     draw_resolution_scale_not_clamped = false;
@@ -1494,6 +1503,8 @@ bool D3D12CommandProcessor::SetupContext() {
         "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  TextureCache::LogDisplayScale(display_geometry, draw_resolution_scale_request,
+                                draw_resolution_scale_x, draw_resolution_scale_y);
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
   if (!shared_memory_->Initialize()) {
@@ -2808,6 +2819,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   const bool refresh_succeeded = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
+      uint32_t(swap_texture_desc.Width), uint32_t(swap_texture_desc.Height),
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
        guest_output_height, frontbuffer_ptr, &record_swap_marker,
        &swap_submission_failed](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
