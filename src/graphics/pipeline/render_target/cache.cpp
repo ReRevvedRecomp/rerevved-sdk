@@ -31,7 +31,8 @@
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, true, "GPU",
+// Keep CPU vertex execution opt-in when extents only optimize interlock barriers.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, false, "GPU",
                     "Execute unclipped draw VS on CPU for PSI render backend");
 
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
