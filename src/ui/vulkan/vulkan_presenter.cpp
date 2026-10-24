@@ -226,6 +226,13 @@ VulkanPresenter::~VulkanPresenter() {
   for (VkFramebuffer& framebuffer : paint_context_.guest_output_intermediate_framebuffers) {
     util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, framebuffer);
   }
+  for (VkFramebuffer& framebuffer : paint_context_.bar_fill_framebuffers) {
+    util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, framebuffer);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                             paint_context_.bar_fill_swapchain_pipeline);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                             paint_context_.bar_fill_intermediate_pipeline);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                              paint_context_.guest_output_descriptor_pool);
   for (PaintContext::GuestOutputPaintPipeline& guest_output_paint_pipeline :
@@ -1808,6 +1815,111 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         }
       }
 
+      // Keep images sized for present_bar_fill=blur; disabled blur or resource
+      // creation failure falls back to black bars.
+      std::array<std::pair<uint32_t, uint32_t>, kBarFillBlurMaxLevels> bar_fill_sizes;
+      size_t bar_fill_level_count = 0;
+      if (guest_output_flow.effect_count && guest_output_flow.bar_fill_blur &&
+          paint_context_.bar_fill_intermediate_pipeline != VK_NULL_HANDLE) {
+        bar_fill_level_count = CalculateBarFillBlurLevels(
+            guest_output_properties.frontbuffer_width, guest_output_properties.frontbuffer_height,
+            bar_fill_sizes.data(), bar_fill_sizes.size());
+      }
+      for (size_t i = 0; i < kBarFillBlurMaxLevels; ++i) {
+        std::pair<uint32_t, uint32_t> bar_fill_needed_size(0, 0);
+        if (i < bar_fill_level_count) {
+          bar_fill_needed_size = bar_fill_sizes[i];
+        }
+        std::unique_ptr<GuestOutputImage>& bar_fill_image_ref = paint_context_.bar_fill_images[i];
+        VkExtent2D bar_fill_current_extent(bar_fill_image_ref ? bar_fill_image_ref->extent()
+                                                              : VkExtent2D{});
+        if (bar_fill_current_extent.width == bar_fill_needed_size.first &&
+            bar_fill_current_extent.height == bar_fill_needed_size.second) {
+          continue;
+        }
+        if (!bar_fill_needed_size.first || !bar_fill_needed_size.second) {
+          // Release unused images only after their last GPU submission completes.
+          if (bar_fill_image_ref &&
+              paint_context_.submission_tracker.UpdateAndGetCompletedSubmission() >=
+                  paint_context_.bar_fill_last_submission) {
+            bar_fill_image_ref.reset();
+            util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+                                       paint_context_.bar_fill_framebuffers[i]);
+          }
+          continue;
+        }
+        if (bar_fill_image_ref) {
+          paint_context_.submission_tracker.AwaitSubmissionCompletion(
+              paint_context_.bar_fill_last_submission);
+          bar_fill_image_ref.reset();
+          util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
+                                     paint_context_.bar_fill_framebuffers[i]);
+        }
+        bar_fill_image_ref = GuestOutputImage::Create(vulkan_device_, bar_fill_needed_size.first,
+                                                      bar_fill_needed_size.second);
+        if (!bar_fill_image_ref) {
+          // Fall back to black bars and skip further image allocation.
+          bar_fill_level_count = 0;
+          continue;
+        }
+        VkImageView bar_fill_framebuffer_attachment = bar_fill_image_ref->view();
+        VkFramebufferCreateInfo bar_fill_framebuffer_create_info;
+        bar_fill_framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        bar_fill_framebuffer_create_info.pNext = nullptr;
+        bar_fill_framebuffer_create_info.flags = 0;
+        bar_fill_framebuffer_create_info.renderPass = guest_output_intermediate_render_pass_;
+        bar_fill_framebuffer_create_info.attachmentCount = 1;
+        bar_fill_framebuffer_create_info.pAttachments = &bar_fill_framebuffer_attachment;
+        bar_fill_framebuffer_create_info.width = bar_fill_needed_size.first;
+        bar_fill_framebuffer_create_info.height = bar_fill_needed_size.second;
+        bar_fill_framebuffer_create_info.layers = 1;
+        if (dfn.vkCreateFramebuffer(device, &bar_fill_framebuffer_create_info, nullptr,
+                                    &paint_context_.bar_fill_framebuffers[i]) != VK_SUCCESS) {
+          REXLOG_ERROR("VulkanPresenter: Failed to create a bar fill blur framebuffer");
+          bar_fill_image_ref.reset();
+          bar_fill_level_count = 0;
+          continue;
+        }
+        VkDescriptorImageInfo bar_fill_descriptor_image_info;
+        bar_fill_descriptor_image_info.sampler = VK_NULL_HANDLE;
+        bar_fill_descriptor_image_info.imageView = bar_fill_image_ref->view();
+        bar_fill_descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet bar_fill_descriptor_write;
+        bar_fill_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        bar_fill_descriptor_write.pNext = nullptr;
+        bar_fill_descriptor_write.dstSet =
+            paint_context_.guest_output_descriptor_sets
+                [PaintContext::kGuestOutputDescriptorSetBarFill0Sampled + i];
+        bar_fill_descriptor_write.dstBinding = 0;
+        bar_fill_descriptor_write.dstArrayElement = 0;
+        bar_fill_descriptor_write.descriptorCount = 1;
+        bar_fill_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bar_fill_descriptor_write.pImageInfo = &bar_fill_descriptor_image_info;
+        bar_fill_descriptor_write.pBufferInfo = nullptr;
+        bar_fill_descriptor_write.pTexelBufferView = nullptr;
+        dfn.vkUpdateDescriptorSets(device, 1, &bar_fill_descriptor_write, 0, nullptr);
+      }
+      if (bar_fill_level_count) {
+        // The dimmed swapchain pipeline, recreated when the swapchain render
+        // pass format changes.
+        if (paint_context_.bar_fill_swapchain_pipeline != VK_NULL_HANDLE &&
+            paint_context_.bar_fill_swapchain_format !=
+                paint_context_.swapchain_render_pass_format) {
+          paint_context_.submission_tracker.AwaitSubmissionCompletion(
+              paint_context_.guest_output_image_paint_last_submission);
+          util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                     paint_context_.bar_fill_swapchain_pipeline);
+        }
+        if (paint_context_.bar_fill_swapchain_pipeline == VK_NULL_HANDLE) {
+          paint_context_.bar_fill_swapchain_pipeline = CreateGuestOutputPaintPipeline(
+              GuestOutputPaintEffect::kBilinear, paint_context_.swapchain_render_pass, true);
+          paint_context_.bar_fill_swapchain_format = paint_context_.swapchain_render_pass_format;
+        }
+        if (paint_context_.bar_fill_swapchain_pipeline == VK_NULL_HANDLE) {
+          bar_fill_level_count = 0;
+        }
+      }
+
       if (guest_output_flow.effect_count) {
         // Check if all the intermediate effects are supported by the
         // implementation.
@@ -1868,6 +1980,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
 #endif
+        // Skip the black letterbox clear once the blur covers the bars.
+        bool bar_fill_drawn = false;
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
@@ -1893,6 +2007,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_flow.output_x = 0;
             guest_output_flow.output_y = 0;
             guest_output_flow.letterbox_clear_rectangle_count = 0;
+            // No bars remain.
+            bar_fill_level_count = 0;
           }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
           bool use_temporal_upscaler =
@@ -1949,10 +2065,85 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
 #endif
 
+          // Map the sampled image to the rectangle, clipping to the target bounds.
+          auto draw_bar_fill_bilinear = [&](VkPipeline pipeline, uint32_t descriptor_set,
+                                            int32_t rect_x, int32_t rect_y, uint32_t rect_width,
+                                            uint32_t rect_height, uint32_t target_width,
+                                            uint32_t target_height) {
+            VkViewport viewport;
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = float(target_width);
+            viewport.height = float(target_height);
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+            dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &viewport);
+            VkRect2D scissor;
+            scissor.offset.x = 0;
+            scissor.offset.y = 0;
+            scissor.extent.width = target_width;
+            scissor.extent.height = target_height;
+            dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &scissor);
+            dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            VkPipelineLayout pipeline_layout =
+                guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexBilinear];
+            dfn.vkCmdBindDescriptorSets(
+                draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+                &paint_context_.guest_output_descriptor_sets[descriptor_set], 0, nullptr);
+            GuestOutputPaintRectangleConstants rect_constants;
+            float x_to_ndc = 2.0f / viewport.width;
+            float y_to_ndc = 2.0f / viewport.height;
+            rect_constants.x = -1.0f + float(rect_x) * x_to_ndc;
+            rect_constants.y = -1.0f + float(rect_y) * y_to_ndc;
+            rect_constants.width = float(rect_width) * x_to_ndc;
+            rect_constants.height = float(rect_height) * y_to_ndc;
+            dfn.vkCmdPushConstants(draw_command_buffer, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   0, sizeof(rect_constants), &rect_constants);
+            BilinearConstants bilinear_constants;
+            bilinear_constants.output_offset[0] = rect_x;
+            bilinear_constants.output_offset[1] = rect_y;
+            bilinear_constants.output_size_inv[0] = 1.0f / float(rect_width);
+            bilinear_constants.output_size_inv[1] = 1.0f / float(rect_height);
+            dfn.vkCmdPushConstants(draw_command_buffer, pipeline_layout,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(rect_constants),
+                                   sizeof(bilinear_constants), &bilinear_constants);
+            dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+          };
+
           int32_t effect_rect_x, effect_rect_y;
           if (is_final_effect) {
             effect_rect_x = guest_output_flow.output_x;
             effect_rect_y = guest_output_flow.output_y;
+            if (bar_fill_level_count) {
+              // Halve the guest output down the present_bar_fill=blur chain
+              // before beginning the swapchain pass. The intermediate render
+              // pass leaves each image in the shader read layout.
+              paint_context_.bar_fill_last_submission = current_paint_submission_index;
+              for (size_t j = 0; j < bar_fill_level_count; ++j) {
+                VkRenderPassBeginInfo bar_fill_render_pass_begin_info;
+                bar_fill_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                bar_fill_render_pass_begin_info.pNext = nullptr;
+                bar_fill_render_pass_begin_info.renderPass = guest_output_intermediate_render_pass_;
+                bar_fill_render_pass_begin_info.framebuffer =
+                    paint_context_.bar_fill_framebuffers[j];
+                bar_fill_render_pass_begin_info.renderArea.offset.x = 0;
+                bar_fill_render_pass_begin_info.renderArea.offset.y = 0;
+                bar_fill_render_pass_begin_info.renderArea.extent.width = bar_fill_sizes[j].first;
+                bar_fill_render_pass_begin_info.renderArea.extent.height = bar_fill_sizes[j].second;
+                bar_fill_render_pass_begin_info.clearValueCount = 0;
+                bar_fill_render_pass_begin_info.pClearValues = nullptr;
+                dfn.vkCmdBeginRenderPass(draw_command_buffer, &bar_fill_render_pass_begin_info,
+                                         VK_SUBPASS_CONTENTS_INLINE);
+                draw_bar_fill_bilinear(
+                    paint_context_.bar_fill_intermediate_pipeline,
+                    j ? PaintContext::kGuestOutputDescriptorSetBarFill0Sampled + uint32_t(j - 1)
+                      : PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+                            uint32_t(guest_output_image_paint_ref_index),
+                    0, 0, bar_fill_sizes[j].first, bar_fill_sizes[j].second,
+                    bar_fill_sizes[j].first, bar_fill_sizes[j].second);
+                dfn.vkCmdEndRenderPass(draw_command_buffer);
+              }
+            }
             dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                                      VK_SUBPASS_CONTENTS_INLINE);
             swapchain_image_pass_begun = true;
@@ -1984,6 +2175,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
           dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &guest_output_viewport);
           dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &guest_output_scissor);
+
+          if (is_final_effect && bar_fill_level_count) {
+            // Draw the dimmed blur over the swapchain before the sharp output.
+            draw_bar_fill_bilinear(
+                paint_context_.bar_fill_swapchain_pipeline,
+                PaintContext::kGuestOutputDescriptorSetBarFill0Sampled +
+                    uint32_t(bar_fill_level_count - 1),
+                guest_output_flow.bar_fill_rect.x, guest_output_flow.bar_fill_rect.y,
+                guest_output_flow.bar_fill_rect.width, guest_output_flow.bar_fill_rect.height,
+                paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+            bar_fill_drawn = true;
+          }
 
           const PaintContext::GuestOutputPaintPipeline& effect_pipeline =
               paint_context_.guest_output_paint_pipelines[size_t(effect)];
@@ -2073,7 +2276,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           if (is_final_effect) {
             // Clear the letterbox around the guest output if the guest output
             // doesn't cover the entire swapchain image.
-            if (swapchain_image_clear_needed && guest_output_flow.letterbox_clear_rectangle_count) {
+            if (swapchain_image_clear_needed && !bar_fill_drawn &&
+                guest_output_flow.letterbox_clear_rectangle_count) {
               VkClearRect
                   letterbox_clear_vulkan_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];
               for (size_t i = 0; i < guest_output_flow.letterbox_clear_rectangle_count; ++i) {
@@ -2514,6 +2718,13 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         guest_output_paint_intermediate_pipeline;
   }
 
+  // The bilinear pipeline for the present_bar_fill=blur chain. Without it the
+  // bars stay black.
+  if (guest_output_paint_fs_[size_t(GuestOutputPaintEffect::kBilinear)] != VK_NULL_HANDLE) {
+    paint_context_.bar_fill_intermediate_pipeline = CreateGuestOutputPaintPipeline(
+        GuestOutputPaintEffect::kBilinear, guest_output_intermediate_render_pass_);
+  }
+
   // Guest output painting descriptor sets.
   VkDescriptorPoolSize guest_output_paint_descriptor_pool_sizes[2];
   guest_output_paint_descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2571,7 +2782,8 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
 }
 
 VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
-                                                           VkRenderPass render_pass) {
+                                                           VkRenderPass render_pass,
+                                                           bool bar_fill_dim) {
   VkPipelineShaderStageCreateInfo stages[2] = {};
   for (uint32_t i = 0; i < 2; ++i) {
     VkPipelineShaderStageCreateInfo& stage = stages[i];
@@ -2614,6 +2826,20 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
   color_blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
   color_blend_state.attachmentCount = 1;
   color_blend_state.pAttachments = &color_blend_attachment_state;
+  if (bar_fill_dim) {
+    // Output = source * constant, with alpha 1 from the shader.
+    color_blend_attachment_state.blendEnable = VK_TRUE;
+    color_blend_attachment_state.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+    color_blend_attachment_state.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    color_blend_attachment_state.colorBlendOp = VK_BLEND_OP_ADD;
+    color_blend_attachment_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    color_blend_attachment_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    color_blend_attachment_state.alphaBlendOp = VK_BLEND_OP_ADD;
+    color_blend_state.blendConstants[0] = kBarFillDim;
+    color_blend_state.blendConstants[1] = kBarFillDim;
+    color_blend_state.blendConstants[2] = kBarFillDim;
+    color_blend_state.blendConstants[3] = 1.0f;
+  }
 
   static const VkDynamicState kPipelineDynamicStates[] = {
       VK_DYNAMIC_STATE_VIEWPORT,

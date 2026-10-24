@@ -433,7 +433,10 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+      // Bar fill blur chain textures - the last usage is bar_fill_last_usage.
+      kRTVIndexBarFill0 = kRTVIndexGuestOutputIntermediate0 + kMaxGuestOutputPaintEffects - 1,
+
+      kRTVCount = kRTVIndexBarFill0 + kBarFillBlurMaxLevels,
     };
 
     enum ViewIndex : UINT {
@@ -445,7 +448,11 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kViewIndexGuestOutputIntermediate0Srv = kViewIndexGuestOutput0Srv + kGuestOutputMailboxSize,
 
-      kViewCount = kViewIndexGuestOutputIntermediate0Srv + kMaxGuestOutputPaintEffects - 1,
+      // Bar fill blur chain textures - the last usage is bar_fill_last_usage.
+      kViewIndexBarFill0Srv =
+          kViewIndexGuestOutputIntermediate0Srv + kMaxGuestOutputPaintEffects - 1,
+
+      kViewCount = kViewIndexBarFill0Srv + kBarFillBlurMaxLevels,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -496,6 +503,11 @@ class D3D12Presenter final : public Presenter {
         guest_output_intermediate_textures;
     UINT64 guest_output_intermediate_texture_last_usage = 0;
 
+    // Successive 2x downsamples of the guest output for present_bar_fill=blur,
+    // created on demand and kept (in PIXEL_SHADER_RESOURCE) while not drawn to.
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBarFillBlurMaxLevels> bar_fill_textures;
+    UINT64 bar_fill_last_usage = 0;
+
     // Connection-specific.
 
     uint32_t swap_chain_width = 0;
@@ -539,6 +551,11 @@ class D3D12Presenter final : public Presenter {
       guest_output_paint_intermediate_pipelines_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_final_pipelines_;
+  // Bilinear pipelines for present_bar_fill=blur: the first writes a blur chain
+  // texture, the second draws to the swap chain scaling the color by the dim
+  // factor via the blend factor.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> bar_fill_downsample_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> bar_fill_composite_pipeline_;
 
   // The first is the refresher submission tracker fence value at which the
   // guest output texture was last refreshed, the second is the reference to the

@@ -32,6 +32,13 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
+REXCVAR_DEFINE_STRING(
+    present_bar_fill, "black", "Display",
+    "Fill pillarbox and letterbox bars: black, blur (dimmed, blurred copy of the "
+    "game image)")
+    .allowed({"black", "blur"})
+    .audience(rex::cvar::Audience::kPlayer);
+
 REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
     .range(0, 100);
@@ -1278,6 +1285,15 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       letterbox_clear_rectangle_top.width = host_rt_width;
       letterbox_clear_rectangle_top.height = host_rt_height - letterbox_mid_bottom;
     }
+  }
+
+  // The backend skips the black letterbox clear after drawing the blurred fill.
+  if (HasBars(host_rt_width, host_rt_height, flow.output_x, flow.output_y, output_width,
+              output_height) &&
+      ParseBarFillMode(REXCVAR_QUERY(std::string, present_bar_fill)) == BarFillMode::kBlur) {
+    flow.bar_fill_rect =
+        CalculateBarFillRect(host_rt_width, host_rt_height, output_width, output_height);
+    flow.bar_fill_blur = flow.bar_fill_rect.width && flow.bar_fill_rect.height;
   }
 
   return flow;

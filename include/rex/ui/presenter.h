@@ -30,6 +30,7 @@
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/types.h>
+#include <rex/ui/bar_fill.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/frame_stats.h>
 #include <rex/ui/surface.h>
@@ -527,6 +528,13 @@ class Presenter {
     // rectangles around the guest output.
     size_t letterbox_clear_rectangle_count;
     std::array<ClearRectangle, kMaxClearRectangles> letterbox_clear_rectangles;
+
+    // Set only when present_bar_fill is blur and the letterbox leaves bars. The
+    // backend then draws a dimmed, blurred copy of the guest output over the
+    // whole target through the rectangle below (which may extend outside it)
+    // before the fitted output, and skips the letterbox clears.
+    bool bar_fill_blur;
+    BarFillRect bar_fill_rect;
 
     void GetEffectInputSize(size_t effect_index, uint32_t& width_out, uint32_t& height_out) const {
       assert_true(effect_index < effect_count);

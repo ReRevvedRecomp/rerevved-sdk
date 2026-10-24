@@ -316,8 +316,11 @@ class VulkanPresenter final : public Presenter {
       kGuestOutputDescriptorSetIntermediate0Sampled =
           kGuestOutputDescriptorSetGuestOutput0Sampled + kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      kGuestOutputDescriptorSetBarFill0Sampled =
           kGuestOutputDescriptorSetIntermediate0Sampled + kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount =
+          kGuestOutputDescriptorSetBarFill0Sampled + kBarFillBlurMaxLevels,
     };
 
     struct UISetupCommandBuffer {
@@ -397,6 +400,20 @@ class VulkanPresenter final : public Presenter {
         guest_output_intermediate_framebuffers = {};
     uint64_t guest_output_intermediate_image_last_submission = 0;
 
+    // Successive 2x downsamples of the guest output for present_bar_fill=blur,
+    // created on demand, with the same lifetime rules as the intermediate
+    // images.
+    std::array<std::unique_ptr<GuestOutputImage>, kBarFillBlurMaxLevels> bar_fill_images;
+    std::array<VkFramebuffer, kBarFillBlurMaxLevels> bar_fill_framebuffers = {};
+    uint64_t bar_fill_last_submission = 0;
+    // Bilinear pipelines for the blur: the first writes a chain image (created
+    // on initialization), the second draws to the swapchain scaling the color
+    // by the dim factor (created during painting, like the swapchain pipelines
+    // of the effects).
+    VkPipeline bar_fill_intermediate_pipeline = VK_NULL_HANDLE;
+    VkPipeline bar_fill_swapchain_pipeline = VK_NULL_HANDLE;
+    VkFormat bar_fill_swapchain_format = VK_FORMAT_UNDEFINED;
+
     // Command buffers optionally executed before the draw command buffer,
     // outside the painting render pass.
     std::vector<UISetupCommandBuffer> ui_setup_command_buffers;
@@ -432,8 +449,11 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  // With bar_fill_dim, the pipeline outputs the color multiplied by
+  // kBarFillDim.
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
-                                                          VkRenderPass render_pass);
+                                                          VkRenderPass render_pass,
+                                                          bool bar_fill_dim = false);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,

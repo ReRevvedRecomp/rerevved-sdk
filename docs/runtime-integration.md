@@ -100,6 +100,23 @@ the ABI number alone does not establish compatibility. The presenter honors
 the aspect only through its normal fitting, so original-aspect movies
 need `present_letterbox` on and `present_safe_area_x`/`present_safe_area_y` at
 100.
+
+`present_bar_fill` (`Display`, player audience, hot reload) chooses what fills
+the pillarbox or letterbox bars left by the fitted image. `black` (default)
+clears them. `blur` draws a dimmed (0.4x), blurred copy of the guest output over
+the whole surface, scaled to cover it without distortion (centered crop), then
+draws the sharp image over it.
+
+The blur halves the guest output through bilinear passes until neither side
+exceeds 96 pixels (four passes for 1280x720, about 0.3 megapixels written), then
+scales the last level with bilinear filtering. Upscaling and sharpening effects
+do not affect the fill because it is computed from the guest output.
+
+The fill applies only when bars exist, so it does nothing with
+`present_letterbox` off or an exactly fitting window. D3D12 and Vulkan support
+the fill, and UI drawn after the guest output covers it. The setting belongs
+to the presenter and does not change the GPU plugin ABI.
+
 `input_gamepad_in_background` (default false, hot reload) sets SDL's background
 joystick hint so the SDL input backend keeps reading gamepads while the window
 is unfocused.

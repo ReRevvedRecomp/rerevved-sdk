@@ -1328,6 +1328,83 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         }
       }
 
+      // Keep textures sized for present_bar_fill=blur; disabled blur or resource
+      // creation failure falls back to black bars.
+      std::array<std::pair<uint32_t, uint32_t>, kBarFillBlurMaxLevels> bar_fill_sizes;
+      size_t bar_fill_level_count = 0;
+      if (guest_output_flow.effect_count && guest_output_flow.bar_fill_blur &&
+          bar_fill_downsample_pipeline_ && bar_fill_composite_pipeline_) {
+        bar_fill_level_count = CalculateBarFillBlurLevels(
+            guest_output_properties.frontbuffer_width, guest_output_properties.frontbuffer_height,
+            bar_fill_sizes.data(), bar_fill_sizes.size());
+      }
+      for (size_t i = 0; i < kBarFillBlurMaxLevels; ++i) {
+        std::pair<uint32_t, uint32_t> bar_fill_needed_size(0, 0);
+        if (i < bar_fill_level_count) {
+          bar_fill_needed_size = bar_fill_sizes[i];
+        }
+        Microsoft::WRL::ComPtr<ID3D12Resource>& bar_fill_texture_ref =
+            paint_context_.bar_fill_textures[i];
+        std::pair<uint32_t, uint32_t> bar_fill_current_size(0, 0);
+        if (bar_fill_texture_ref) {
+          D3D12_RESOURCE_DESC bar_fill_current_desc = bar_fill_texture_ref->GetDesc();
+          bar_fill_current_size.first = uint32_t(bar_fill_current_desc.Width);
+          bar_fill_current_size.second = bar_fill_current_desc.Height;
+        }
+        if (bar_fill_current_size == bar_fill_needed_size) {
+          continue;
+        }
+        if (!bar_fill_needed_size.first || !bar_fill_needed_size.second) {
+          // Release unused textures only after their last GPU submission completes.
+          if (bar_fill_texture_ref &&
+              paint_context_.paint_submission_tracker.GetCompletedSubmission() >=
+                  paint_context_.bar_fill_last_usage) {
+            bar_fill_texture_ref.Reset();
+          }
+          continue;
+        }
+        if (bar_fill_texture_ref) {
+          paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(
+              paint_context_.bar_fill_last_usage);
+          bar_fill_texture_ref.Reset();
+        }
+        D3D12_RESOURCE_DESC bar_fill_desc = {};
+        bar_fill_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        bar_fill_desc.Width = bar_fill_needed_size.first;
+        bar_fill_desc.Height = bar_fill_needed_size.second;
+        bar_fill_desc.DepthOrArraySize = 1;
+        bar_fill_desc.MipLevels = 1;
+        bar_fill_desc.Format = kGuestOutputIntermediateFormat;
+        bar_fill_desc.SampleDesc.Count = 1;
+        bar_fill_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        bar_fill_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(device->CreateCommittedResource(
+                &util::kHeapPropertiesDefault, provider_.GetHeapFlagCreateNotZeroed(),
+                &bar_fill_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&bar_fill_texture_ref)))) {
+          REXLOG_ERROR("D3D12Presenter: Failed to create a bar fill blur texture");
+          // Fall back to black bars and skip further texture allocation.
+          bar_fill_level_count = 0;
+          continue;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC bar_fill_srv_desc = {};
+        bar_fill_srv_desc.Format = kGuestOutputIntermediateFormat;
+        bar_fill_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        bar_fill_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        bar_fill_srv_desc.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(
+            bar_fill_texture_ref.Get(), &bar_fill_srv_desc,
+            provider_.OffsetViewDescriptor(view_heap_cpu_start,
+                                           uint32_t(PaintContext::kViewIndexBarFill0Srv + i)));
+        D3D12_RENDER_TARGET_VIEW_DESC bar_fill_rtv_desc = {};
+        bar_fill_rtv_desc.Format = kGuestOutputIntermediateFormat;
+        bar_fill_rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(
+            bar_fill_texture_ref.Get(), &bar_fill_rtv_desc,
+            provider_.OffsetRTVDescriptor(rtv_heap_start,
+                                          uint32_t(PaintContext::kRTVIndexBarFill0 + i)));
+      }
+
       if (guest_output_flow.effect_count) {
         paint_context_.guest_output_resource_paint_refs[guest_output_resource_paint_ref_index]
             .first = current_paint_submission;
@@ -1336,6 +1413,107 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         }
 
         command_list->SetDescriptorHeaps(1, &view_heap);
+      }
+
+      // Draw the dimmed blur over the back buffer before the sharp output.
+      // Skip the black letterbox clear once the blur covers the bars.
+      bool bar_fill_drawn = false;
+      if (guest_output_flow.effect_count && bar_fill_level_count) {
+        paint_context_.bar_fill_last_usage = current_paint_submission;
+        D3D12_GPU_DESCRIPTOR_HANDLE bar_fill_view_heap_gpu_start =
+            view_heap->GetGPUDescriptorHandleForHeapStart();
+        command_list->SetGraphicsRootSignature(
+            guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear].Get());
+        command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        // Map the source view to the rectangle, clipping to the target bounds.
+        auto draw_bar_fill_bilinear = [&](UINT source_view_index, int32_t rect_x, int32_t rect_y,
+                                          uint32_t rect_width, uint32_t rect_height,
+                                          uint32_t target_width, uint32_t target_height) {
+          D3D12_VIEWPORT viewport;
+          viewport.TopLeftX = 0.0f;
+          viewport.TopLeftY = 0.0f;
+          viewport.Width = float(target_width);
+          viewport.Height = float(target_height);
+          viewport.MinDepth = 0.0f;
+          viewport.MaxDepth = 1.0f;
+          command_list->RSSetViewports(1, &viewport);
+          D3D12_RECT scissor;
+          scissor.left = 0;
+          scissor.top = 0;
+          scissor.right = LONG(target_width);
+          scissor.bottom = LONG(target_height);
+          command_list->RSSetScissorRects(1, &scissor);
+          command_list->SetGraphicsRootDescriptorTable(
+              UINT(GuestOutputPaintRootParameter::kSource),
+              provider_.OffsetViewDescriptor(bar_fill_view_heap_gpu_start, source_view_index));
+          GuestOutputPaintRectangleConstants rect_constants;
+          float x_to_ndc = 2.0f / viewport.Width;
+          float y_to_ndc = 2.0f / viewport.Height;
+          rect_constants.x = -1.0f + float(rect_x) * x_to_ndc;
+          // +Y is -V.
+          rect_constants.y = 1.0f - float(rect_y) * y_to_ndc;
+          rect_constants.width = float(rect_width) * x_to_ndc;
+          rect_constants.height = -float(rect_height) * y_to_ndc;
+          command_list->SetGraphicsRoot32BitConstants(
+              UINT(GuestOutputPaintRootParameter::kRectangle),
+              sizeof(rect_constants) / sizeof(uint32_t), &rect_constants, 0);
+          BilinearConstants bilinear_constants;
+          bilinear_constants.output_offset[0] = rect_x;
+          bilinear_constants.output_offset[1] = rect_y;
+          bilinear_constants.output_size_inv[0] = 1.0f / float(rect_width);
+          bilinear_constants.output_size_inv[1] = 1.0f / float(rect_height);
+          command_list->SetGraphicsRoot32BitConstants(
+              UINT(GuestOutputPaintRootParameter::kEffectConstants),
+              sizeof(bilinear_constants) / sizeof(uint32_t), &bilinear_constants, 0);
+          command_list->DrawInstanced(4, 1, 0, 0);
+        };
+        command_list->SetPipelineState(bar_fill_downsample_pipeline_.Get());
+        for (size_t i = 0; i < bar_fill_level_count; ++i) {
+          ID3D12Resource* bar_fill_texture = paint_context_.bar_fill_textures[i].Get();
+          D3D12_RESOURCE_BARRIER barrier;
+          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+          barrier.Transition.pResource = bar_fill_texture;
+          barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          command_list->ResourceBarrier(1, &barrier);
+          command_list->DiscardResource(bar_fill_texture, nullptr);
+          D3D12_CPU_DESCRIPTOR_HANDLE bar_fill_rtv = provider_.OffsetRTVDescriptor(
+              rtv_heap_start, uint32_t(PaintContext::kRTVIndexBarFill0 + i));
+          command_list->OMSetRenderTargets(1, &bar_fill_rtv, TRUE, nullptr);
+          back_buffer_bound = false;
+          draw_bar_fill_bilinear(i ? UINT(PaintContext::kViewIndexBarFill0Srv + (i - 1))
+                                   : UINT(PaintContext::kViewIndexGuestOutput0Srv +
+                                          guest_output_resource_paint_ref_index),
+                                 0, 0, bar_fill_sizes[i].first, bar_fill_sizes[i].second,
+                                 bar_fill_sizes[i].first, bar_fill_sizes[i].second);
+          barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          command_list->ResourceBarrier(1, &barrier);
+        }
+        if (!back_buffer_acquired) {
+          D3D12_RESOURCE_BARRIER barrier_present_to_rtv;
+          barrier_present_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          barrier_present_to_rtv.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+          barrier_present_to_rtv.Transition.pResource = back_buffer;
+          barrier_present_to_rtv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          barrier_present_to_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+          barrier_present_to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          command_list->ResourceBarrier(1, &barrier_present_to_rtv);
+          back_buffer_acquired = true;
+        }
+        command_list->OMSetRenderTargets(1, &back_buffer_rtv, TRUE, nullptr);
+        back_buffer_bound = true;
+        const float bar_fill_blend_factor[] = {kBarFillDim, kBarFillDim, kBarFillDim, 1.0f};
+        command_list->OMSetBlendFactor(bar_fill_blend_factor);
+        command_list->SetPipelineState(bar_fill_composite_pipeline_.Get());
+        draw_bar_fill_bilinear(
+            UINT(PaintContext::kViewIndexBarFill0Srv + (bar_fill_level_count - 1)),
+            guest_output_flow.bar_fill_rect.x, guest_output_flow.bar_fill_rect.y,
+            guest_output_flow.bar_fill_rect.width, guest_output_flow.bar_fill_rect.height,
+            paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+        bar_fill_drawn = true;
       }
 
       // This effect loop must not be aborted so the states of the resources
@@ -1551,7 +1729,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           if (drew_graphics_effect) {
             // Clear the letterbox around the guest output if the guest output
             // doesn't cover the entire back buffer.
-            if (guest_output_flow.letterbox_clear_rectangle_count) {
+            if (!bar_fill_drawn && guest_output_flow.letterbox_clear_rectangle_count) {
               D3D12_RECT
               letterbox_clear_d3d12_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];
               for (size_t i = 0; i < guest_output_flow.letterbox_clear_rectangle_count; ++i) {
@@ -2012,6 +2190,34 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         return false;
       }
     }
+  }
+
+  // present_bar_fill=blur pipelines, reusing the bilinear shader. Without them
+  // the bars stay black.
+  guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_bilinear_ps;
+  guest_output_paint_pipeline_desc.PS.BytecodeLength = sizeof(shaders::guest_output_bilinear_ps);
+  guest_output_paint_pipeline_desc.pRootSignature =
+      guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear].Get();
+  guest_output_paint_pipeline_desc.RTVFormats[0] = kGuestOutputIntermediateFormat;
+  if (FAILED(device->CreateGraphicsPipelineState(&guest_output_paint_pipeline_desc,
+                                                 IID_PPV_ARGS(&bar_fill_downsample_pipeline_)))) {
+    REXLOG_WARN("D3D12Presenter: Failed to create the bar fill downsampling pipeline");
+  }
+  // Output = source * blend factor, with alpha 1 from the shader.
+  D3D12_RENDER_TARGET_BLEND_DESC& bar_fill_blend =
+      guest_output_paint_pipeline_desc.BlendState.RenderTarget[0];
+  bar_fill_blend.BlendEnable = TRUE;
+  bar_fill_blend.SrcBlend = D3D12_BLEND_BLEND_FACTOR;
+  bar_fill_blend.DestBlend = D3D12_BLEND_ZERO;
+  bar_fill_blend.BlendOp = D3D12_BLEND_OP_ADD;
+  bar_fill_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+  bar_fill_blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+  bar_fill_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  guest_output_paint_pipeline_desc.RTVFormats[0] = kSwapChainFormat;
+  if (FAILED(device->CreateGraphicsPipelineState(&guest_output_paint_pipeline_desc,
+                                                 IID_PPV_ARGS(&bar_fill_composite_pipeline_)))) {
+    REXLOG_WARN("D3D12Presenter: Failed to create the bar fill composite pipeline");
+    bar_fill_downsample_pipeline_.Reset();
   }
 
   // Initialize connection-independent parts of the painting context.
