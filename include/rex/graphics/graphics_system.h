@@ -62,12 +62,35 @@ class GraphicsSystem : public system::IGraphicsSystem {
   X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
                          system::KernelState* kernel_state) override;
   bool has_presentation() const override { return presenter_ != nullptr; }
+  // The pair is published as one word so a reader never sees a width from one
+  // size and a height from another.
   void SetDisplaySurfaceSize(uint32_t width, uint32_t height) override {
-    display_surface_width_ = width;
-    display_surface_height_ = height;
+    display_surface_size_.store((uint64_t(width) << 32) | height, std::memory_order_release);
   }
-  uint32_t display_surface_width() const { return display_surface_width_; }
-  uint32_t display_surface_height() const { return display_surface_height_; }
+  bool GetDisplaySurfaceSize(uint32_t& width, uint32_t& height) const override {
+    const uint64_t size = display_surface_size_.load(std::memory_order_acquire);
+    width = uint32_t(size >> 32);
+    height = uint32_t(size);
+    if (width && height) {
+      return true;
+    }
+    width = 0;
+    height = 0;
+    return false;
+  }
+  uint32_t display_surface_width() const {
+    return uint32_t(display_surface_size_.load(std::memory_order_acquire) >> 32);
+  }
+  uint32_t display_surface_height() const {
+    return uint32_t(display_surface_size_.load(std::memory_order_acquire));
+  }
+
+  bool SetPresentationAspect(uint32_t aspect_x, uint32_t aspect_y) override;
+  bool TakePresentationAspect(system::SwapPresentationAspect& aspect) override;
+  void SetSwapPresentationObserver(system::SwapPresentationObserver observer,
+                                   void* context) override;
+  // Called by the command processor after each decoded swap.
+  void NotifySwapPresentation(const system::SwapPresentationReport& report) override;
   void Shutdown() override;
 
   // May be called from any thread any number of times, even during recovery
@@ -122,8 +145,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   ::rex::ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<::rex::ui::GraphicsProvider> provider_;
   bool provider_supports_presentation_ = false;
-  uint32_t display_surface_width_ = 0;
-  uint32_t display_surface_height_ = 0;
+  std::atomic<uint64_t> display_surface_size_{0};
 
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
@@ -137,6 +159,20 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool paused_ = false;
 
  private:
+  void ClearPendingPresentationAspect();
+
+  // Guest-thread requests waiting for the next swap packet.
+  std::mutex presentation_aspect_mutex_;
+  bool presentation_aspect_pending_ = false;
+  uint32_t presentation_aspect_x_ = 0;
+  uint32_t presentation_aspect_y_ = 0;
+  uint64_t presentation_aspect_sequence_ = 0;
+
+  // Held across the callback so clearing the observer waits out a running one.
+  std::mutex swap_observer_mutex_;
+  system::SwapPresentationObserver swap_observer_ = nullptr;
+  void* swap_observer_context_ = nullptr;
+
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic_flag host_gpu_loss_reported_;

@@ -137,7 +137,10 @@ bool ProcessVdSwap(const memory::Memory& memory, system::IDetachedVideoDelegate*
   dwords[offset++] = gpu_fetch.dword_4;
   dwords[offset++] = gpu_fetch.dword_5;
 
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+  const system::SwapPresentationAspect* presentation = inputs.presentation;
+  const bool has_presentation = presentation && presentation->policy_sequence != 0;
+  dwords[offset++] = xenos::MakePacketType3(
+      xenos::PM4_XE_SWAP, 4 + (has_presentation ? xenos::kSwapAspectTrailerWords : 0));
   dwords[offset++] = xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
 
@@ -145,6 +148,14 @@ bool ProcessVdSwap(const memory::Memory& memory, system::IDetachedVideoDelegate*
   uint32_t height = *inputs.height;
   dwords[offset++] = width;
   dwords[offset++] = height;
+  if (has_presentation) {
+    const bool valid = presentation->override_valid;
+    dwords[offset++] = xenos::kSwapAspectSignature;
+    dwords[offset++] = valid ? presentation->aspect_x : 0;
+    dwords[offset++] = valid ? presentation->aspect_y : 0;
+    dwords[offset++] = uint32_t(presentation->policy_sequence);
+    dwords[offset++] = uint32_t(presentation->policy_sequence >> 32);
+  }
 
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {

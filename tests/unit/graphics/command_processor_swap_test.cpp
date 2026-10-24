@@ -132,6 +132,36 @@ class DecodedCommandProcessor final : public CpuCommandProcessor {
   }
 };
 
+class PresentingCommandProcessor final : public CpuCommandProcessor {
+ public:
+  using CpuCommandProcessor::CpuCommandProcessor;
+  using CpuCommandProcessor::IssueSwap;
+  bool SupportsPresentationAspect() const override { return true; }
+  system::SwapPresentationAspect seen;
+
+ protected:
+  void IssueSwap(uint32_t pointer, uint32_t width, uint32_t height,
+                 const system::SwapPresentationAspect& presentation) override {
+    seen = presentation;
+    ++issue_count;
+    issued = {pointer, width, height};
+    BeginSwapDisplay(presentation, nullptr, 1280, 720);
+    FinishSwapDisplay(true);
+  }
+};
+
+class InstallableGraphicsSystem final : public GraphicsSystem {
+ public:
+  std::string name() const override { return "installable"; }
+  void Install(std::unique_ptr<CommandProcessor> processor) {
+    command_processor_ = std::move(processor);
+  }
+
+ protected:
+  void CreateProvider(bool) override {}
+  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override { return {}; }
+};
+
 class PreparedObserver final : public diagnostic::DrawCaptureFrameInputObserver {
  public:
   bool OnFrameBegin(const diagnostic::DrawCaptureFrameInputSwapView&) override { return true; }
@@ -160,6 +190,26 @@ std::array<uint32_t, 9> SwapPacket(bool predicate = false) {
                                     0xBB,
                                     0xCC,
                                     xenos::MakePacketType2()};
+  for (auto& word : packet) {
+    word = rex::byte_swap(word);
+  }
+  return packet;
+}
+
+// A swap packet with the aspect trailer, followed by a separate packet.
+std::array<uint32_t, 11> AspectSwapPacket(
+    uint32_t trailer_signature = xenos::kSwapAspectSignature) {
+  std::array<uint32_t, 11> packet = {xenos::MakePacketType3(xenos::PM4_XE_SWAP, 9),
+                                     xenos::kSwapSignature,
+                                     0x12340000,
+                                     1280,
+                                     720,
+                                     trailer_signature,
+                                     21,
+                                     9,
+                                     0x00000002,
+                                     0x00000001,
+                                     xenos::MakePacketType2()};
   for (auto& word : packet) {
     word = rex::byte_swap(word);
   }
@@ -434,6 +484,165 @@ TEST_CASE("shared swap decoder skips predicated swaps and defaults to original i
   CHECK(legacy.issue_count == 1);
   CHECK(legacy.counter() == 1);
   CHECK(reader.read_offset() == 8 * sizeof(uint32_t));
+}
+
+TEST_CASE("swap decoder passes the aspect trailer to issue and reports the swap",
+          "[graphics][swap]") {
+  CpuGraphicsSystem system;
+  PresentingCommandProcessor cp(&system);
+  system::SwapPresentationReport report;
+  int reports = 0;
+  struct Capture {
+    system::SwapPresentationReport* report;
+    int* count;
+  } capture{&report, &reports};
+  system.SetSwapPresentationObserver(
+      [](void* context, const system::SwapPresentationReport& swap) {
+        auto* target = static_cast<Capture*>(context);
+        *target->report = swap;
+        ++*target->count;
+      },
+      &capture);
+
+  auto packet = AspectSwapPacket();
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(packet.data()), sizeof(packet));
+  REQUIRE(cp.ExecutePacket(&reader));
+  CHECK(reader.read_offset() == 10 * sizeof(uint32_t));
+  CHECK(cp.issued == std::array<uint32_t, 3>{0x12340000, 1280, 720});
+  CHECK(cp.seen.aspect_x == 21);
+  CHECK(cp.seen.aspect_y == 9);
+  CHECK(cp.seen.policy_sequence == 0x100000002ull);
+  CHECK(cp.seen.override_valid);
+
+  REQUIRE(reports == 1);
+  CHECK(report.request.policy_sequence == 0x100000002ull);
+  CHECK(report.frontbuffer_ptr == 0x12340000);
+  CHECK(report.display_x == 21);
+  CHECK(report.display_y == 9);
+  CHECK_FALSE(report.content_known);
+  CHECK(report.refresh == system::SwapRefreshResult::kOk);
+
+  system.SetSwapPresentationObserver(nullptr, nullptr);
+  reader.set_read_offset(0);
+  REQUIRE(cp.ExecutePacket(&reader));
+  CHECK(reports == 1);
+}
+
+TEST_CASE("swap decoder reports a swap whose backend never reached the presenter",
+          "[graphics][swap]") {
+  CpuGraphicsSystem system;
+  CpuCommandProcessor cp(&system);
+  system::SwapPresentationReport report;
+  report.refresh = system::SwapRefreshResult::kOk;
+  system.SetSwapPresentationObserver(
+      [](void* context, const system::SwapPresentationReport& swap) {
+        *static_cast<system::SwapPresentationReport*>(context) = swap;
+      },
+      &report);
+
+  auto packet = AspectSwapPacket();
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(packet.data()), sizeof(packet));
+  REQUIRE(cp.ExecutePacket(&reader));
+  CHECK(cp.issue_count == 1);
+  CHECK(report.request.policy_sequence == 0x100000002ull);
+  CHECK(report.display_x == 0);
+  CHECK(report.refresh == system::SwapRefreshResult::kSkipped);
+  system.SetSwapPresentationObserver(nullptr, nullptr);
+}
+
+TEST_CASE("swap decoder ignores padding without the aspect trailer signature",
+          "[graphics][swap]") {
+  CpuGraphicsSystem system;
+  PresentingCommandProcessor cp(&system);
+
+  auto wrong_signature = AspectSwapPacket(0x41414141);
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(wrong_signature.data()),
+                            sizeof(wrong_signature));
+  REQUIRE(cp.ExecutePacket(&reader));
+  CHECK(reader.read_offset() == 10 * sizeof(uint32_t));
+  CHECK(cp.seen.policy_sequence == 0);
+  CHECK_FALSE(cp.seen.override_valid);
+
+  auto padded = SwapPacket();
+  memory::RingBuffer padded_reader(reinterpret_cast<uint8_t*>(padded.data()), sizeof(padded));
+  REQUIRE(cp.ExecutePacket(&padded_reader));
+  CHECK(padded_reader.read_offset() == 8 * sizeof(uint32_t));
+  CHECK(cp.seen.policy_sequence == 0);
+}
+
+TEST_CASE("swap decoder skips a packet too short to hold a frontbuffer", "[graphics][swap]") {
+  CpuGraphicsSystem system;
+  PresentingCommandProcessor cp(&system);
+  int reports = 0;
+  system.SetSwapPresentationObserver(
+      [](void* context, const system::SwapPresentationReport&) { ++*static_cast<int*>(context); },
+      &reports);
+
+  for (uint32_t payload_words : {1u, 2u, 3u}) {
+    std::array<uint32_t, 6> packet = {xenos::MakePacketType3(xenos::PM4_XE_SWAP, payload_words),
+                                      xenos::kSwapSignature,
+                                      0x12340000,
+                                      1280,
+                                      720,
+                                      xenos::MakePacketType2()};
+    for (auto& word : packet) {
+      word = rex::byte_swap(word);
+    }
+    memory::RingBuffer reader(reinterpret_cast<uint8_t*>(packet.data()), sizeof(packet));
+    REQUIRE(cp.ExecutePacket(&reader));
+    CHECK(reader.read_offset() == (payload_words + 1) * sizeof(uint32_t));
+  }
+  CHECK(cp.issue_count == 0);
+  CHECK(reports == 0);
+  system.SetSwapPresentationObserver(nullptr, nullptr);
+}
+
+TEST_CASE("an explicit clear trailer carries its sequence without an override",
+          "[graphics][swap]") {
+  CpuGraphicsSystem system;
+  PresentingCommandProcessor cp(&system);
+  auto packet = AspectSwapPacket();
+  packet[6] = 0;
+  packet[7] = 0;
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(packet.data()), sizeof(packet));
+  REQUIRE(cp.ExecutePacket(&reader));
+  CHECK(cp.seen.policy_sequence == 0x100000002ull);
+  CHECK_FALSE(cp.seen.override_valid);
+}
+
+TEST_CASE("presentation aspect requests are validated, one-shot and sequenced",
+          "[graphics][swap]") {
+  InstallableGraphicsSystem system;
+  system.Install(std::make_unique<PresentingCommandProcessor>(&system));
+
+  CHECK_FALSE(system.SetPresentationAspect(7, 0));
+  CHECK_FALSE(system.SetPresentationAspect(0, 3));
+  system::SwapPresentationAspect taken;
+  CHECK_FALSE(system.TakePresentationAspect(taken));
+
+  CHECK(system.SetPresentationAspect(21, 9));
+  REQUIRE(system.TakePresentationAspect(taken));
+  CHECK(taken.aspect_x == 21);
+  CHECK(taken.aspect_y == 9);
+  CHECK(taken.override_valid);
+  CHECK(taken.policy_sequence == 1);
+  CHECK_FALSE(system.TakePresentationAspect(taken));
+  CHECK(taken.policy_sequence == 0);
+
+  CHECK(system.SetPresentationAspect(0, 0));
+  CHECK(system.SetPresentationAspect(32, 9));
+  REQUIRE(system.TakePresentationAspect(taken));
+  CHECK(taken.aspect_x == 32);
+  CHECK(taken.policy_sequence == 3);
+
+  CHECK(system.SetPresentationAspect(0, 0));
+  REQUIRE(system.TakePresentationAspect(taken));
+  CHECK_FALSE(taken.override_valid);
+  CHECK(taken.policy_sequence == 4);
+
+  CHECK(system.SetPresentationAspect(21, 9));
+  system.Shutdown();
+  CHECK_FALSE(system.TakePresentationAspect(taken));
 }
 
 TEST_CASE("prepared callback failure leaves real swap decode and original issue progressing",

@@ -328,6 +328,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
  private:
   friend struct ReXAppTestAccess;
 
+  bool window_minimized_ = false;
+
   std::function<void(PathConfig)> MakeResumeCallback();
   void ShutdownModPlugins();
   void ShutdownOverlays(input::InputSystem* input_system);
@@ -356,6 +358,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnLostFocus(ui::UISetupEvent& e) override;
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
+
+  // Republishes the presented size to the graphics system; a minimized window
+  // or an unknown size is 0x0.
+  void PublishDisplaySurfaceSize(bool minimized);
 
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;

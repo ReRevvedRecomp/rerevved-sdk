@@ -30,6 +30,12 @@ namespace xenos {
 
 constexpr memory::fourcc_t kSwapSignature = memory::make_fourcc("SWAP");
 
+// Optional trailer of the PM4_XE_SWAP payload after the four base words:
+// signature, aspect x, aspect y, then the 64-bit policy sequence as low and
+// high words. A shorter payload, or other words in that position, carries none.
+constexpr memory::fourcc_t kSwapAspectSignature = memory::make_fourcc("ASPX");
+constexpr uint32_t kSwapAspectTrailerWords = 5;
+
 enum class ShaderType : uint32_t {
   kVertex = 0,
   kPixel = 1,

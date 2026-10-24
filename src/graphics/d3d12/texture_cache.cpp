@@ -1512,7 +1512,8 @@ void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2UAV(
 ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                                       xenos::TextureFormat& format_out,
                                                       uint32_t* width_unscaled_out,
-                                                      uint32_t* height_unscaled_out) {
+                                                      uint32_t* height_unscaled_out,
+                                                      SwapContentKey* content_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -1524,6 +1525,11 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
   if (texture == nullptr || !LoadTextureData(*texture)) {
     return nullptr;
   }
+  // Sample the identity right after the upload, generation first: a guest write
+  // after this point bumps the generation, and one racing the sampling leaves the
+  // dirty mask set, so old pixels are never tagged with a newer generation.
+  const SwapContentKey loaded_content = {texture->instance_id(), texture->content_generation()};
+  const bool content_stable = texture->outdated_mask() == 0;
   texture->MarkAsUsed();
   // The swap texture is likely to be used only for the presentation compute
   // shader, and not during emulation, where it'd be NON_PIXEL_SHADER_RESOURCE |
@@ -1551,6 +1557,9 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
     *height_unscaled_out = key.GetHeight();
   }
   format_out = key.format;
+  if (content_out) {
+    *content_out = content_stable ? loaded_content : SwapContentKey{};
+  }
   return texture_resource;
 }
 

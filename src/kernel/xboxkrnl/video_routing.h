@@ -54,6 +54,9 @@ struct VdSwapInputs {
   const rex::be<uint32_t>* color_space;
   const rex::be<uint32_t>* width;
   const rex::be<uint32_t>* height;
+  // Pending presentation aspect to carry in the swap packet; null leaves the
+  // packet bytes unchanged.
+  const system::SwapPresentationAspect* presentation = nullptr;
 };
 
 // Decodes the swap, writes the ring packet and then notifies the delegate.

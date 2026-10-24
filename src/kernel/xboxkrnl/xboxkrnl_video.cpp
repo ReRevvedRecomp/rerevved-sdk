@@ -447,6 +447,14 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   inputs.width = width.host_address();
   inputs.height = height.host_address();
 
+  // The request rides with this swap's packet, not with whichever swap the
+  // GPU thread reaches first.
+  system::SwapPresentationAspect presentation;
+  auto* graphics = REX_KERNEL_STATE()->emulator()->graphics_system();
+  if (graphics && graphics->TakePresentationAspect(presentation)) {
+    inputs.presentation = &presentation;
+  }
+
   auto video_delegate = REX_KERNEL_STATE()->emulator()->detached_video_delegate();
   ProcessVdSwap(*REX_KERNEL_MEMORY(), video_delegate.get(), inputs);
 }

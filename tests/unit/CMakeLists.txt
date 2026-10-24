@@ -9,6 +9,7 @@ add_executable(unit_tests
     ui/window_size_test.cpp
     graphics/draw_capture_mailbox_test.cpp
     graphics/command_processor_swap_test.cpp
+    graphics/swap_presentation_test.cpp
     graphics/prepared_resource_input_test.cpp
     graphics/frame_input_costs_test.cpp
     graphics/frame_input_buffer_versions_test.cpp

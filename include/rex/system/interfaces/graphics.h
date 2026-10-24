@@ -31,6 +31,41 @@ class KernelState;
 
 namespace rex::system {
 
+// Display aspect for one guest swap, snapshotted when the swap command is
+// produced and carried with it to the GPU thread. policy_sequence counts the
+// accepted SetPresentationAspect calls from 1; 0 means the swap carried none.
+// override_valid is false for an explicit clear.
+struct SwapPresentationAspect {
+  uint32_t aspect_x = 0;
+  uint32_t aspect_y = 0;
+  uint64_t policy_sequence = 0;
+  bool override_valid = false;
+};
+
+enum class SwapRefreshResult : uint8_t {
+  kSkipped,  // The swap never reached the presenter.
+  kOk,
+  kFailed,  // The presenter kept the previous image.
+};
+
+// What the GPU thread did with one decoded swap.
+struct SwapPresentationReport {
+  SwapPresentationAspect request;  // As decoded from the swap command.
+  uint32_t frontbuffer_ptr = 0;
+  // Aspect handed to the presenter; 0 when the swap did not reach it.
+  uint32_t display_x = 0;
+  uint32_t display_y = 0;
+  // Identifies the source content; repeated swaps of unchanged content share it.
+  uint64_t content_id = 0;
+  bool content_known = false;
+  bool repeated = false;  // Meaningful when content_known.
+  SwapRefreshResult refresh = SwapRefreshResult::kSkipped;
+};
+
+// Called on the GPU thread after each decoded swap, including skipped and
+// failed ones. It must not call SetSwapPresentationObserver.
+using SwapPresentationObserver = void (*)(void* context, const SwapPresentationReport& report);
+
 class IGraphicsSystem {
  public:
   virtual ~IGraphicsSystem() = default;
@@ -64,6 +99,44 @@ class IGraphicsSystem {
     (void)width;
     (void)height;
   }
+
+  // Physical pixel size last reported through SetDisplaySurfaceSize. Returns
+  // false and zeroes both outputs while the size is unknown or minimized.
+  virtual bool GetDisplaySurfaceSize(uint32_t& width, uint32_t& height) const {
+    width = 0;
+    height = 0;
+    return false;
+  }
+
+  // Requests the display aspect for the next guest swap; call it on the guest
+  // thread immediately before that swap. Both values positive request that
+  // aspect and (0, 0) clears the override. The request is one-shot and rides
+  // with the swap command, so the image keeps its aspect through GPU lag,
+  // repeated swaps and repaints. Exactly one zero is invalid. Returns true
+  // when the backend accepts the request. Returns false for an invalid pair or
+  // unsupported backend, leaving any pending request unchanged.
+  virtual bool SetPresentationAspect(uint32_t aspect_x, uint32_t aspect_y) {
+    (void)aspect_x;
+    (void)aspect_y;
+    return false;
+  }
+
+  // Swap production side of SetPresentationAspect: moves the pending request,
+  // if any, into `aspect` and clears it. Returns whether one was pending.
+  virtual bool TakePresentationAspect(SwapPresentationAspect& aspect) {
+    aspect = {};
+    return false;
+  }
+
+  // Reports every decoded swap to `observer`; nullptr clears it. Returning
+  // from the clear guarantees no callback is running.
+  virtual void SetSwapPresentationObserver(SwapPresentationObserver observer, void* context) {
+    (void)observer;
+    (void)context;
+  }
+
+  // Called by the command processor after each decoded swap.
+  virtual void NotifySwapPresentation(const SwapPresentationReport& report) { (void)report; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

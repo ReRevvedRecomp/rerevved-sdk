@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -222,6 +223,81 @@ TEST_CASE("VdSwap writes identical ring bytes and then notifies the delegate", "
   CHECK(swap.width == kWidth);
   CHECK(swap.height == kHeight);
   CHECK(video_delegate.calls.empty());
+}
+
+TEST_CASE("VdSwap carries a pending presentation aspect in the swap packet", "[kernel][video]") {
+  auto& memory = rex::testing::GetTestMemory();
+
+  system::SwapPresentationAspect presentation;
+  presentation.aspect_x = 21;
+  presentation.aspect_y = 9;
+  presentation.policy_sequence = 0x100000002ull;
+  presentation.override_valid = true;
+
+  SwapFixture plain(kFrontbufferVirtual);
+  REQUIRE(ProcessVdSwap(memory, nullptr, plain.Inputs()));
+  SwapFixture carrying(kFrontbufferVirtual);
+  auto inputs = carrying.Inputs();
+  inputs.presentation = &presentation;
+  REQUIRE(ProcessVdSwap(memory, nullptr, inputs));
+
+  auto word_at = [&](size_t word) {
+    const auto& bytes = carrying.reservation;
+    return (uint32_t(bytes[word * 4]) << 24) | (uint32_t(bytes[word * 4 + 1]) << 16) |
+           (uint32_t(bytes[word * 4 + 2]) << 8) | uint32_t(bytes[word * 4 + 3]);
+  };
+  CHECK(word_at(7) == 0xC0086400);  // Type 3 PM4_XE_SWAP, nine words.
+  CHECK(word_at(8) == 0x53574150);  // 'SWAP'
+  CHECK(word_at(9) == kFrontbufferPhysical);
+  CHECK(word_at(10) == kWidth);
+  CHECK(word_at(11) == kHeight);
+  CHECK(word_at(12) == 0x41535058);  // 'ASPX'
+  CHECK(word_at(13) == 21);
+  CHECK(word_at(14) == 9);
+  CHECK(word_at(15) == 2);
+  CHECK(word_at(16) == 1);
+  for (size_t word = 17; word < 64; ++word) {
+    CHECK(word_at(word) == 0x80000000);
+  }
+  // The fetch registers precede the packet and do not depend on the trailer.
+  CHECK(std::equal(plain.reservation.begin(), plain.reservation.begin() + 7 * 4,
+                   carrying.reservation.begin()));
+}
+
+TEST_CASE("VdSwap encodes explicit clears and omits the trailer without a request",
+          "[kernel][video]") {
+  auto& memory = rex::testing::GetTestMemory();
+
+  system::SwapPresentationAspect clear;
+  clear.aspect_x = 21;
+  clear.aspect_y = 9;
+  clear.policy_sequence = 7;
+  clear.override_valid = false;
+
+  SwapFixture cleared(kFrontbufferVirtual);
+  auto inputs = cleared.Inputs();
+  inputs.presentation = &clear;
+  REQUIRE(ProcessVdSwap(memory, nullptr, inputs));
+  const auto word_at = [&](size_t word) {
+    return (uint32_t(cleared.reservation[word * 4]) << 24) |
+           (uint32_t(cleared.reservation[word * 4 + 1]) << 16) |
+           (uint32_t(cleared.reservation[word * 4 + 2]) << 8) |
+           uint32_t(cleared.reservation[word * 4 + 3]);
+  };
+  CHECK(word_at(12) == 0x41535058);
+  CHECK(word_at(13) == 0);
+  CHECK(word_at(14) == 0);
+  CHECK(word_at(15) == 7);
+
+  // A request without a sequence is no request.
+  system::SwapPresentationAspect none;
+  SwapFixture plain(kFrontbufferVirtual);
+  SwapFixture without(kFrontbufferVirtual);
+  auto none_inputs = without.Inputs();
+  none_inputs.presentation = &none;
+  REQUIRE(ProcessVdSwap(memory, nullptr, plain.Inputs()));
+  REQUIRE(ProcessVdSwap(memory, nullptr, none_inputs));
+  CHECK(without.reservation == plain.reservation);
 }
 
 // Debug builds assert on an unmapped frontbuffer before the safety return.

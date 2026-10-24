@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/swap_presentation.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
@@ -119,11 +120,14 @@ class VulkanTextureCache final : public TextureCache {
   // guest-to-host swizzle requires swapping red and blue (R <- B, B <- R) with
   // green preserved, which is needed by the presentation fallback path on
   // devices without imageViewFormatSwizzle.
+  // content_out, if given, receives the identity of the texture contents, or a
+  // zero instance when they changed while being sampled.
   VkImageView RequestSwapTexture(uint32_t& width_scaled_out, uint32_t& height_scaled_out,
                                  xenos::TextureFormat& format_out,
                                  uint32_t* width_unscaled_out = nullptr,
                                  uint32_t* height_unscaled_out = nullptr,
-                                 bool* swap_source_needs_rb_swap_out = nullptr);
+                                 bool* swap_source_needs_rb_swap_out = nullptr,
+                                 SwapContentKey* content_out = nullptr);
 
   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
                              uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,

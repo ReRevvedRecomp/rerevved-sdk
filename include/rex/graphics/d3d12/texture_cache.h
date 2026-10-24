@@ -26,6 +26,7 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/swap_presentation.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -213,10 +214,13 @@ class D3D12TextureCache final : public TextureCache {
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
   // the description of its SRV. May call LoadTextureData, so the same
   // restrictions (such as about descriptor heap change possibility) apply.
+  // content_out, if given, receives the identity of the texture contents, or a
+  // zero instance when they changed while being sampled.
   ID3D12Resource* RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                      xenos::TextureFormat& format_out,
                                      uint32_t* width_unscaled_out = nullptr,
-                                     uint32_t* height_unscaled_out = nullptr);
+                                     uint32_t* height_unscaled_out = nullptr,
+                                     SwapContentKey* content_out = nullptr);
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;

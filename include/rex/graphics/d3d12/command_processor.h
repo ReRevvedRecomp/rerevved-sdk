@@ -229,6 +229,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
+  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                 const system::SwapPresentationAspect& presentation) override;
+  bool SupportsPresentationAspect() const override { return true; }
 
   void OnPrimaryBufferEnd() override;
 

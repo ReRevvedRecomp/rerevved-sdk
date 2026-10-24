@@ -25,6 +25,7 @@
 
 #include <rex/graphics/xenos_fence_trace.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -1097,6 +1098,13 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  // A swap needs its signature and three frontbuffer words; a shorter packet is
+  // malformed and is skipped whole rather than read past its payload.
+  if (count < 4) {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    return true;
+  }
+
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
     static uint64_t last_frame_tick = 0;
@@ -1123,7 +1131,26 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+
+  // Padding words past the base four carry nothing unless they open the
+  // aspect trailer.
+  system::SwapPresentationAspect presentation;
+  uint32_t extra_words = count - 4;
+  if (extra_words >= xenos::kSwapAspectTrailerWords) {
+    const uint32_t trailer_signature = reader->ReadAndSwap<uint32_t>();
+    const uint32_t aspect_x = reader->ReadAndSwap<uint32_t>();
+    const uint32_t aspect_y = reader->ReadAndSwap<uint32_t>();
+    const uint32_t sequence_low = reader->ReadAndSwap<uint32_t>();
+    const uint32_t sequence_high = reader->ReadAndSwap<uint32_t>();
+    extra_words -= xenos::kSwapAspectTrailerWords;
+    if (trailer_signature == xenos::kSwapAspectSignature) {
+      presentation.aspect_x = aspect_x;
+      presentation.aspect_y = aspect_y;
+      presentation.policy_sequence = (uint64_t(sequence_high) << 32) | sequence_low;
+      presentation.override_valid = aspect_x != 0 && aspect_y != 0;
+    }
+  }
+  reader->AdvanceRead(extra_words * sizeof(uint32_t));
 
   uint64_t correlation_token = 0;
   auto& fence_trace = diagnostic::GetXenosFenceTrace();
@@ -1141,11 +1168,37 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
   current_xenos_fence_trace_token_ = correlation_token;
   OnSwapDecoded(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  swap_report_ = {};
+  swap_report_.request = presentation;
+  swap_report_.frontbuffer_ptr = frontbuffer_ptr;
+  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height, presentation);
+  if (graphics_system_) {
+    graphics_system_->NotifySwapPresentation(swap_report_);
+  }
   current_xenos_fence_trace_token_ = 0;
 
   counter_.fetch_add(1, std::memory_order_release);
   return true;
+}
+
+CommandProcessor::SwapDisplay CommandProcessor::BeginSwapDisplay(
+    const system::SwapPresentationAspect& presentation, const SwapContentKey* content,
+    uint32_t native_x, uint32_t native_y) {
+  swap_display_decision_ = swap_aspect_tracker_.Decide(presentation, content, native_x, native_y);
+  swap_report_.display_x = swap_display_decision_.display_x;
+  swap_report_.display_y = swap_display_decision_.display_y;
+  swap_report_.content_known = swap_display_decision_.content_known;
+  swap_report_.content_id = swap_display_decision_.content_id;
+  swap_report_.repeated = swap_display_decision_.repeated;
+  return {swap_display_decision_.display_x, swap_display_decision_.display_y};
+}
+
+void CommandProcessor::FinishSwapDisplay(bool refresh_succeeded) {
+  swap_report_.refresh =
+      refresh_succeeded ? system::SwapRefreshResult::kOk : system::SwapRefreshResult::kFailed;
+  if (refresh_succeeded) {
+    swap_aspect_tracker_.Commit(swap_display_decision_);
+  }
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,

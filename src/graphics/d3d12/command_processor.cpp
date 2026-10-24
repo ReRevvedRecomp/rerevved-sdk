@@ -2567,6 +2567,12 @@ void D3D12CommandProcessor::OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t wid
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height, {});
+}
+
+void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                      uint32_t frontbuffer_height,
+                                      const system::SwapPresentationAspect& presentation) {
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2651,9 +2657,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   const auto& regs = *register_file_;
   auto fetch = regs.GetTextureFetch(0);
-  ID3D12Resource* swap_texture_resource =
-      texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
-                                         &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
+  SwapContentKey swap_content_key;
+  ID3D12Resource* swap_texture_resource = texture_cache_->RequestSwapTexture(
+      swap_texture_srv_desc, frontbuffer_format, &frontbuffer_width_unscaled,
+      &frontbuffer_height_unscaled, &swap_content_key);
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
     REXGPU_ERROR(
@@ -2814,8 +2821,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   system::X_VIDEO_MODE video_mode;
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-  uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
-  uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  // The decoded request replaces only the display aspect; the guest output and
+  // source dimensions stay those of the swap.
+  const SwapDisplay swap_display =
+      BeginSwapDisplay(presentation, swap_content_key.known() ? &swap_content_key : nullptr,
+                       std::max(uint32_t(1), uint32_t(video_mode.display_width)),
+                       std::max(uint32_t(1), uint32_t(video_mode.display_height)));
+  uint32_t display_width = swap_display.x;
+  uint32_t display_height = swap_display.y;
 
   const bool refresh_succeeded = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
@@ -3126,6 +3139,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         return submission_result;
       });
 
+  FinishSwapDisplay(refresh_succeeded);
   swap_submission_failed |= !refresh_succeeded;
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.

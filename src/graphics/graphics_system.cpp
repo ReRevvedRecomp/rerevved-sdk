@@ -180,7 +180,56 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   return X_STATUS_SUCCESS;
 }
 
+bool GraphicsSystem::SetPresentationAspect(uint32_t aspect_x, uint32_t aspect_y) {
+  if ((aspect_x == 0) != (aspect_y == 0)) {
+    return false;
+  }
+  if (!command_processor_ || !command_processor_->SupportsPresentationAspect()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(presentation_aspect_mutex_);
+  presentation_aspect_pending_ = true;
+  presentation_aspect_x_ = aspect_x;
+  presentation_aspect_y_ = aspect_y;
+  ++presentation_aspect_sequence_;
+  return true;
+}
+
+bool GraphicsSystem::TakePresentationAspect(system::SwapPresentationAspect& aspect) {
+  aspect = {};
+  std::lock_guard<std::mutex> lock(presentation_aspect_mutex_);
+  if (!presentation_aspect_pending_) {
+    return false;
+  }
+  presentation_aspect_pending_ = false;
+  aspect.aspect_x = presentation_aspect_x_;
+  aspect.aspect_y = presentation_aspect_y_;
+  aspect.policy_sequence = presentation_aspect_sequence_;
+  aspect.override_valid = presentation_aspect_x_ != 0 && presentation_aspect_y_ != 0;
+  return true;
+}
+
+void GraphicsSystem::ClearPendingPresentationAspect() {
+  std::lock_guard<std::mutex> lock(presentation_aspect_mutex_);
+  presentation_aspect_pending_ = false;
+}
+
+void GraphicsSystem::SetSwapPresentationObserver(system::SwapPresentationObserver observer,
+                                                 void* context) {
+  std::lock_guard<std::mutex> lock(swap_observer_mutex_);
+  swap_observer_ = observer;
+  swap_observer_context_ = context;
+}
+
+void GraphicsSystem::NotifySwapPresentation(const system::SwapPresentationReport& report) {
+  std::lock_guard<std::mutex> lock(swap_observer_mutex_);
+  if (swap_observer_) {
+    swap_observer_(swap_observer_context_, report);
+  }
+}
+
 void GraphicsSystem::Shutdown() {
+  ClearPendingPresentationAspect();
   if (command_processor_) {
     command_processor_->Shutdown();
     command_processor_.reset();
@@ -374,6 +423,7 @@ bool GraphicsSystem::PauseAndResetGpuWritePointer() {
   if (resume) {
     command_processor_->Pause();
   }
+  ClearPendingPresentationAspect();
   command_processor_->UpdateWritePointer(0);
   return resume;
 }

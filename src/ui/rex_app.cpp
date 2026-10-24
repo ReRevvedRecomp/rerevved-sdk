@@ -803,11 +803,28 @@ bool ReXApp::OnCloseRequested(ui::UIEvent& e) {
   return OnWindowCloseRequested();
 }
 
+void ReXApp::PublishDisplaySurfaceSize(bool minimized) {
+  if (!window_) {
+    return;
+  }
+  // The Runtime owns the graphics system once it is set up.
+  if (auto* graphics_system = runtime_ ? runtime_->graphics_system() : config_.graphics.get()) {
+    uint32_t surface_width = 0;
+    uint32_t surface_height = 0;
+    if (minimized || !window_->GetPresentationPixelSize(surface_width, surface_height)) {
+      surface_width = 0;
+      surface_height = 0;
+    }
+    graphics_system->SetDisplaySurfaceSize(surface_width, surface_height);
+  }
+}
+
 void ReXApp::OnResize(ui::UISetupEvent& e) {
   (void)e;
   if (!window_) {
     return;
   }
+  PublishDisplaySurfaceSize(window_minimized_);
   OnWindowPixelSizeChanged(window_->GetActualPhysicalWidth(), window_->GetActualPhysicalHeight());
   OnWindowResized(window_->GetActualLogicalWidth(), window_->GetActualLogicalHeight());
 }
@@ -837,12 +854,16 @@ void ReXApp::OnLostFocus(ui::UISetupEvent& e) {
 void ReXApp::OnMinimized(ui::UIEvent& e) {
   (void)e;
   audio::SetOutputFocused(false);
+  window_minimized_ = true;
+  PublishDisplaySurfaceSize(true);
   OnWindowMinimized();
 }
 
 void ReXApp::OnRestored(ui::UIEvent& e) {
   (void)e;
   audio::SetOutputFocused(window_ && window_->HasFocus());
+  window_minimized_ = false;
+  PublishDisplaySurfaceSize(false);
   OnWindowRestored();
 }
 

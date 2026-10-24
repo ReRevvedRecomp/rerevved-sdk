@@ -23,6 +23,7 @@
 
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/swap_presentation.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
@@ -134,6 +135,16 @@ class CommandProcessor {
   // for instance).
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
+  // The decoder calls this form. Backends that present the swap override it to
+  // honor the aspect carried with the swap command; the default drops it.
+  virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                         uint32_t frontbuffer_height,
+                         const system::SwapPresentationAspect& presentation) {
+    (void)presentation;
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+  // Whether IssueSwap with a presentation aspect applies it.
+  virtual bool SupportsPresentationAspect() const { return false; }
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
@@ -277,6 +288,18 @@ class CommandProcessor {
   // original issue. Implementations must contain optional preparation failures.
   virtual void OnSwapDecoded(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) {}
 
+  // Backends call these from IssueSwap(..., presentation). BeginSwapDisplay
+  // picks the aspect for the presenter from the request and the source content
+  // (null when unidentified), and FinishSwapDisplay records the refresh result
+  // and commits the choice only when the presenter accepted the image.
+  struct SwapDisplay {
+    uint32_t x = 0;
+    uint32_t y = 0;
+  };
+  SwapDisplay BeginSwapDisplay(const system::SwapPresentationAspect& presentation,
+                               const SwapContentKey* content, uint32_t native_x, uint32_t native_y);
+  void FinishSwapDisplay(bool refresh_succeeded);
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -298,6 +321,10 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   std::atomic<uint32_t> counter_{0};
+
+  SwapAspectTracker swap_aspect_tracker_;
+  SwapAspectTracker::Decision swap_display_decision_;
+  system::SwapPresentationReport swap_report_;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

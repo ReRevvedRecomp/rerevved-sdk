@@ -67,6 +67,39 @@ After device limits apply, the plugin logs
 `Display: guest=WxH scale_requested=<auto|XxY> scale_effective=XxY surface=WxH`,
 and on the first presented frame
 `Display: swap_source=WxH output=x,y,w,h`.
+`IGraphicsSystem::GetDisplaySurfaceSize` returns the last reported surface as one
+coherent pair, or false with both outputs zero while it is unknown or minimized;
+`ReXApp` refreshes it on every window resize.
+
+A title can change the presented aspect per swap without changing the guest
+buffer. `IGraphicsSystem::SetPresentationAspect(x, y)` is called on the guest
+thread immediately before the guest swap: two positive values request that
+display aspect for that swap, `(0, 0)` clears the request, and exactly one zero
+returns false. The request is one-shot. `VdSwap` moves it
+(`TakePresentationAspect`) into a trailer of the `PM4_XE_SWAP` packet (signature
+`ASPX`, aspect x and y, 64-bit sequence of accepted calls counted from 1), so the
+GPU thread reads the aspect of the swap it decodes, not the latest one. A swap
+without a request omits the trailer. New content without an override uses the
+`VdQueryVideoMode` aspect. Both backends' `IssueSwap` replace only the display
+aspect handed to `Presenter::RefreshGuestOutput`; guest-output and source
+dimensions are unchanged. The aspect stays with its image: a swap that repeats
+the previous source texture contents (same texture instance and content
+generation, not merely the same frontbuffer address) keeps that image's aspect,
+and a refresh the presenter rejects leaves the shown image's record unchanged.
+
+`SetSwapPresentationObserver` registers a callback invoked on the GPU thread for
+every decoded swap, including skipped and failed ones, with the decoded request,
+the aspect handed to the presenter, the content identity and the refresh result;
+clearing it waits for a running callback. `SetPresentationAspect` returns true
+when it accepts a valid request and the command processor supports it (D3D12
+and Vulkan).
+
+The request, trailer and observer are part of GPU plugin ABI 5. Build the runtime,
+the Xenos plugin, the installed headers and the title from matching sources;
+the ABI number alone does not establish compatibility. The presenter honors
+the aspect only through its normal fitting, so original-aspect movies
+need `present_letterbox` on and `present_safe_area_x`/`present_safe_area_y` at
+100.
 `input_gamepad_in_background` (default false, hot reload) sets SDL's background
 joystick hint so the SDL input backend keeps reading gamepads while the window
 is unfocused.

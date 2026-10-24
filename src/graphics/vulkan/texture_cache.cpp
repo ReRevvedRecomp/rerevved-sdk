@@ -980,12 +980,10 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
   return sampler_used->second.last_usage_submission;
 }
 
-VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
-                                                   uint32_t& height_scaled_out,
-                                                   xenos::TextureFormat& format_out,
-                                                   uint32_t* width_unscaled_out,
-                                                   uint32_t* height_unscaled_out,
-                                                   bool* swap_source_needs_rb_swap_out) {
+VkImageView VulkanTextureCache::RequestSwapTexture(
+    uint32_t& width_scaled_out, uint32_t& height_scaled_out, xenos::TextureFormat& format_out,
+    uint32_t* width_unscaled_out, uint32_t* height_unscaled_out,
+    bool* swap_source_needs_rb_swap_out, SwapContentKey* content_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -1015,6 +1013,11 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   if (!LoadTextureData(*texture)) {
     return VK_NULL_HANDLE;
   }
+  // Sample the identity right after the upload, generation first: a guest write
+  // after this point bumps the generation, and one racing the sampling leaves the
+  // dirty mask set, so old pixels are never tagged with a newer generation.
+  const SwapContentKey loaded_content = {texture->instance_id(), texture->content_generation()};
+  const bool content_stable = texture->outdated_mask() == 0;
   texture->MarkAsUsed();
   VulkanTexture::Usage old_usage = texture->SetUsage(VulkanTexture::Usage::kSwapSampled);
   if (old_usage != VulkanTexture::Usage::kSwapSampled) {
@@ -1040,6 +1043,9 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   width_scaled_out = key.GetWidth() * (key.scaled_resolve ? draw_resolution_scale_x() : 1);
   height_scaled_out = key.GetHeight() * (key.scaled_resolve ? draw_resolution_scale_y() : 1);
   format_out = key.format;
+  if (content_out) {
+    *content_out = content_stable ? loaded_content : SwapContentKey{};
+  }
   return texture_view;
 }
 
