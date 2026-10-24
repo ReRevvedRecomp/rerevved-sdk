@@ -425,7 +425,13 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
       ImGui::SameLine();
       ImGui::PushID(pair->value->name.c_str());
       ImGui::BeginDisabled(!settings_rows::InlineValueEnabled(*pair, checked));
-      draw_value(*pair->value);
+      if (settings_rows::InlineValueShown(*pair, checked)) {
+        draw_value(*pair->value);
+      } else {
+        char blank[1] = {};
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##v", blank, sizeof(blank), ImGuiInputTextFlags_ReadOnly);
+      }
       // Custom text stays on the label; only default details reach the field.
       if (!tooltip_text && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         RowTooltip(*pair->value, settings_style,

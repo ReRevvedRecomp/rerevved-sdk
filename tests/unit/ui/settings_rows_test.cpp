@@ -433,6 +433,8 @@ TEST_CASE("settings inline value lock follows toggle and its own lifecycle", "[s
   REQUIRE(pairs.size() == 1);
   CHECK(rows::InlineValueEnabled(pairs[0], true));
   CHECK_FALSE(rows::InlineValueEnabled(pairs[0], false));
+  CHECK(rows::InlineValueShown(pairs[0], true));
+  CHECK_FALSE(rows::InlineValueShown(pairs[0], false));
   pairs[0].unlock_when_checked = false;
   CHECK(rows::InlineValueEnabled(pairs[0], false));
   CHECK_FALSE(rows::InlineValueEnabled(pairs[0], true));
@@ -442,6 +444,7 @@ TEST_CASE("settings inline value lock follows toggle and its own lifecycle", "[s
   CHECK(rows::InlineValueEnabled(pairs[0], false));
   registry[1].lifecycle = rex::cvar::Lifecycle::kInitOnly;
   CHECK_FALSE(rows::InlineValueEnabled(pairs[0], false));
+  CHECK(rows::InlineValueShown(pairs[0], false));
 }
 
 TEST_CASE("settings inline pairs ignore invalid or already owned cvars", "[settings]") {

@@ -237,8 +237,14 @@ inline bool IsVisibleRow(const rex::cvar::FlagEntry& entry, const SettingsLayout
          IsVisible(entry, EffectiveAudience(entry, layout), show_advanced, show_developer, layout);
 }
 
+// A value locked by its toggle is not in effect, so its field shows blank
+// rather than a stale or default value; a lifecycle lock still shows it.
+inline bool InlineValueShown(const InlineToggle& pair, bool checked) {
+  return checked == pair.unlock_when_checked;
+}
+
 inline bool InlineValueEnabled(const InlineToggle& pair, bool checked) {
-  return checked == pair.unlock_when_checked &&
+  return InlineValueShown(pair, checked) &&
          pair.value->lifecycle != rex::cvar::Lifecycle::kInitOnly;
 }
 
