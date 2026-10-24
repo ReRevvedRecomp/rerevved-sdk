@@ -82,6 +82,20 @@ if(WIN32 AND REXGLUE_USE_D3D12)
     target_link_libraries(unit_tests PRIVATE d3d12)
 endif()
 
+if(REXGLUE_USE_VULKAN)
+    target_sources(unit_tests PRIVATE
+        graphics/spirv_translator_fetch_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_builder.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_translator.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_translator_memexport.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+    )
+    target_link_libraries(unit_tests PRIVATE Vulkan::Headers glslang::SPIRV glslang)
+endif()
+
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/graphics_system.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/sampler_info.cpp
