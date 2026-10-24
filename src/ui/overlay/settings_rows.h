@@ -348,9 +348,9 @@ inline const char* LifecycleText(rex::cvar::Lifecycle lifecycle) {
     case rex::cvar::Lifecycle::kHotReload:
       return "applies immediately";
     case rex::cvar::Lifecycle::kRequiresRestart:
-      return "applies after restart";
+      return "Applies after restart.";
     case rex::cvar::Lifecycle::kInitOnly:
-      return "set at startup only";
+      return "Set at startup only.";
   }
   return "";
 }
