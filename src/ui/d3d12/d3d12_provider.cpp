@@ -18,6 +18,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+#include <dxgi1_6.h>
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
@@ -250,10 +251,23 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. Without an explicit index, ask for the high-performance
+  // GPU first: plain enumeration starts at the primary display's adapter, which
+  // can be an integrated GPU on a system that also has a discrete one.
+  Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory6;
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
+  }
+  auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** out) {
+    if (dxgi_factory6) {
+      return dxgi_factory6->EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                       IID_PPV_ARGS(out));
+    }
+    return dxgi_factory->EnumAdapters1(index, out);
+  };
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  while (enum_adapter(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
