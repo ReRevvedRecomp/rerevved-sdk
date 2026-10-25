@@ -193,7 +193,24 @@ class Runtime {
   system::ModLoadoutSelection ValidateModLoadout(std::span<const std::string> ids) const;
   system::ModLoadoutApplyResult ApplyModLoadout(std::span<const std::string> ids,
                                                 bool replace_invalid_current = false);
+  // Evaluated on demand: a reason locks loadout changes, nullopt allows them.
+  // Empty reasons and exceptions use the default reason. An empty function clears the provider.
+  // The provider must be cheap and thread-safe: it may run each UI frame or on any applying thread.
+  // While locked, ApplyModLoadout and persisting ApplyModScriptLoadout return kLocked with the
+  // reason, and the manager disables editing. Startup still replays the saved loadout.
+  void SetModLoadoutLockProvider(std::function<std::optional<std::string>()> provider);
+  std::optional<std::string> mod_loadout_lock_reason() const;
   void RescanModCatalog();
+  // UI-thread Lua activation shared by startup dispatch and mod manager saves. Native
+  // payloads retain their active state and require restart when selection changes.
+  system::ModLoadoutApplyResult ApplyModScriptLoadout(std::span<const system::ModPackage> packages,
+                                                      std::span<const std::string> ids,
+                                                      bool persist,
+                                                      bool replace_invalid_current = false);
+  const std::string& active_mod_script_digest() const { return active_mod_script_digest_; }
+  void SetModLoadoutChangedCallback(std::function<void()> callback) {
+    mod_loadout_changed_callback_ = std::move(callback);
+  }
   void MarkModActive(std::string_view id, bool active, std::optional<size_t> order = std::nullopt) {
     mod_catalog_.SetActive(id, active, order);
     if (active) {
@@ -310,6 +327,12 @@ class Runtime {
   bool mod_order_file_exists_ = false;
   bool mod_order_file_invalid_ = false;
   bool restart_required_ = false;
+  mutable std::mutex mod_loadout_lock_mutex_;
+  // Shared so readers copy only the pointer under the mutex and call it outside.
+  std::shared_ptr<const std::function<std::optional<std::string>()>> mod_loadout_lock_provider_;
+  std::string active_mod_script_digest_;
+  std::vector<std::string> active_mod_script_ids_;
+  std::function<void()> mod_loadout_changed_callback_;
   system::AssetOverlayCatalog asset_overlay_catalog_;
   std::vector<system::AssetOverlayPackage> active_asset_overlays_;
   std::vector<std::string> asset_order_ids_;

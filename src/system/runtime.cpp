@@ -349,6 +349,9 @@ void Runtime::Shutdown() {
   mod_loadout_diagnostics_.clear();
   mod_order_file_invalid_ = false;
   restart_required_ = false;
+  active_mod_script_digest_.clear();
+  active_mod_script_ids_.clear();
+  mod_loadout_changed_callback_ = {};
   asset_overlay_catalog_ = {};
   asset_order_file_exists_ = false;
   active_asset_overlays_.clear();
@@ -443,8 +446,51 @@ system::ModLoadoutSelection Runtime::ValidateModLoadout(std::span<const std::str
   return system::ValidateModLoadout(mod_catalog_, ids, user_data_root_ / system::kModOrderFileName);
 }
 
+void Runtime::SetModLoadoutLockProvider(std::function<std::optional<std::string>()> provider) {
+  auto shared =
+      provider
+          ? std::make_shared<const std::function<std::optional<std::string>()>>(std::move(provider))
+          : nullptr;
+  std::lock_guard lock(mod_loadout_lock_mutex_);
+  mod_loadout_lock_provider_ = std::move(shared);
+}
+
+std::optional<std::string> Runtime::mod_loadout_lock_reason() const {
+  constexpr const char* kDefaultReason = "Mod changes are locked.";
+  std::shared_ptr<const std::function<std::optional<std::string>()>> provider;
+  {
+    std::lock_guard lock(mod_loadout_lock_mutex_);
+    provider = mod_loadout_lock_provider_;
+  }
+  if (!provider) {
+    return std::nullopt;
+  }
+  try {
+    auto reason = (*provider)();
+    if (reason && reason->empty()) {
+      *reason = kDefaultReason;
+    }
+    return reason;
+  } catch (...) {
+    return std::string(kDefaultReason);
+  }
+}
+
 system::ModLoadoutApplyResult Runtime::ApplyModLoadout(std::span<const std::string> ids,
                                                        bool replace_invalid_current) {
+  if (mod_script_host_ && mod_script_host_->supports_replacement()) {
+    if (auto reason = mod_loadout_lock_reason()) {
+      return {system::ModLoadoutApplyStatus::kLocked, {{0, std::move(*reason), {}}}};
+    }
+    const auto selection = ValidateModLoadout(ids);
+    if (!selection.IsValid())
+      return {system::ModLoadoutApplyStatus::kInvalidDesired, selection.diagnostics};
+    return ApplyModScriptLoadout(selection.packages, ids, true, replace_invalid_current);
+  }
+  // Evaluated immediately before the write so a lock raised since the caller decided is honored.
+  if (auto reason = mod_loadout_lock_reason()) {
+    return {system::ModLoadoutApplyStatus::kLocked, {{0, std::move(*reason), {}}}};
+  }
   auto result =
       system::ApplyModLoadout(user_data_root_, mod_catalog_, ids, replace_invalid_current);
   if (!result.succeeded()) {
