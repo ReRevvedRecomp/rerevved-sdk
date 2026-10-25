@@ -1354,8 +1354,8 @@ struct Client::Impl {
       }
       auto wait = std::max(
           0us, std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now()));
-      timeval timeout{static_cast<long>(wait.count() / 1000000),
-                      static_cast<long>(wait.count() % 1000000)};
+      timeval timeout{static_cast<decltype(timeval::tv_sec)>(wait.count() / 1000000),
+                      static_cast<decltype(timeval::tv_usec)>(wait.count() % 1000000)};
       fd_set readable;
       FD_ZERO(&readable);
       FD_SET(transport.handle, &readable);
