@@ -75,18 +75,32 @@ bool HasMagic(std::span<const uint8_t> bytes) {
 }
 
 Bytes Encode(const Message& message, const SessionKey& key) {
+  const bool game = message.type == Type::kGameRequest || message.type == Type::kGameReply;
+  const bool requester = std::any_of(message.requester_id.begin(), message.requester_id.end(),
+                                     [](uint8_t byte) { return byte != 0; });
   if (message.data.size() > rex::session_data::kMaxBytes ||
-      (message.type == Type::kRequest && !message.data.empty()) ||
-      (message.type != Type::kRequest && message.type != Type::kReply))
+      (game ? (message.game_generation == 0 || !requester || message.game_attempt == 0)
+            : (message.game_generation != 0 || requester || message.game_attempt != 0)) ||
+      ((message.type == Type::kRequest || message.type == Type::kGameRequest) &&
+       !message.data.empty()) ||
+      (message.type != Type::kRequest && message.type != Type::kReply &&
+       message.type != Type::kGameRequest && message.type != Type::kGameReply))
     return {};
   Bytes out(kMagic.begin(), kMagic.end());
-  out.reserve(kRequestSize + message.data.size());
+  out.reserve((game ? kGameHeaderSize : kHeaderSize) + kMacSize + message.data.size());
   out.push_back(kVersion);
   out.push_back(static_cast<uint8_t>(message.type));
   out.push_back(static_cast<uint8_t>(message.data.size()));
   out.push_back(static_cast<uint8_t>(message.data.size() >> 8));
   out.insert(out.end(), message.session_id.begin(), message.session_id.end());
   out.insert(out.end(), message.nonce.begin(), message.nonce.end());
+  if (game) {
+    for (unsigned shift = 0; shift < 64; shift += 8)
+      out.push_back(static_cast<uint8_t>(message.game_generation >> shift));
+    out.insert(out.end(), message.requester_id.begin(), message.requester_id.end());
+    for (unsigned shift = 0; shift < 64; shift += 8)
+      out.push_back(static_cast<uint8_t>(message.game_attempt >> shift));
+  }
   out.insert(out.end(), message.data.begin(), message.data.end());
   const auto mac = Mac(key, out);
   out.insert(out.end(), mac.begin(), mac.end());
@@ -98,9 +112,13 @@ std::optional<Message> Decode(std::span<const uint8_t> bytes, const SessionKey& 
       bytes[4] != kVersion)
     return std::nullopt;
   const auto type = static_cast<Type>(bytes[5]);
+  const bool game = type == Type::kGameRequest || type == Type::kGameReply;
+  const size_t header = game ? kGameHeaderSize : kHeaderSize;
   const size_t length = bytes[6] | (size_t(bytes[7]) << 8);
-  if ((type != Type::kRequest && type != Type::kReply) || (type == Type::kRequest && length != 0) ||
-      bytes.size() != kRequestSize + length)
+  if ((type != Type::kRequest && type != Type::kReply && type != Type::kGameRequest &&
+       type != Type::kGameReply) ||
+      ((type == Type::kRequest || type == Type::kGameRequest) && length != 0) ||
+      length > rex::session_data::kMaxBytes || bytes.size() != header + kMacSize + length)
     return std::nullopt;
   const auto body = bytes.first(bytes.size() - kMacSize);
   if (!relay::ConstantTimeEqual(Mac(key, body), bytes.last(kMacSize)))
@@ -109,7 +127,19 @@ std::optional<Message> Decode(std::span<const uint8_t> bytes, const SessionKey& 
   message.type = type;
   std::copy_n(bytes.begin() + 8, message.session_id.size(), message.session_id.begin());
   std::copy_n(bytes.begin() + 16, message.nonce.size(), message.nonce.begin());
-  message.data.assign(bytes.begin() + kHeaderSize, bytes.begin() + kHeaderSize + length);
+  if (game) {
+    for (unsigned index = 0; index < 8; ++index) {
+      message.game_generation |= uint64_t{bytes[kHeaderSize + index]} << (index * 8);
+      message.game_attempt |= uint64_t{bytes[kHeaderSize + 24 + index]} << (index * 8);
+    }
+    std::copy_n(bytes.begin() + kHeaderSize + 8, message.requester_id.size(),
+                message.requester_id.begin());
+    if (!message.game_generation || !message.game_attempt ||
+        std::all_of(message.requester_id.begin(), message.requester_id.end(),
+                    [](uint8_t byte) { return byte == 0; }))
+      return std::nullopt;
+  }
+  message.data.assign(bytes.begin() + header, bytes.begin() + header + length);
   return message;
 }
 
@@ -128,12 +158,23 @@ void Core::SetProvider(Provider provider) {
   provider_ = std::move(provider);
 }
 
-void Core::StartGenerationLocked(const SessionInfo& info) {
+void Core::StartGenerationLocked(const SessionInfo& info, bool new_session) {
   ++generation_;
   state_ = State::kNone;
   bytes_.clear();
   info_ = info;
   serving_ = false;
+  host_session_ = false;
+  preparing_game_ = false;
+  game_ready_ = false;
+  game_request_ = false;
+  game_generation_ = 0;
+  requested_game_generation_ = 0;
+  if (new_session) {
+    requester_id_ = {};
+    game_attempt_ = 0;
+    game_requesters_.clear();
+  }
   answered_.clear();
   host_ = {};
   nonces_.clear();
@@ -142,11 +183,21 @@ void Core::StartGenerationLocked(const SessionInfo& info) {
 }
 
 void Core::HostCreated(const SessionInfo& info) {
+  CaptureHost(info, false);
+}
+
+void Core::CaptureHost(const SessionInfo& info, bool for_game, uint64_t expected_generation) {
   Provider provider;
   uint64_t generation = 0;
   {
     std::lock_guard lock(mutex_);
-    StartGenerationLocked(info);
+    if (for_game && (generation_ != expected_generation || game_ready_ || preparing_game_))
+      return;
+    const uint64_t next_game = for_game ? game_generation_ + 1 : 0;
+    StartGenerationLocked(info, !for_game);
+    game_generation_ = next_game;
+    host_session_ = true;
+    preparing_game_ = for_game;
     generation = generation_;
     provider = provider_;
   }
@@ -175,6 +226,8 @@ void Core::HostCreated(const SessionInfo& info) {
     return;
   }
   state_ = State::kHost;
+  preparing_game_ = false;
+  game_ready_ = for_game;
   bytes_ = std::move(bytes);
   serving_ = std::any_of(info.id.begin(), info.id.end(), [](uint8_t b) { return b != 0; });
   REXKRNL_INFO("Host session data: hosting with {} bytes{}", bytes_.size(),
@@ -185,7 +238,26 @@ void Core::HostCreated(const SessionInfo& info) {
 std::optional<Outgoing> Core::JoinCreated(const SessionInfo& info, Route host,
                                           Clock::time_point now) {
   std::lock_guard lock(mutex_);
-  StartGenerationLocked(info);
+  return StartJoinLocked(info, host, now, false);
+}
+
+std::optional<Outgoing> Core::StartJoinLocked(const SessionInfo& info, Route host,
+                                              Clock::time_point now, bool for_game) {
+  const uint64_t previous_game = for_game ? game_generation_ : 0;
+  StartGenerationLocked(info, !for_game);
+  if (for_game) {
+    ++game_attempt_;
+    if (game_attempt_ == 1) {
+      requester_id_ = random_();
+      // The identity is public framing, not secret key material.
+      if (std::all_of(requester_id_.begin(), requester_id_.end(),
+                      [](uint8_t byte) { return byte == 0; }))
+        requester_id_.back() = 1;
+    }
+  }
+  game_generation_ = previous_game;
+  requested_game_generation_ = for_game ? previous_game + 1 : 0;
+  game_request_ = for_game;
   if (host.link == Link::kNone || !host.ipv4) {
     state_ = State::kUnavailable;
     REXKRNL_DEBUG("Host session data: joined without a route to the host");
@@ -198,6 +270,41 @@ std::optional<Outgoing> Core::JoinCreated(const SessionInfo& info, Route host,
   next_retry_ = now + retry_delay_;
   REXKRNL_DEBUG("Host session data: requesting from the host over {}", LinkName(host.link));
   return RequestLocked();
+}
+
+std::optional<Outgoing> Core::BeginGame(Clock::time_point now) {
+  SessionInfo info;
+  uint64_t generation;
+  {
+    std::lock_guard lock(mutex_);
+    if (game_ready_ || preparing_game_ || game_request_ || state_ == State::kNone)
+      return std::nullopt;
+    info = info_;
+    generation = generation_;
+    if (!host_session_)
+      return StartJoinLocked(info, host_, now, true);
+  }
+  CaptureHost(info, true, generation);
+  return std::nullopt;
+}
+
+void Core::EndGame() {
+  std::lock_guard lock(mutex_);
+  ++generation_;
+  if (host_session_ && preparing_game_)
+    state_ = State::kHost;
+  // Retire the requested floor even without a reply. Host requester history
+  // also binds late-join attempts to their actual served generation.
+  if (game_request_)
+    game_generation_ = std::max(game_generation_, requested_game_generation_);
+  preparing_game_ = false;
+  game_ready_ = false;
+  game_request_ = false;
+  // End cancels a joiner's outstanding game request and its replay nonces.
+  nonces_.clear();
+  if (!host_session_ && state_ == State::kPending)
+    state_ = State::kUnavailable;
+  changed_.notify_all();
 }
 
 void Core::Deleted() {
@@ -221,6 +328,31 @@ bool Core::TakeReplyTokenLocked(Clock::time_point now) {
   return true;
 }
 
+bool Core::BindGameRequestLocked(const Message& message, Route from) {
+  auto requester =
+      std::find_if(game_requesters_.begin(), game_requesters_.end(),
+                   [&](const auto& entry) { return entry.id == message.requester_id; });
+  if (requester == game_requesters_.end()) {
+    // An unseen earlier attempt cannot be bound to a host game. Recreating the
+    // session is required rather than guessing after all of its requests were lost.
+    if (message.game_attempt != 1 || game_requesters_.size() == kMaxGameRequesters)
+      return false;
+    game_requesters_.push_back(
+        {message.requester_id, from, message.game_attempt, game_generation_});
+    return true;
+  }
+  if (requester->route != from)
+    return false;
+  if (message.game_attempt == requester->attempt)
+    return game_generation_ == requester->generation;
+  if (message.game_attempt != requester->attempt + 1 ||
+      game_generation_ != requester->generation + 1)
+    return false;
+  requester->attempt = message.game_attempt;
+  requester->generation = game_generation_;
+  return true;
+}
+
 std::optional<Outgoing> Core::Receive(Route from, std::span<const uint8_t> bytes,
                                       Clock::time_point now) {
   if (bytes.size() < kRequestSize || bytes.size() > kMaxMessageSize || !HasMagic(bytes)) {
@@ -235,8 +367,15 @@ std::optional<Outgoing> Core::Receive(Route from, std::span<const uint8_t> bytes
     return std::nullopt;
   }
   auto message = Decode(bytes, info_.key);
-  const Type expected = host ? Type::kRequest : Type::kReply;
-  if (!message || message->type != expected || message->session_id != info_.id ||
+  const bool expected =
+      message && (host ? (message->type == Type::kRequest ||
+                          (message->type == Type::kGameRequest && game_ready_ &&
+                           message->game_generation <= game_generation_))
+                       : message->type == (game_request_ ? Type::kGameReply : Type::kReply));
+  if (!expected || message->session_id != info_.id ||
+      (!host && game_request_ && message->game_generation < requested_game_generation_) ||
+      (!host && game_request_ &&
+       (message->requester_id != requester_id_ || message->game_attempt != game_attempt_)) ||
       (!host && std::find(nonces_.begin(), nonces_.end(), message->nonce) == nonces_.end())) {
     REXKRNL_DEBUG("Host session data: dropped an invalid or unauthenticated message from {}",
                   LinkName(from.link));
@@ -253,6 +392,10 @@ std::optional<Outgoing> Core::Receive(Route from, std::span<const uint8_t> bytes
       REXKRNL_DEBUG("Host session data: dropped a request over the reply rate limit");
       return std::nullopt;
     }
+    if (message->type == Type::kGameRequest && !BindGameRequestLocked(*message, from)) {
+      REXKRNL_DEBUG("Host session data: game attempt has no matching requester/generation history");
+      return std::nullopt;
+    }
     if (answered == answered_.end()) {
       // The oldest nonce goes first; the rate limit still bounds its replays.
       if (answered_.size() == kMaxAnsweredNonces)
@@ -261,10 +404,19 @@ std::optional<Outgoing> Core::Receive(Route from, std::span<const uint8_t> bytes
       answered = answered_.end() - 1;
     }
     ++answered->second;
-    Message reply{Type::kReply, info_.id, message->nonce, bytes_};
+    Message reply{message->type == Type::kGameRequest ? Type::kGameReply : Type::kReply,
+                  info_.id,
+                  message->nonce,
+                  bytes_,
+                  message->type == Type::kGameRequest ? game_generation_ : 0,
+                  message->requester_id,
+                  message->game_attempt};
     return Outgoing{from, Encode(reply, info_.key)};
   }
   state_ = State::kReceived;
+  game_ready_ = game_request_;
+  if (game_request_)
+    game_generation_ = message->game_generation;
   bytes_ = std::move(message->data);
   REXKRNL_INFO("Host session data: received {} bytes from the host", bytes_.size());
   changed_.notify_all();
@@ -298,7 +450,7 @@ std::optional<Clock::time_point> Core::NextDeadline() const {
 
 Status Core::Current() const {
   std::lock_guard lock(mutex_);
-  return {state_, bytes_};
+  return {state_, bytes_, game_ready_};
 }
 
 Status Core::Wait(std::chrono::milliseconds timeout) {
@@ -308,7 +460,7 @@ Status Core::Wait(std::chrono::milliseconds timeout) {
                     [&] { return state_ != State::kPending || generation_ != generation; });
   if (generation_ != generation)
     return {};
-  return {state_, bytes_};
+  return {state_, bytes_, game_ready_};
 }
 
 Outgoing Core::RequestLocked() {
@@ -317,7 +469,14 @@ Outgoing Core::RequestLocked() {
     nonce_uses_ = 0;
   }
   ++nonce_uses_;
-  return {host_, Encode({Type::kRequest, info_.id, nonces_.back(), {}}, info_.key)};
+  return {host_, Encode({game_request_ ? Type::kGameRequest : Type::kRequest,
+                         info_.id,
+                         nonces_.back(),
+                         {},
+                         requested_game_generation_,
+                         game_request_ ? requester_id_ : Nonce{},
+                         game_request_ ? game_attempt_ : 0},
+                        info_.key)};
 }
 
 // LanLink
@@ -566,6 +725,13 @@ void Service::Join(const SessionInfo& info, Route host) {
   Kick();
 }
 
+void Service::BeginGame() {
+  if (auto first = core_.BeginGame(Clock::now())) {
+    Send(*first);
+    Kick();
+  }
+}
+
 void Service::Receive(Route from, std::span<const uint8_t> bytes) {
   if (auto reply = core_.Receive(from, bytes, Clock::now()))
     Send(*reply);
@@ -656,6 +822,14 @@ void OnSessionDelete() {
   ProcessService().core().Deleted();
 }
 
+void OnSessionStart() {
+  ProcessService().BeginGame();
+}
+
+void OnSessionEnd() {
+  ProcessService().core().EndGame();
+}
+
 void OnNetworkCleanup() {
   ProcessService().core().Deleted();
 }
@@ -663,6 +837,10 @@ void OnNetworkCleanup() {
 }  // namespace rex::kernel::xam::host_data
 
 namespace rex::session_data {
+
+void PrepareForGame() {
+  rex::kernel::xam::host_data::OnSessionStart();
+}
 
 void SetHostDataProvider(std::function<std::vector<std::uint8_t>()> provider) {
   rex::kernel::xam::host_data::ProcessService().core().SetProvider(std::move(provider));

@@ -178,6 +178,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XSessionStart({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      host_data::OnSessionStart();
       lan::SystemLinkState().SetSessionState(2);
 
       return X_STATUS_SUCCESS;
@@ -191,6 +192,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
 
       REXKRNL_DEBUG("XSessionEnd({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
+      host_data::OnSessionEnd();
       lan::SystemLinkState().SetSessionState(3);
       if (auto sessions = live::ActiveService())
         sessions->EndSession(live::Clock::now());

@@ -3,8 +3,8 @@
  * @brief       Title data the host of a System Link or Live session serves to joiners
  *
  * A title registers a provider whose bytes describe its host-side settings.
- * When this instance creates a host session, the SDK calls the provider once,
- * freezes the bytes for that session and serves them to every joiner over an
+ * When this instance creates a host session, the SDK captures lobby bytes,
+ * then refreshes them once at PrepareForGame and serves that frozen game over an
  * SDK side channel that the guest never sees. A joiner's create starts a
  * request to the host addressed from the host's XSESSION_INFO; the title reads
  * the result with Current() or waits for it with WaitForHostData(). Messages
@@ -26,12 +26,11 @@ namespace rex::session_data {
 
 inline constexpr std::size_t kMaxBytes = 1024;
 
-// Called (any thread, must be cheap) when this instance creates a host session;
-// the returned bytes (<= kMaxBytes, larger is truncated with a warning) are
-// frozen for that session and served to joiners. A null provider freezes no
-// bytes, and an exception from it is logged as an error and freezes no bytes
-// (the host still reports kHost). The provider is copied and may be replaced
-// at any time; a session already created keeps the bytes it froze.
+// Called at host session creation and game preparation on any thread. Must be cheap.
+// Returned bytes are frozen until the next game and served to joiners. Output above
+// kMaxBytes is truncated with a warning. Null or throwing providers freeze no bytes
+// but still report kHost. Exceptions are logged as errors. The provider is copied and
+// replaceable at any time. A prepared game keeps its frozen bytes until XSessionEnd.
 void SetHostDataProvider(std::function<std::vector<std::uint8_t>()> provider);
 
 enum class State : std::uint8_t {
@@ -45,7 +44,13 @@ enum class State : std::uint8_t {
 struct Status {
   State state = State::kNone;
   std::vector<std::uint8_t> bytes;
+  bool game_ready = false;  // refreshed for this game, never merely lobby data
 };
+
+// Before title gameplay freezes, capture the host's provider or start a joiner's fresh
+// authenticated game-only request. Idempotent until XSessionEnd, also called by XSessionStart.
+// Game policy requires game_ready after WaitForHostData, never Current's lobby bytes.
+void PrepareForGame();
 
 // kNone without a session; kHost with the frozen bytes on the host. Thread-safe
 // and never blocks.
