@@ -17,3 +17,11 @@ jobs:
       platform: win-amd64
       ref: ${{ github.sha }}
       publish_mode: none
+
+  build-linux-amd64:
+    name: Build and test linux-amd64
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: linux-amd64
+      ref: ${{ github.sha }}
+      publish_mode: none

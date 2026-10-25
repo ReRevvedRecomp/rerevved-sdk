@@ -24,7 +24,8 @@ commits on `upstream/main`.
 The `SDK artifacts` workflow accepts a full 40-character commit SHA and builds
 that exact commit for `win-amd64`, `mac-amd64`, `mac-arm64`, `linux-amd64`, and
 `linux-arm64`. The Windows job runs the full test suite; Unix jobs run the
-`^mod_plugin\.` selection with PowerPC tests disabled. Each workflow artifact is
+`^mod_plugin\.` selection with PowerPC tests disabled. Maintained branch checks
+run the `win-amd64` and `linux-amd64` jobs. Each workflow artifact is
 named `rexglue-sdk-<platform>` and contains a
 `rexglue-sdk-<version>-<platform>.zip` archive.
 
