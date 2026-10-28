@@ -66,6 +66,7 @@ add_executable(unit_tests
     graphics/diagnostic_frame_capture_test.cpp
     graphics/xenos_fence_trace_test.cpp
     input/input_assignment_test.cpp
+    input/sdl_input_driver_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
