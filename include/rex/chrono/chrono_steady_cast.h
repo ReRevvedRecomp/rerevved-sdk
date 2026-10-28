@@ -12,6 +12,9 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <ratio>
+#include <type_traits>
 
 #include <rex/chrono/chrono.h>
 
@@ -65,8 +68,36 @@ struct clock_time_conversion<std::chrono::steady_clock, ::rex::chrono::WinSystem
     auto nt_now = WinSystemClock_::now();
     std::atomic_thread_fence(std::memory_order_acq_rel);
 
-    auto delta = t - nt_now;
-    return steady_now + delta;
+    using SignedTicks = std::chrono::duration<int64_t, std::ratio<1, 10000000>>;
+    using steady_duration = steady_clock_::duration;
+    // steady_clock counts nanoseconds, so a delta past about 292 years overflows.
+    // NT times near the FileTime epoch are legal already-due times, so inputs
+    // outside the window saturate at its edge.
+    constexpr auto kMaxDelta = std::chrono::duration_cast<SignedTicks>(std::chrono::years(10));
+    constexpr auto kMaxSteady = std::chrono::duration_cast<steady_duration>(kMaxDelta);
+
+    // Compare in the coarser of the input and 100 ns ticks so neither side
+    // overflows when scaled. Flooring a finer input cannot cross a whole-tick edge.
+    constexpr bool kInputIsCoarse =
+        std::ratio_greater_equal_v<typename Duration::period, typename SignedTicks::period>;
+    using Compare = std::conditional_t<kInputIsCoarse, Duration, SignedTicks>;
+    const auto lower = std::chrono::duration_cast<Compare>((nt_now - kMaxDelta).time_since_epoch());
+    const auto upper = std::chrono::duration_cast<Compare>((nt_now + kMaxDelta).time_since_epoch());
+    const auto input = std::chrono::duration_cast<Compare>(t.time_since_epoch());
+    if (input < lower) {
+      return steady_now - kMaxSteady;
+    }
+    if (input > upper) {
+      return steady_now + kMaxSteady;
+    }
+
+    // Inside the window everything is close to nt_now, so the 100 ns tick count
+    // fits SignedTicks. Keep the sub-tick remainder of a finer input.
+    const auto ticks = std::chrono::duration_cast<SignedTicks>(t.time_since_epoch());
+    const auto remainder = t.time_since_epoch() - std::chrono::duration_cast<Duration>(ticks);
+    return steady_now +
+           std::chrono::duration_cast<steady_duration>(ticks - nt_now.time_since_epoch()) +
+           std::chrono::duration_cast<steady_duration>(remainder);
   }
 };
 
