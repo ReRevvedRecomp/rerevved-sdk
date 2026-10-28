@@ -23,6 +23,13 @@ foreach(_runtime_variant in-tree installed)
     unset(_runtime_staging_dir)
 endforeach()
 
+add_test(NAME cmake.version
+    COMMAND ${CMAKE_COMMAND}
+        -DREX_VERSION=${PROJECT_SOURCE_DIR}/cmake/rex_version.cmake
+        -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/version/version_test.cmake
+)
+
 # PPC instruction tests (requires PPC toolchain)
 if(REXGLUE_BUILD_PPC_TESTS)
     add_subdirectory(ppc)

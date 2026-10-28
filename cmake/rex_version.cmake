@@ -15,7 +15,8 @@
 #   commits; the patch is not pre-incremented, so the next tag lands on it).
 # Untagged commit, floor ahead of the last tag (minor/major bumped on development
 #   but not yet released): holds at MAJOR.MINOR.0-<id> until main catches up.
-#   id is "dev.gSHA" on any branch and "rc.gSHA" on a release/* branch.
+#   id is "dev.gSHA" on any branch and "rc.gSHA" on a release/* branch, where
+#   SHA is the first 8 hex digits of the describe hash.
 #==========================================================
 function(rex_compute_version out_var)
     set(one_value FLOOR_MAJOR FLOOR_MINOR GIT_DESCRIBE_LONG GIT_DESCRIBE_EXACT BRANCH_NAME)
@@ -50,7 +51,9 @@ function(rex_compute_version out_var)
         set(tag_patch 0)
     endif()
     set(commit_count ${CMAKE_MATCH_7})
-    set(short_sha ${CMAKE_MATCH_8})
+    # A fixed length keeps the version independent of how many objects the
+    # clone holds; git's automatic abbreviation grows with the object count.
+    string(SUBSTRING "${CMAKE_MATCH_8}" 0 8 short_sha)
 
     if(ARG_BRANCH_NAME MATCHES "^release/")
         set(id "rc.g${short_sha}")
@@ -136,7 +139,7 @@ function(rex_resolve_version out_var)
     endif()
 
     execute_process(
-        COMMAND ${GIT_EXECUTABLE} describe --tags --long
+        COMMAND ${GIT_EXECUTABLE} describe --tags --long --abbrev=40
             --match "v[0-9]*.[0-9]*"
             --exclude "*-*"
         WORKING_DIRECTORY "${ARG_SOURCE_DIR}"

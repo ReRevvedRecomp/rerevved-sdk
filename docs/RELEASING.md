@@ -48,7 +48,7 @@ commit-count tweak, and stays there until a release on that floor lands and
 the build tracks the released base plus commits and the next release tag lands
 on the very next number. `<commit-count>` is the number of commits since that
 tag (the TWEAK slot). The `-id` trailer identifies the build channel (`dev` or
-`rc`) and the short commit SHA.
+`rc`) and the first eight hex digits of the commit SHA.
 
 Examples:
 
@@ -57,8 +57,8 @@ Examples:
 | `git tag v0.7.5` pushed | `0.7.5` |
 | `git tag v0.7.5.1` pushed (hotfix tweak) | `0.7.5.1` |
 | `development`, 38 commits past `v0.7.4` | `0.7.4.38-dev.gb27f3f74` |
-| `release/0.7.5`, 15 commits past `v0.7.4` | `0.7.4.15-rc.gdeadbee` |
-| Floor bumped to `0.8`, 3 commits past `v0.7.5` | `0.8.0-dev.gdef5678` |
+| `release/0.7.5`, 15 commits past `v0.7.4` | `0.7.4.15-rc.gdeadbeef` |
+| Floor bumped to `0.8`, 3 commits past `v0.7.5` | `0.8.0-dev.gdef56789` |
 
 A version with `-dev` or `-rc` is unstable. Only a version without an `-id`
 trailer is covered by the public API.
