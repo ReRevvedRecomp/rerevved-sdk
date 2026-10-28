@@ -31,14 +31,20 @@ using Nonce = std::array<uint8_t, 16>;
 
 // Message: ASCII RXSD, version:u8, type:u8, data length:u16 LE, session id[8],
 // nonce[16], data[length], then HMAC-SHA256(key, kMacLabel || every preceding
-// byte). A request carries no data; a reply echoes the request's nonce.
+// byte). Requests carry no data. Replies echo the request's nonce. Types 3/4
+// request/serve only a prepared game's snapshot. Old peers reject these types.
+// Game messages add a u64 LE generation after the nonce: minimum requested on
+// a request, actual prepared generation on a reply, included in the HMAC.
+// Then requester id[16] and attempt:u64 LE bind replies and retries to one
+// joined instance's game attempt, including when the earlier reply was lost.
 constexpr std::string_view kMagic = "RXSD";
 constexpr std::string_view kMacLabel = "RXSD-HOSTDATA-v1";
 constexpr uint8_t kVersion = 1;
 constexpr size_t kHeaderSize = 32;
 constexpr size_t kMacSize = 32;
 constexpr size_t kRequestSize = kHeaderSize + kMacSize;
-constexpr size_t kMaxMessageSize = kRequestSize + rex::session_data::kMaxBytes;
+constexpr size_t kGameHeaderSize = kHeaderSize + 8 + 16 + 8;
+constexpr size_t kMaxMessageSize = kGameHeaderSize + kMacSize + rex::session_data::kMaxBytes;
 
 // Native UDP port of the direct-LAN side socket, bound to the selected address.
 constexpr uint16_t kLanPort = 30110;
@@ -48,13 +54,16 @@ constexpr std::chrono::milliseconds kFirstRetry{250};
 constexpr std::chrono::milliseconds kMaxRetry{2000};
 constexpr std::chrono::milliseconds kGiveUp{15000};
 
-enum class Type : uint8_t { kRequest = 1, kReply = 2 };
+enum class Type : uint8_t { kRequest = 1, kReply = 2, kGameRequest = 3, kGameReply = 4 };
 
 struct Message {
   Type type = Type::kRequest;
   SessionId session_id{};
   Nonce nonce{};
   Bytes data;
+  uint64_t game_generation = 0;
+  Nonce requester_id{};
+  uint64_t game_attempt = 0;
 };
 
 // True when `bytes` starts with kMagic; used to route side-channel datagrams.
@@ -90,6 +99,9 @@ struct Outgoing {
 constexpr unsigned kRepliesPerNonce = 3;
 constexpr size_t kMaxAnsweredNonces = 64;
 constexpr double kRepliesPerSecond = 20;
+// Retain every served requester until session deletion to preserve freshness
+// evidence. A full cache refuses new IDs instead of evicting existing records.
+constexpr size_t kMaxGameRequesters = 64;
 
 // Session state shared by the guest thread (create and delete), the transport
 // threads (Receive) and the timer (Due). Every member is thread-safe. Each
@@ -99,7 +111,7 @@ class Core {
   using Provider = std::function<Bytes()>;
   using RandomNonce = std::function<Nonce()>;
 
-  // `random` supplies request nonces; the default uses the OS random source.
+  // `random` supplies requester IDs and request nonces. The default uses the OS random source.
   explicit Core(RandomNonce random = {});
 
   void SetProvider(Provider provider);
@@ -111,6 +123,11 @@ class Core {
   // a link or address enters kUnavailable at once and returns nothing.
   std::optional<Outgoing> JoinCreated(const SessionInfo& info, Route host, Clock::time_point now);
   void Deleted();
+  // Capture once on the host, or start a fresh game-only joiner request.
+  // Until host preparation finishes no game request receives a reply.
+  std::optional<Outgoing> BeginGame(Clock::time_point now);
+  // Invalidate readiness and any in-flight capture/request for the ended game.
+  void EndGame();
 
   // Handles one datagram from `from`; returns the reply to a valid request.
   // Invalid, unexpected, oversized, replayed or rate-limited datagrams are
@@ -128,9 +145,20 @@ class Core {
   rex::session_data::Status Wait(std::chrono::milliseconds timeout);
 
  private:
-  void StartGenerationLocked(const SessionInfo& info);
+  void StartGenerationLocked(const SessionInfo& info, bool new_session = true);
+  void CaptureHost(const SessionInfo& info, bool for_game, uint64_t expected_generation = 0);
+  std::optional<Outgoing> StartJoinLocked(const SessionInfo& info, Route host,
+                                          Clock::time_point now, bool for_game);
   Outgoing RequestLocked();
   bool TakeReplyTokenLocked(Clock::time_point now);
+  bool BindGameRequestLocked(const Message& message, Route from);
+
+  struct GameRequester {
+    Nonce id{};
+    Route route;
+    uint64_t attempt = 0;
+    uint64_t generation = 0;
+  };
 
   RandomNonce random_;
   mutable std::mutex mutex_;
@@ -141,6 +169,15 @@ class Core {
   Bytes bytes_;
   SessionInfo info_{};
   bool serving_ = false;  // host with a session id and key to answer requests for
+  bool host_session_ = false;
+  bool preparing_game_ = false;
+  bool game_ready_ = false;
+  bool game_request_ = false;
+  uint64_t game_generation_ = 0;  // host generation or joiner's accepted/retired floor
+  uint64_t requested_game_generation_ = 0;
+  Nonce requester_id_{};
+  uint64_t game_attempt_ = 0;
+  std::vector<GameRequester> game_requesters_;
   std::vector<std::pair<Nonce, unsigned>> answered_;  // host: replies per request nonce
   double reply_tokens_ = kRepliesPerSecond;           // shared by every session
   std::optional<Clock::time_point> reply_refill_;
@@ -196,6 +233,7 @@ class Service {
   void Created(uint32_t flags, const lan::SessionSnapshot& session);
   // Enters kPending toward `host`, sends the first request and arms the timer.
   void Join(const SessionInfo& info, Route host);
+  void BeginGame();
   void Receive(Route from, std::span<const uint8_t> bytes);
   // Stops and joins the timer and LAN worker and removes the relay handler.
   // Idempotent; afterwards nothing is sent and state queries still work.
@@ -222,6 +260,8 @@ class Service {
 Service& ProcessService();
 void OnSessionCreate(uint32_t flags, const lan::SessionSnapshot& session);
 void OnSessionDelete();
+void OnSessionStart();
+void OnSessionEnd();
 // The last XNetCleanup ends any session data, like a delete.
 void OnNetworkCleanup();
 

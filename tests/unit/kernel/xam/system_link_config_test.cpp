@@ -45,9 +45,7 @@ struct Fixture : StateFixture {
       ("system-link-config-" +
        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   std::filesystem::path path = directory / "fixture";
-  Fixture() {
-    REQUIRE(std::filesystem::create_directory(directory));
-  }
+  Fixture() { REQUIRE(std::filesystem::create_directory(directory)); }
   ~Fixture() {
     std::error_code error;
     std::filesystem::remove(path, error);
@@ -264,6 +262,33 @@ TEST_CASE("system_link snapshot refuses conflicting and incomplete settings",
   CHECK_FALSE(CurrentConfig().error.empty());
   CHECK(Status().starts_with("Relay failed: "));
   CHECK(Status().find(*invite) == std::string::npos);
+}
+
+TEST_CASE("system_link config error starts disconnected", "[system_link][invite]") {
+  Fixture f;
+  f.Set("system_link_invite", "True");
+  f.Freeze();
+  const auto config = CurrentConfig();
+  CHECK(config.error == "not an invite code");
+  CHECK(RelayRequested());
+  relay_link::Client client;
+  lan::LanSystemLinkState lan;
+  RelayStartup startup;
+  // A title may not survive a failed XNetStartup, so each attempt succeeds offline.
+  for (uint32_t references = 1; references <= 2; ++references) {
+    CHECK(startup.Start(config, client, lan) == 0);
+    CHECK(startup.references() == references);
+    CHECK(client.stats().state == relay_link::Association::kFailed);
+    CHECK(RelayStatus(client.stats()) == "Relay failed: not an invite code");
+  }
+  CHECK(Status() == "Relay failed: not an invite code");
+  CHECK_FALSE(lan.enabled());
+  lan::XnAddrSnapshot address{};
+  CHECK(RelayTitleXnAddr(client, lan, &address) == kXnAddrNone);
+  CHECK(address.ipv4 == 0);
+  CHECK_FALSE(startup.Cleanup(client));
+  CHECK(startup.Cleanup(client));
+  CHECK(startup.references() == 0);
 }
 
 TEST_CASE("system_link off snapshot ignores later settings", "[system_link]") {
@@ -639,8 +664,8 @@ TEST_CASE("system_link unreachable relay startup succeeds without a network",
   CHECK(address.ipv4 == client.ipv4());
   CHECK(address.ethernet != fallback);
   const std::array<uint8_t, 2> qos_data{7, 8};
-  CHECK(QosListen(lan, Mode::kRelay, qos_data, 0,
-                  lan::kQosListenEnable | lan::kQosListenSetData) == 0);
+  CHECK(QosListen(lan, Mode::kRelay, qos_data, 0, lan::kQosListenEnable | lan::kQosListenSetData) ==
+        0);
   CHECK(lan.qos_snapshot().enabled);
   CHECK(lan.qos_snapshot().payload.size() == 2);
   const auto sent = client.Send(socket.native_handle(), {0xFFFFFFFFu, 1000}, payload);

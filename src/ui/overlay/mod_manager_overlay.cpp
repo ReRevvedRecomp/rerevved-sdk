@@ -207,6 +207,11 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         const auto* catalog = runtime_ ? &runtime_->mod_catalog() : nullptr;
         const size_t installed_count = catalog ? catalog->packages.size() : 0;
         const size_t staged_count = staged_ids_.size();
+        std::optional<std::string> lock_reason;
+        if (runtime_) {
+          lock_reason = runtime_->mod_loadout_lock_reason();
+        }
+        const bool locked = lock_reason.has_value();
 
         if (editing_load_order_) {
           ImGui::PushStyleColor(ImGuiCol_Text, kHeaderText);
@@ -224,11 +229,16 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
           }
           if (runtime_) {
             ImGui::SameLine();
+            ImGui::BeginDisabled(locked);
             if (OverlayButton(imgui_drawer()->style(), "Edit Order")) {
               editing_load_order_ = true;
             }
+            ImGui::EndDisabled();
           }
           ImGui::Separator();
+        }
+        if (locked) {
+          ImGui::TextColored(kCodeBadge, "%s", lock_reason->c_str());
         }
 
         const auto staged = runtime_ ? runtime_->ValidateModLoadout(staged_ids_)
@@ -240,6 +250,7 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
           if (staged_ids_.empty()) {
             ImGui::TextDisabled("No enabled mods.");
           } else {
+            ImGui::BeginDisabled(locked);
             for (size_t order = 0; order < staged_ids_.size(); ++order) {
               const std::string& id = staged_ids_[order];
               const auto* mod = catalog ? catalog->Find(id) : nullptr;
@@ -287,6 +298,7 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
               ImGui::Separator();
               ImGui::PopID();
             }
+            ImGui::EndDisabled();
           }
           ImGui::EndChild();
         } else {
@@ -356,11 +368,13 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
               ImGui::PushID(("unavailable:" + id).c_str());
               ImGui::TextColored(kCodeBadge, "Unavailable enabled package: %s", id.c_str());
               ImGui::SameLine();
+              ImGui::BeginDisabled(locked);
               if (OverlayButton(imgui_drawer()->style(), "remove", ImVec2(0, 0), true)) {
                 staged_ids_.erase(std::remove(staged_ids_.begin(), staged_ids_.end(), id),
                                   staged_ids_.end());
                 ClearStaleStatus();
               }
+              ImGui::EndDisabled();
               ImGui::PopID();
             }
             if (runtime_) {
@@ -399,7 +413,10 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
                 ImGui::PushID(package_key.c_str());
                 bool is_staged = std::find(staged_ids_.begin(), staged_ids_.end(), package_id) !=
                                  staged_ids_.end();
-                if (ImGui::Checkbox("##enabled", &is_staged)) {
+                ImGui::BeginDisabled(locked);
+                const bool toggled = ImGui::Checkbox("##enabled", &is_staged);
+                ImGui::EndDisabled();
+                if (toggled) {
                   ClearStaleStatus();
                   if (is_staged) {
                     staged_ids_.push_back(package_id);
@@ -453,7 +470,9 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         const bool has_persistable_change =
             runtime_ &&
             (IsDirty() || !runtime_->mod_order_file_exists() || runtime_->mod_order_file_invalid());
-        const bool can_save = has_persistable_change && staged.IsValid();
+        const bool live_apply = runtime_ && runtime_->mod_script_host() &&
+                                runtime_->mod_script_host()->supports_replacement();
+        const bool can_save = (has_persistable_change || live_apply) && staged.IsValid() && !locked;
         if (editing_load_order_) {
           if (OverlayButton(imgui_drawer()->style(), "Done")) {
             editing_load_order_ = false;

@@ -50,6 +50,7 @@ enum class ModLoadoutApplyStatus {
   kInvalidCurrent,
   kInvalidProfile,
   kIoError,
+  kLocked,  // The application locked loadout changes. Diagnostics carry its reason.
 };
 
 struct ModLoadoutApplyResult {

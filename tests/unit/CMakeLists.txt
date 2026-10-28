@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     audio/output_state_test.cpp
+    ui/achievement_groups_test.cpp
     ui/bar_fill_test.cpp
     ui/detached_presentation_test.cpp
     ui/frame_rate_meter_test.cpp
@@ -28,6 +29,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     filesystem/virtual_file_system_test.cpp
+    core/first_seen_test.cpp
     core/hash_test.cpp
     core/sha256_test.cpp
     core/relay_test.cpp
@@ -37,6 +39,7 @@ add_executable(unit_tests
     core/live_invite_test.cpp
     discord/discord_rpc_test.cpp
     core/stream_test.cpp
+    core/system_test.cpp
     core/chrono_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp

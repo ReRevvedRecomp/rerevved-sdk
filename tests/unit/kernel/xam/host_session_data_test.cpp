@@ -65,11 +65,30 @@ TEST_CASE("host session data messages round trip and reject tampering", "[host_d
 
   Message reply{Type::kReply, info.id, request.nonce, Bytes(rex::session_data::kMaxBytes, 0x5a)};
   const auto reply_bytes = Encode(reply, info.key);
-  REQUIRE(reply_bytes.size() == kMaxMessageSize);
+  REQUIRE(reply_bytes.size() == kRequestSize + rex::session_data::kMaxBytes);
   decoded = Decode(reply_bytes, info.key);
   REQUIRE(decoded);
   CHECK(decoded->type == Type::kReply);
   CHECK(decoded->data == reply.data);
+
+  auto game_reply = reply;
+  game_reply.type = Type::kGameReply;
+  game_reply.game_generation = 0x1020304050607080ull;
+  game_reply.requester_id.fill(7);
+  game_reply.game_attempt = 0x8070605040302010ull;
+  const auto game_bytes = Encode(game_reply, info.key);
+  REQUIRE(game_bytes.size() == kMaxMessageSize);
+  const auto decoded_game = Decode(game_bytes, info.key);
+  REQUIRE(decoded_game);
+  CHECK(decoded_game->game_generation == 0x1020304050607080ull);
+  CHECK(decoded_game->requester_id == game_reply.requester_id);
+  CHECK(decoded_game->game_attempt == 0x8070605040302010ull);
+  CHECK(decoded_game->data == reply.data);
+  for (size_t i = 0; i < game_bytes.size(); ++i) {
+    auto tampered = game_bytes;
+    tampered[i] ^= 1;
+    CHECK_FALSE(Decode(tampered, info.key));
+  }
 
   // Any changed byte, a different key, truncation or trailing bytes fail.
   for (size_t i = 0; i < encoded.size(); ++i) {
@@ -89,7 +108,7 @@ TEST_CASE("host session data messages round trip and reject tampering", "[host_d
   CHECK(Encode(reply, info.key).empty());
   request.data = {1};
   CHECK(Encode(request, info.key).empty());
-  CHECK(Encode({static_cast<Type>(3), info.id, {}, {}}, info.key).empty());
+  CHECK(Encode({static_cast<Type>(5), info.id, {}, {}}, info.key).empty());
   CHECK_FALSE(HasMagic(Bytes{'R', 'X', 'Q', 'P'}));
 }
 
@@ -136,6 +155,310 @@ TEST_CASE("host session data freezes and truncates host bytes", "[host_data]") {
   auto request = joiner.JoinCreated({}, kHostRoute, Clock::now());
   REQUIRE(request);
   CHECK_FALSE(core.Receive(kJoinerRoute, request->bytes, Clock::now()));
+}
+
+TEST_CASE("host session data refreshes at game start and freezes until game end", "[host_data]") {
+  const auto info = TestInfo();
+  const auto now = Clock::now();
+  Core host;
+  Bytes selected{1};
+  unsigned captures = 0;
+  host.SetProvider([&] {
+    ++captures;
+    return selected;
+  });
+  host.HostCreated(info);
+  CHECK_FALSE(host.Current().game_ready);
+  uint8_t next_nonce = 0;
+  Core joiner([&] {
+    Nonce nonce{};
+    nonce.fill(++next_nonce);
+    return nonce;
+  });
+  auto lobby_request = joiner.JoinCreated(info, kHostRoute, now);
+  REQUIRE(lobby_request);
+  const auto lobby_reply = host.Receive(kJoinerRoute, lobby_request->bytes, now);
+  REQUIRE(lobby_reply);
+  joiner.Receive(kHostRoute, lobby_reply->bytes, now);
+  CHECK(joiner.Current().bytes == Bytes{1});
+  CHECK_FALSE(joiner.Current().game_ready);
+
+  // A joiner starts first and must not freeze stale lobby bytes.
+  auto game_request = joiner.BeginGame(now);
+  REQUIRE(game_request);
+  CHECK(joiner.Current().state == State::kPending);
+  CHECK(joiner.Current().bytes.empty());
+  CHECK_FALSE(host.Receive(kJoinerRoute, game_request->bytes, now));
+  joiner.Receive(kHostRoute, lobby_reply->bytes, now);
+  CHECK(joiner.Current().state == State::kPending);
+  selected = {2, 3};  // Changed after lobby creation.
+  host.BeginGame(now);
+  CHECK(host.Current().game_ready);
+  CHECK(captures == 2);
+  auto reply = host.Receive(kJoinerRoute, game_request->bytes, now);
+  REQUIRE(reply);
+  auto tampered = reply->bytes;
+  tampered[kHeaderSize] ^= 1;
+  joiner.Receive(kHostRoute, tampered, now);
+  CHECK(joiner.Current().state == State::kPending);
+  joiner.Receive(kHostRoute, reply->bytes, now);
+  const auto running = joiner.Current();
+  CHECK(running.game_ready);
+  CHECK(running.bytes == Bytes{2, 3});
+
+  selected = {4};
+  host.BeginGame(now);
+  CHECK_FALSE(joiner.BeginGame(now));
+  CHECK(captures == 2);
+  CHECK(host.Current().bytes == Bytes{2, 3});
+  joiner.EndGame();
+  CHECK_FALSE(joiner.Current().game_ready);
+  auto next_request = joiner.BeginGame(now);
+  REQUIRE(next_request);
+  // The peer can advance before the host ends the old game. Its request for the next
+  // generation must not receive the snapshot from the game still running.
+  CHECK(host.Current().game_ready);
+  CHECK_FALSE(host.Receive(kJoinerRoute, next_request->bytes, now));
+  host.EndGame();
+  CHECK_FALSE(host.Current().game_ready);
+  CHECK_FALSE(host.Receive(kJoinerRoute, next_request->bytes, now));
+  joiner.Receive(kHostRoute, reply->bytes, now);
+  CHECK(joiner.Current().state == State::kPending);
+  host.BeginGame(now);
+  auto next_reply = host.Receive(kJoinerRoute, next_request->bytes, now);
+  REQUIRE(next_reply);
+  joiner.Receive(kHostRoute, next_reply->bytes, now);
+  CHECK(joiner.Current().game_ready);
+  CHECK(joiner.Current().bytes == Bytes{4});
+  CHECK(captures == 3);
+  CHECK(running.bytes == Bytes{2, 3});  // Previously frozen consumer remains stable.
+
+  // A late join learns the host's actual generation, even if it missed games.
+  Core late(FixedNonce(10));
+  REQUIRE(late.JoinCreated(info, kHostRoute, now));
+  auto late_request = late.BeginGame(now);
+  REQUIRE(late_request);
+  auto late_reply = host.Receive(kJoinerRoute, late_request->bytes, now);
+  REQUIRE(late_reply);
+  late.Receive(kHostRoute, late_reply->bytes, now);
+  CHECK(late.Current().game_ready);
+  CHECK(late.Current().bytes == Bytes{4});
+  late.EndGame();
+  auto future_request = late.BeginGame(now);
+  REQUIRE(future_request);
+  CHECK_FALSE(host.Receive(kJoinerRoute, future_request->bytes, now));
+}
+
+TEST_CASE("host session data retires unanswered game generations", "[host_data]") {
+  for (const bool timeout : {false, true}) {
+    INFO("timeout=" << timeout);
+    const auto info = TestInfo();
+    const auto now = Clock::now();
+    Core host;
+    host.SetProvider(Returns({1}));
+    host.HostCreated(info);
+    host.BeginGame(now);
+    Core joiner(FixedNonce(9));
+    REQUIRE(joiner.JoinCreated(info, kHostRoute, now));
+    auto first_request = joiner.BeginGame(now);
+    REQUIRE(first_request);
+    auto decoded_first = Decode(first_request->bytes, info.key);
+    REQUIRE(decoded_first);
+    CHECK(decoded_first->game_generation == 1);
+    CHECK_FALSE(joiner.BeginGame(now));
+    auto retry = joiner.Due(now + kFirstRetry);
+    REQUIRE(retry);
+    const auto decoded_retry = Decode(retry->bytes, info.key);
+    REQUIRE(decoded_retry);
+    CHECK(decoded_retry->game_generation == 1);
+    // The host prepared game 1, but its reply never reached the joiner.
+    REQUIRE(host.Receive(kJoinerRoute, retry->bytes, now));
+    if (timeout) {
+      CHECK_FALSE(joiner.Due(now + kGiveUp));
+      CHECK(joiner.Current().state == State::kUnavailable);
+      CHECK_FALSE(joiner.BeginGame(now + kGiveUp));
+    }
+    joiner.EndGame();
+    joiner.EndGame();  // Duplicate lifecycle end must not retire another game.
+    const auto next_time = now + kGiveUp;
+    auto next_request = joiner.BeginGame(next_time);
+    REQUIRE(next_request);
+    const auto decoded_next = Decode(next_request->bytes, info.key);
+    REQUIRE(decoded_next);
+    CHECK(decoded_next->game_generation == 2);
+    CHECK_FALSE(joiner.BeginGame(next_time));
+    CHECK_FALSE(host.Receive(kJoinerRoute, next_request->bytes, next_time));
+    // Even a correctly authenticated reply using the current nonce cannot
+    // satisfy this attempt with the prior game's generation.
+    Message stale{
+        Type::kGameReply,          info.id, decoded_next->nonce, {1}, 1, decoded_next->requester_id,
+        decoded_next->game_attempt};
+    joiner.Receive(kHostRoute, Encode(stale, info.key), next_time);
+    CHECK(joiner.Current().state == State::kPending);
+    CHECK_FALSE(joiner.Current().game_ready);
+    host.EndGame();
+    host.SetProvider(Returns({2}));
+    host.BeginGame(next_time);
+    auto fresh_reply = host.Receive(kJoinerRoute, next_request->bytes, next_time);
+    REQUIRE(fresh_reply);
+    joiner.Receive(kHostRoute, fresh_reply->bytes, next_time);
+    CHECK(joiner.Current().game_ready);
+    CHECK(joiner.Current().bytes == Bytes{2});
+  }
+}
+
+TEST_CASE("host session data binds a late joiner's lost reply to its game attempt", "[host_data]") {
+  const auto info = TestInfo();
+  const auto now = Clock::now();
+  Core host;
+  host.SetProvider(Returns({5}));
+  host.HostCreated(info);
+  for (unsigned game = 1; game <= 5; ++game) {
+    host.BeginGame(now);
+    if (game != 5)
+      host.EndGame();
+  }
+  Core joiner(FixedNonce(11));
+  REQUIRE(joiner.JoinCreated(info, kHostRoute, now));
+  const auto first_request = joiner.BeginGame(now);
+  REQUIRE(first_request);
+  const auto lost_reply = host.Receive(kJoinerRoute, first_request->bytes, now);
+  REQUIRE(lost_reply);
+  const auto decoded_lost = Decode(lost_reply->bytes, info.key);
+  REQUIRE(decoded_lost);
+  CHECK(decoded_lost->game_generation == 5);
+  CHECK(decoded_lost->game_attempt == 1);
+  const auto retry = joiner.Due(now + kFirstRetry);
+  REQUIRE(retry);
+  REQUIRE(host.Receive(kJoinerRoute, retry->bytes, now));
+  joiner.EndGame();  // No reply ever reached this late joiner.
+  const auto next_request = joiner.BeginGame(now);
+  REQUIRE(next_request);
+  const auto decoded_next = Decode(next_request->bytes, info.key);
+  REQUIRE(decoded_next);
+  CHECK(decoded_next->game_generation == 2);
+  CHECK(decoded_next->game_attempt == 2);
+  CHECK(decoded_next->requester_id == decoded_lost->requester_id);
+  CHECK_FALSE(host.Receive(kJoinerRoute, next_request->bytes, now));
+  // A delayed reply from attempt 1 uses the same injected nonce, but cannot
+  // satisfy attempt 2 because the authenticated attempt ordinal differs.
+  joiner.Receive(kHostRoute, lost_reply->bytes, now);
+  CHECK(joiner.Current().state == State::kPending);
+  host.EndGame();
+  host.SetProvider(Returns({6}));
+  host.BeginGame(now);
+  CHECK_FALSE(host.Receive(kJoinerRoute, first_request->bytes, now));
+  auto wrong_route = kJoinerRoute;
+  ++wrong_route.ipv4;
+  CHECK_FALSE(host.Receive(wrong_route, next_request->bytes, now));
+  const auto fresh_reply = host.Receive(kJoinerRoute, next_request->bytes, now);
+  REQUIRE(fresh_reply);
+  auto different_requester = Decode(fresh_reply->bytes, info.key);
+  REQUIRE(different_requester);
+  different_requester->requester_id[0] ^= 1;
+  joiner.Receive(kHostRoute, Encode(*different_requester, info.key), now);
+  CHECK(joiner.Current().state == State::kPending);
+  joiner.Receive(kHostRoute, fresh_reply->bytes, now);
+  CHECK(joiner.Current().game_ready);
+  CHECK(joiner.Current().bytes == Bytes{6});
+  CHECK_FALSE(joiner.BeginGame(now));
+  joiner.EndGame();
+  const auto third_request = joiner.BeginGame(now);
+  REQUIRE(third_request);
+  CHECK_FALSE(host.Receive(kJoinerRoute, third_request->bytes, now));
+  host.EndGame();
+  host.SetProvider(Returns({7}));
+  host.BeginGame(now);
+  const auto third_retry = joiner.Due(now + kFirstRetry);
+  REQUIRE(third_retry);
+  const auto third_reply = host.Receive(kJoinerRoute, third_retry->bytes, now);
+  REQUIRE(third_reply);
+  joiner.Receive(kHostRoute, third_reply->bytes, now);
+  CHECK(joiner.Current().bytes == Bytes{7});
+}
+
+TEST_CASE("host session data refuses attempts whose earlier requests never arrived",
+          "[host_data]") {
+  const auto info = TestInfo();
+  const auto now = Clock::now();
+  Core host;
+  host.HostCreated(info);
+  host.BeginGame(now);
+  Core joiner(FixedNonce(12));
+  REQUIRE(joiner.JoinCreated(info, kHostRoute, now));
+  REQUIRE(joiner.BeginGame(now));  // Discard every request from attempt 1.
+  joiner.EndGame();
+  const auto request = joiner.BeginGame(now);
+  REQUIRE(request);
+  const auto decoded = Decode(request->bytes, info.key);
+  REQUIRE(decoded);
+  CHECK(decoded->game_attempt == 2);
+  CHECK_FALSE(host.Receive(kJoinerRoute, request->bytes, now));
+  host.EndGame();
+  host.BeginGame(now);
+  const auto retry = joiner.Due(now + kFirstRetry);
+  REQUIRE(retry);
+  CHECK_FALSE(host.Receive(kJoinerRoute, retry->bytes, now));
+  CHECK_FALSE(joiner.Due(now + kGiveUp));
+  CHECK(joiner.Current().state == State::kUnavailable);
+  CHECK_FALSE(joiner.Current().game_ready);
+}
+
+TEST_CASE("host session data retains bounded requester history until session deletion",
+          "[host_data]") {
+  const auto info = TestInfo();
+  const auto start = Clock::now();
+  Core host;
+  host.HostCreated(info);
+  host.BeginGame(start);
+  Message request{Type::kGameRequest, info.id, {}, {}, 1, {}, 1};
+  auto now = start;
+  for (size_t index = 1; index <= kMaxGameRequesters; ++index) {
+    request.nonce.fill(static_cast<uint8_t>(index));
+    request.requester_id.fill(static_cast<uint8_t>(index));
+    now += 1s;
+    REQUIRE(host.Receive(kJoinerRoute, Encode(request, info.key), now));
+  }
+  request.nonce.fill(100);
+  request.requester_id.fill(100);
+  CHECK_FALSE(host.Receive(kJoinerRoute, Encode(request, info.key), now));
+  request.requester_id.fill(1);
+  REQUIRE(host.Receive(kJoinerRoute, Encode(request, info.key), now));
+  host.EndGame();
+  host.BeginGame(now);
+  CHECK_FALSE(host.Receive(kJoinerRoute, Encode(request, info.key),
+                           now));  // Old attempt cannot take a new game.
+  request.game_generation = 2;
+  request.game_attempt = 3;
+  CHECK_FALSE(
+      host.Receive(kJoinerRoute, Encode(request, info.key), now));  // No attempt 2 was served.
+  request.game_attempt = 2;
+  REQUIRE(host.Receive(kJoinerRoute, Encode(request, info.key), now));
+  request.requester_id.fill(100);
+  request.game_attempt = 1;
+  CHECK_FALSE(host.Receive(kJoinerRoute, Encode(request, info.key),
+                           now));  // Refresh did not evict history.
+  host.Deleted();
+  host.HostCreated(info);
+  host.BeginGame(now);
+  request.game_generation = 1;
+  REQUIRE(host.Receive(kJoinerRoute, Encode(request, info.key), now));
+}
+
+TEST_CASE("host session data discards game capture replaced by session end", "[host_data]") {
+  Core host;
+  host.HostCreated(TestInfo());
+  host.SetProvider([&] {
+    host.EndGame();
+    return Bytes{9};
+  });
+  host.BeginGame(Clock::now());
+  CHECK_FALSE(host.Current().game_ready);
+  CHECK(host.Current().bytes.empty());
+  host.SetProvider(Returns({7}));
+  host.BeginGame(Clock::now());
+  CHECK(host.Current().game_ready);
+  CHECK(host.Current().bytes == Bytes{7});
 }
 
 TEST_CASE("host session data moves a joiner from pending to received", "[host_data]") {

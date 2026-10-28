@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -107,6 +108,14 @@ struct ModScriptPublishResult {
   ModScriptStage stage = ModScriptStage::kSchema;
   std::string message;
 };
+// Prepared replacement on the UI thread owns validation, storage, and publication locks.
+// Commit cannot fail or allocate. Destroying it without Commit leaves rules intact.
+class ModScriptReplacement {
+ public:
+  virtual ~ModScriptReplacement() = default;
+  virtual void Commit() noexcept = 0;
+};
+
 class IModScriptHost {
  public:
   virtual ~IModScriptHost() = default;
@@ -114,6 +123,14 @@ class IModScriptHost {
   // Validate and atomically publish the whole bundle. After committing, return
   // success without allocating. Descriptors remain immutable after registration.
   virtual ModScriptPublishResult Publish(const ModScriptPublishRequest& request) noexcept = 0;
+  // Replaces exactly this host's prior Lua-owned loadout, including removals.
+  // Empty requests unload all. Hosts default to publication only at startup.
+  virtual bool supports_replacement() const noexcept { return false; }
+  virtual std::unique_ptr<ModScriptReplacement> PrepareReplacement(
+      std::span<const ModScriptPublishRequest>, ModScriptPublishResult& result) noexcept {
+    result.stage = ModScriptStage::kSupport;
+    return nullptr;
+  }
 };
 
 struct ModPackage;

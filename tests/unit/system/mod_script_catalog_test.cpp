@@ -6,6 +6,9 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <optional>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 
 using namespace rex::system;
@@ -27,6 +30,22 @@ struct PackageTree {
     REXCVAR_SET(mods_data_root, previous_root);
     std::error_code error;
     std::filesystem::remove_all(root, error);
+  }
+  void WriteNative(std::string_view id) {
+    const auto package = root / id;
+    std::filesystem::create_directories(package);
+    std::ofstream(package / "mod.toml")
+        << "manifest_version=1\n[mod]\nid='" << id
+        << "'\nname='Native'\nversion='1.0'\ncode='native'\nplugin_abi=1\n";
+    for (const auto platform :
+         {"windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-x64", "macos-arm64"}) {
+      const auto path = package / "code" / platform;
+      std::filesystem::create_directories(path);
+      for (const auto filename :
+           {"native.dll", "natived.dll", "nativerd.dll", "libnative.so", "libnatived.so",
+            "libnativerd.so", "libnative.dylib", "libnatived.dylib", "libnativerd.dylib"})
+        std::ofstream(path / filename) << "fixture";
+    }
   }
   void Write(std::string_view id,
              std::string_view payload =
@@ -293,4 +312,336 @@ TEST_CASE("Lua dispatch reports missing host without running source", "[mod_scri
                     [](const auto&) { FAIL("unexpected native callback"); });
   REQUIRE(Message(*runtime.mod_catalog().Find("unhosted"), "support: main.lua: no script host"));
   REQUIRE(runtime.active_mod_states().empty());
+}
+
+namespace {
+struct ReplacementHost : IModScriptHost {
+  std::vector<std::string> active;
+  bool reject = false;
+  size_t commits = 0;
+  std::function<void()> on_prepare;
+  std::span<const ModScriptContract> contracts() const override { return kContracts; }
+  bool supports_replacement() const noexcept override { return true; }
+  ModScriptPublishResult Publish(const ModScriptPublishRequest&) noexcept override { return {}; }
+  struct Replacement final : ModScriptReplacement {
+    ReplacementHost& host;
+    std::vector<std::string> next;
+    explicit Replacement(ReplacementHost& host) : host(host) {}
+    void Commit() noexcept override {
+      host.active.swap(next);
+      ++host.commits;
+    }
+  };
+  std::unique_ptr<ModScriptReplacement> PrepareReplacement(
+      std::span<const ModScriptPublishRequest> requests,
+      ModScriptPublishResult& result) noexcept override {
+    if (on_prepare)
+      on_prepare();
+    result = {false, ModScriptStage::kPublish, "fixture rejection"};
+    if (reject)
+      return nullptr;
+    try {
+      auto replacement = std::make_unique<Replacement>(*this);
+      for (const auto& request : requests)
+        replacement->next.emplace_back(request.package_id);
+      result = {true};
+      return replacement;
+    } catch (...) {
+      return nullptr;
+    }
+  }
+};
+}  // namespace
+
+TEST_CASE("F2 Apply replaces Lua active truth and caches canonical content", "[mod_script]") {
+  PackageTree tree;
+  tree.Write("first");
+  tree.Write("second");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  std::vector<std::string> desired{"first", "second"};
+  size_t notifications = 0;
+  bool observed_committed = true;
+  runtime.SetModLoadoutChangedCallback([&] {
+    ++notifications;
+    observed_committed &= host->active.size() == runtime.active_mod_states().size();
+  });
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(host->active == desired);
+  REQUIRE(runtime.mod_catalog().Find("first")->active);
+  REQUIRE(runtime.mod_catalog().Find("second")->active_order == 1);
+  REQUIRE_FALSE(runtime.restart_required());
+  const auto digest = runtime.active_mod_script_digest();
+  REQUIRE(digest.size() == 64);
+  // Source formatting does not change the canonical decoded value.
+  std::ofstream(tree.root / "first/main.lua") << "-- same value\nreturn { answer = 42 }";
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(runtime.active_mod_script_digest() == digest);
+  std::ofstream(tree.root / "first/main.lua") << "return {answer=43}";
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(runtime.active_mod_script_digest() != digest);
+  const auto edited = runtime.active_mod_script_digest();
+  std::reverse(desired.begin(), desired.end());
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(host->active == desired);
+  REQUIRE(runtime.mod_catalog().Find("first")->active_order == 1);
+  REQUIRE(runtime.active_mod_script_digest() != edited);
+  REQUIRE(runtime.ApplyModLoadout({}).succeeded());
+  REQUIRE(host->active.empty());
+  REQUIRE(runtime.active_mod_states().empty());
+  REQUIRE(runtime.active_mods_info().empty());
+  REQUIRE_FALSE(runtime.mod_catalog().Find("first")->active);
+  const auto empty = runtime.active_mod_script_digest();
+  REQUIRE(runtime.ApplyModLoadout({}).succeeded());
+  REQUIRE(runtime.active_mod_script_digest() == empty);
+  REQUIRE(notifications == 6);
+  REQUIRE(observed_committed);
+}
+
+TEST_CASE("F2 Apply rejects scripts and publication without changing active or saved loadout",
+          "[mod_script]") {
+  PackageTree tree;
+  tree.Write("first");
+  tree.Write("second");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  const std::vector<std::string> initial{"first"};
+  REQUIRE(runtime.ApplyModLoadout(initial).succeeded());
+  const auto digest = runtime.active_mod_script_digest();
+  size_t notifications = 0;
+  runtime.SetModLoadoutChangedCallback([&] { ++notifications; });
+  const std::vector<std::string> next{"second"};
+  std::ofstream(tree.root / "second/main.lua") << "return {";
+  REQUIRE_FALSE(runtime.ApplyModLoadout(next).succeeded());
+  REQUIRE(host->active == initial);
+  REQUIRE(runtime.active_mod_script_digest() == digest);
+  REQUIRE(runtime.mod_catalog().Find("first")->active);
+  REQUIRE(runtime.mod_order_ids() == initial);
+  REQUIRE(ReadModLoadout(tree.root / "profile").entries.front().id == "first");
+  std::ofstream(tree.root / "second/main.lua") << "return {answer=42}";
+  host->reject = true;
+  REQUIRE_FALSE(runtime.ApplyModLoadout(next).succeeded());
+  REQUIRE(host->active == initial);
+  REQUIRE(runtime.mod_catalog().Find("first")->active);
+  REQUIRE_FALSE(runtime.mod_catalog().Find("second")->active);
+  REQUIRE(runtime.active_mod_script_digest() == digest);
+  REQUIRE(ReadModLoadout(tree.root / "profile").entries.front().id == "first");
+  host->reject = false;
+  // Persistence failure cancels an already prepared title replacement.
+  std::filesystem::create_directory(tree.root / "profile/.mod_order.txt.tmp");
+  REQUIRE_FALSE(runtime.ApplyModLoadout(next).succeeded());
+  REQUIRE(host->active == initial);
+  REQUIRE(runtime.mod_order_ids() == initial);
+  REQUIRE(runtime.active_mod_script_digest() == digest);
+  REQUIRE(notifications == 0);
+  REQUIRE(host->commits == 1);
+}
+
+TEST_CASE("Startup uses the same atomic Lua replacement before F2 unload", "[mod_script]") {
+  PackageTree tree;
+  tree.Write("first");
+  tree.Write("second");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  const auto catalog = Discover(tree);
+  DispatchModLaunch(runtime, catalog.packages,
+                    [](const auto&) { FAIL("unexpected native callback"); });
+  REQUIRE(host->commits == 1);
+  REQUIRE(runtime.active_mod_states().size() == 2);
+  REQUIRE(runtime.active_mod_script_digest().size() == 64);
+  REQUIRE_FALSE(std::filesystem::exists(tree.root / "profile/mod_order.txt"));
+  REQUIRE(runtime.ApplyModLoadout({}).succeeded());
+  REQUIRE(host->active.empty());
+  REQUIRE(runtime.active_mod_states().empty());
+}
+
+TEST_CASE("Lua replacement preserves running native packages and reports restart", "[mod_script]") {
+  PackageTree tree;
+  tree.WriteNative("native");
+  tree.Write("first");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  const std::vector<std::string> initial{"native", "first"};
+  const auto selection = runtime.ValidateModLoadout(initial);
+  for (const auto& diagnostic : selection.diagnostics)
+    UNSCOPED_INFO(diagnostic.message);
+  REQUIRE(selection.IsValid());
+  DispatchModLaunch(runtime, selection.packages,
+                    [&](const auto& package) { runtime.MarkModActive(package.id, true, 0); });
+  REQUIRE(runtime.mod_catalog().Find("native")->active);
+  const std::vector<std::string> luaOnly{"first"};
+  REQUIRE(runtime.ApplyModLoadout(luaOnly).succeeded());
+  REQUIRE(runtime.restart_required());
+  REQUIRE(runtime.mod_catalog().Find("native")->active);
+  REQUIRE(runtime.active_mods_info().size() == 2);
+  REQUIRE(runtime.ApplyModLoadout({}).succeeded());
+  REQUIRE(runtime.mod_catalog().Find("native")->active);
+  REQUIRE_FALSE(runtime.mod_catalog().Find("first")->active);
+  REQUIRE(runtime.active_mod_states().size() == 1);
+  REQUIRE(runtime.active_mod_states().front().id == "native");
+  REQUIRE(host->active.empty());
+}
+
+TEST_CASE("App lock refuses live loadout changes until unlocked",
+          "[mod_script][mod_loadout_lock]") {
+  PackageTree tree;
+  tree.Write("first");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  const std::vector<std::string> desired{"first"};
+  REQUIRE_FALSE(runtime.mod_loadout_lock_reason());
+
+  std::optional<std::string> lock = "Locked during a match.";
+  runtime.SetModLoadoutLockProvider([&] { return lock; });
+  REQUIRE(runtime.mod_loadout_lock_reason() == "Locked during a match.");
+  const auto refused = runtime.ApplyModLoadout(desired);
+  REQUIRE(refused.status == ModLoadoutApplyStatus::kLocked);
+  REQUIRE(refused.diagnostics.size() == 1);
+  REQUIRE(refused.diagnostics.front().message == "Locked during a match.");
+  const auto selection = runtime.ValidateModLoadout(desired);
+  REQUIRE(runtime.ApplyModScriptLoadout(selection.packages, desired, true).status ==
+          ModLoadoutApplyStatus::kLocked);
+  REQUIRE(host->commits == 0);
+  REQUIRE(host->active.empty());
+  REQUIRE(runtime.mod_order_ids().empty());
+  REQUIRE_FALSE(std::filesystem::exists(tree.root / "profile/mod_order.txt"));
+
+  // Startup dispatch replays the saved loadout and is not a change.
+  REQUIRE(runtime.ApplyModScriptLoadout(selection.packages, {}, false).succeeded());
+  REQUIRE(host->commits == 1);
+
+  lock.reset();
+  REQUIRE_FALSE(runtime.mod_loadout_lock_reason());
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(host->active == desired);
+  REQUIRE(ReadModLoadout(tree.root / "profile").entries.front().id == "first");
+
+  runtime.SetModLoadoutLockProvider({});
+  REQUIRE_FALSE(runtime.mod_loadout_lock_reason());
+}
+
+TEST_CASE("App lock provider normalizes empty reasons and exceptions",
+          "[mod_script][mod_loadout_lock]") {
+  rex::Runtime runtime({}, {});
+  runtime.SetModLoadoutLockProvider([] { return std::optional<std::string>(""); });
+  REQUIRE(runtime.mod_loadout_lock_reason() == "Mod changes are locked.");
+  runtime.SetModLoadoutLockProvider(
+      []() -> std::optional<std::string> { throw std::runtime_error("provider failed"); });
+  REQUIRE(runtime.mod_loadout_lock_reason() == "Mod changes are locked.");
+  runtime.SetModLoadoutLockProvider([]() -> std::optional<std::string> { return std::nullopt; });
+  REQUIRE_FALSE(runtime.mod_loadout_lock_reason());
+}
+
+TEST_CASE("App lock refuses saves without a replacement host", "[mod_script][mod_loadout_lock]") {
+  PackageTree tree;
+  tree.WriteNative("native");
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  const std::vector<std::string> desired{"native"};
+
+  bool locked = true;
+  runtime.SetModLoadoutLockProvider([&]() -> std::optional<std::string> {
+    if (locked)
+      return "In a match.";
+    return std::nullopt;
+  });
+  REQUIRE(runtime.ApplyModLoadout(desired).status == ModLoadoutApplyStatus::kLocked);
+  REQUIRE_FALSE(std::filesystem::exists(tree.root / "profile/mod_order.txt"));
+  REQUIRE_FALSE(runtime.restart_required());
+
+  locked = false;
+  REQUIRE(runtime.ApplyModLoadout(desired).succeeded());
+  REQUIRE(runtime.restart_required());
+}
+
+TEST_CASE("App lock raised during preparation persists and publishes nothing",
+          "[mod_script][mod_loadout_lock]") {
+  PackageTree tree;
+  tree.Write("first");
+  auto host = std::make_shared<ReplacementHost>();
+  rex::Runtime runtime({}, tree.root / "profile");
+  rex::RuntimeConfig config;
+  config.tool_mode = true;
+  config.mod_script_host = host;
+  REQUIRE(runtime.Setup(std::move(config)) == 0);
+  runtime.RescanModCatalog();
+  size_t notifications = 0;
+  runtime.SetModLoadoutChangedCallback([&] { ++notifications; });
+  std::atomic<bool> locked{false};
+  runtime.SetModLoadoutLockProvider([&]() -> std::optional<std::string> {
+    if (locked)
+      return "Match started.";
+    return std::nullopt;
+  });
+  host->on_prepare = [&] { locked = true; };
+
+  const std::vector<std::string> desired{"first"};
+  const auto result = runtime.ApplyModLoadout(desired);
+  REQUIRE(result.status == ModLoadoutApplyStatus::kLocked);
+  REQUIRE(result.diagnostics.front().message == "Match started.");
+  REQUIRE(host->commits == 0);
+  REQUIRE(host->active.empty());
+  REQUIRE(notifications == 0);
+  REQUIRE(runtime.mod_order_ids().empty());
+  REQUIRE(runtime.active_mod_states().empty());
+  REQUIRE(runtime.active_mod_script_digest().empty());
+  REQUIRE_FALSE(runtime.mod_catalog().Find("first")->active);
+  REQUIRE_FALSE(std::filesystem::exists(tree.root / "profile/mod_order.txt"));
+}
+
+TEST_CASE("App lock provider is safe to flip while another thread reads it",
+          "[mod_script][mod_loadout_lock]") {
+  rex::Runtime runtime({}, {});
+  std::atomic<bool> locked{false};
+  std::atomic<bool> done{false};
+  runtime.SetModLoadoutLockProvider([&]() -> std::optional<std::string> {
+    if (locked)
+      return "busy";
+    return std::nullopt;
+  });
+  std::thread writer([&] {
+    for (int i = 0; i < 2000; ++i) {
+      locked = !locked;
+      if (i % 500 == 0)
+        runtime.SetModLoadoutLockProvider([&]() -> std::optional<std::string> {
+          if (locked)
+            return "busy";
+          return std::nullopt;
+        });
+    }
+    done = true;
+  });
+  while (!done) {
+    const auto reason = runtime.mod_loadout_lock_reason();
+    REQUIRE((!reason || *reason == "busy"));
+  }
+  writer.join();
 }
