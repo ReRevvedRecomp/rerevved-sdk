@@ -19,6 +19,7 @@ add_executable(unit_tests
     graphics/shared_memory_test.cpp
     graphics/texture_memory_version_test.cpp
     graphics/draw_resolution_scale_test.cpp
+    graphics/texture_layout_test.cpp
     test_memory.cpp
     memory/heap_allocation_test.cpp
     memory/physical_write_watch_test.cpp
