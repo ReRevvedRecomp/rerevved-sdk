@@ -22,9 +22,13 @@ class ScaleCvarReset {
 };
 }  // namespace
 
-TEST_CASE("auto draw resolution scale matches the presented image height", "[graphics]") {
+TEST_CASE("auto draw resolution scale fits the presented image", "[graphics]") {
   CHECK(Auto(1280, 720) == 1);
-  CHECK(Auto(1920, 1080) == 2);
+  // 1080p upscales a 1x image rather than rendering 1440p.
+  CHECK(Auto(1920, 1080) == 1);
+  CHECK(Auto(1280, 800) == 1);
+  CHECK(Auto(1920, 1200) == 1);
+  CHECK(Auto(800, 480) == 1);
   CHECK(Auto(2560, 1440) == 2);
   CHECK(Auto(3440, 1440) == 2);
   CHECK(Auto(5120, 1440) == 2);
@@ -34,16 +38,17 @@ TEST_CASE("auto draw resolution scale matches the presented image height", "[gra
   CHECK(Auto(2560, 1600) == 2);
   CHECK(Auto(0, 0) == 1);
   CHECK(Auto(3840, 2160, 2) == 2);
-  // Fractional scale ratios round up; the tighter axis limits the fitted image.
-  CHECK(Auto(1281, 721) == 2);
-  CHECK(Auto(1280, 721) == 1);
+  // Fractional scale ratios round down; the tighter axis limits the fitted image.
+  CHECK(Auto(2559, 1439) == 1);
+  CHECK(Auto(2560, 2160) == 2);
+  CHECK(Auto(2559, 2160) == 1);
 }
 
 TEST_CASE("auto draw resolution scale tolerates unknown guest sizes and limits", "[graphics]") {
   CHECK(AutoDrawResolutionScale(3840, 2160, 0, 720, kMax) == 1);
   CHECK(AutoDrawResolutionScale(3840, 2160, 1280, 0, kMax) == 1);
   CHECK(AutoDrawResolutionScale(3840, 2160, 1280, 720, 0) == 1);
-  CHECK(AutoDrawResolutionScale(8192, 8192, 1280, 720, kMax) == kMax);
+  CHECK(AutoDrawResolutionScale(10240, 8192, 1280, 720, kMax) == kMax);
 }
 
 TEST_CASE("resolution_scale 0 resolves from the display geometry", "[graphics]") {
@@ -86,7 +91,7 @@ TEST_CASE("resolution_scale 0 stays auto as an application default", "[graphics]
   uint32_t x = 0;
   uint32_t y = 0;
   const bool not_clamped =
-      TextureCache::GetConfigDrawResolutionScale(x, y, {1280, 720, 1920, 1080});
+      TextureCache::GetConfigDrawResolutionScale(x, y, {1280, 720, 2560, 1440});
   // Put the SDK default back for the other cases.
   REQUIRE(rex::cvar::SetFlagAsApplicationDefault("resolution_scale", "1"));
   CHECK(not_clamped);

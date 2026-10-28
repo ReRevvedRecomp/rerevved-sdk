@@ -99,7 +99,7 @@ REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "Display",
                      "Resolution scale. Draw resolution scale for both X and Y axes (same as "
                      "setting draw_resolution_scale_x and draw_resolution_scale_y). 0 = auto: "
-                     "choose an integer scale for the presented image height")
+                     "choose the largest integer scale that fits the presented image")
     .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
     .audience(rex::cvar::Audience::kPlayer);
@@ -716,9 +716,10 @@ uint32_t AutoDrawResolutionScale(uint32_t surface_width, uint32_t surface_height
   if (!surface_width || !surface_height || !guest_width || !guest_height) {
     return 1;
   }
-  // The guest-aspect image fitted inside the surface is limited by the tighter axis.
-  const uint64_t scale = std::min((uint64_t(surface_height) + guest_height - 1) / guest_height,
-                                  (uint64_t(surface_width) + guest_width - 1) / guest_width);
+  // Round down so a fractional ratio, such as 1080p over 720p, upscales at present
+  // instead of rendering more pixels than the surface shows.
+  const uint64_t scale =
+      std::min(uint64_t(surface_height) / guest_height, uint64_t(surface_width) / guest_width);
   return uint32_t(std::clamp<uint64_t>(scale, 1, std::max<uint32_t>(1, max_scale)));
 }
 

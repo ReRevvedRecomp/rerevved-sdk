@@ -30,10 +30,10 @@
 
 namespace rex::graphics {
 
-/// Smallest integer draw scale covering the guest-aspect image fitted inside
-/// `surface_width` x `surface_height`, capped at max(1, max_scale).
-/// Uses the smaller of ceil(surface height / guest height) and
-/// ceil(surface width / guest width). A zero surface or guest size gives 1.
+/// Largest integer draw scale whose guest-aspect image fits inside
+/// `surface_width` x `surface_height`, clamped to 1 through max(1, max_scale).
+/// Uses the smaller of floor(surface height / guest height) and
+/// floor(surface width / guest width). A zero surface or guest size gives 1.
 uint32_t AutoDrawResolutionScale(uint32_t surface_width, uint32_t surface_height,
                                  uint32_t guest_width, uint32_t guest_height, uint32_t max_scale);
 
