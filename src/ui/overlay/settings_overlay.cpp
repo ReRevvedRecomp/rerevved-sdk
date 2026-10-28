@@ -261,11 +261,8 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
   // Unsaved rows compare against the values at open or the last save.
   std::vector<const rex::cvar::FlagEntry*> changed;
   for (auto& entry : registry) {
-    if (!settings_rows::IsSaved(entry)) {
-      continue;
-    }
     auto it = saved_values_.find(entry.name);
-    if (it != saved_values_.end() && it->second != entry.getter()) {
+    if (it != saved_values_.end() && settings_rows::IsUnsavedChange(entry, it->second)) {
       changed.push_back(&entry);
     }
   }
