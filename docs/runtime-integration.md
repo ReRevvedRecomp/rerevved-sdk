@@ -55,8 +55,10 @@ the startup window to a listed `WxH` or `maximized`; any other size comes from
 guest video mode: only `video_mode_width`/`video_mode_height` and the
 `resolution` preset do.
 `resolution_scale` 0 (`Display`, requires restart) is Auto: it selects the
-smallest whole-number draw scale that covers the height of the guest-aspect
-image fitted inside the presented surface, then clamps it to 1 through 7.
+largest whole-number draw scale whose guest-aspect image fits inside the
+presented surface, then clamps it to 1 through 7. A surface between two
+multiples, such as 1920x1080 for a 1280x720 guest, uses the lower scale and
+the presenter upscales it.
 A non-default `draw_resolution_scale_x`/`draw_resolution_scale_y` overrides
 its axis.
 `ReXApp` reports the surface (the selected display's pixel size in fullscreen,

@@ -12,10 +12,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <ratio>
+#include <tuple>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/chrono/chrono.h>
+#include <rex/chrono/chrono_steady_cast.h>
 
 using rex::chrono::WinSystemClock;
 
@@ -314,4 +317,130 @@ TEST_CASE("weekday c_encoding returns 0=Sunday through 6=Saturday", "[chrono]") 
   CHECK(weekday{sys_days{year{2021} / month{1} / day{1}}}.c_encoding() == 5);
   // 2000-01-01 is Saturday (6)
   CHECK(weekday{sys_days{year{2000} / month{1} / day{1}}}.c_encoding() == 6);
+}
+
+// =============================================================================
+// Steady-clock conversion of early NT absolute times (upstream issue 537)
+// =============================================================================
+
+TEST_CASE("WinSystemClock to steady_clock keeps early due times in the past", "[chrono]") {
+  for (uint64_t file_time : {uint64_t(1), uint64_t(10000000), kFtNtEpoch}) {
+    const auto before = std::chrono::steady_clock::now();
+    const auto due = std::chrono::clock_cast<std::chrono::steady_clock>(
+        WinSystemClock::from_file_time(file_time));
+    const auto after = std::chrono::steady_clock::now();
+    CAPTURE(file_time);
+    CHECK(due <= after);
+    CHECK(due < before);
+  }
+}
+
+TEST_CASE("WinSystemClock to steady_clock still converts near-future times", "[chrono]") {
+  const auto steady_before = std::chrono::steady_clock::now();
+  const auto due = std::chrono::clock_cast<std::chrono::steady_clock>(WinSystemClock::now() +
+                                                                      std::chrono::seconds(60));
+  const auto steady_after = std::chrono::steady_clock::now();
+  CHECK(due > steady_before + std::chrono::seconds(59));
+  CHECK(due < steady_after + std::chrono::seconds(61));
+}
+
+// The conversion must neither wrap for unsigned ticks nor overflow for extreme
+// values: they saturate at +/-10 years, and anything inside keeps its offset.
+namespace {
+using Conversion = std::chrono::clock_time_conversion<std::chrono::steady_clock, WinSystemClock>;
+constexpr auto kTenYears =
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::years(10));
+
+struct Converted {
+  std::chrono::steady_clock::time_point due, steady_before, steady_after;
+  std::chrono::steady_clock::duration nt_span;
+};
+
+// make_tp receives the NT clock reading and returns the input time_point.
+template <typename MakeTimePoint>
+Converted Convert(MakeTimePoint make_tp) {
+  const auto steady_before = std::chrono::steady_clock::now();
+  const auto nt_before = WinSystemClock::now();
+  const auto tp = make_tp(nt_before.time_since_epoch().count());
+  const auto due = Conversion{}(tp);
+  const auto steady_after = std::chrono::steady_clock::now();
+  const auto nt_after = WinSystemClock::now();
+  return {due, steady_before, steady_after,
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(nt_after - nt_before)};
+}
+
+template <typename Rep, typename Period>
+auto MakeTime(Rep ticks) {
+  using D = std::chrono::duration<Rep, Period>;
+  return std::chrono::time_point<WinSystemClock, D>{D(ticks)};
+}
+}  // namespace
+
+TEST_CASE("WinSystemClock to steady_clock handles unsigned duration time points", "[chrono]") {
+  using Ticks100 = std::ratio<1, 10000000>;
+  const auto sixty = std::chrono::seconds(60);
+  const int64_t sixty_ticks = 60 * 10000000;
+
+  SECTION("near future") {
+    const auto r =
+        Convert([&](int64_t now) { return MakeTime<uint64_t, Ticks100>(now + sixty_ticks); });
+    CHECK(r.due >= r.steady_before + sixty - r.nt_span);
+    CHECK(r.due <= r.steady_after + sixty);
+  }
+  SECTION("near past") {
+    const auto r =
+        Convert([&](int64_t now) { return MakeTime<uint64_t, Ticks100>(now - sixty_ticks); });
+    CHECK(r.due >= r.steady_before - sixty - r.nt_span);
+    CHECK(r.due <= r.steady_after - sixty);
+  }
+  SECTION("FileTime epoch") {
+    const auto r = Convert([&](int64_t) { return MakeTime<uint64_t, Ticks100>(0); });
+    CHECK(r.due >= r.steady_before - kTenYears);
+    CHECK(r.due <= r.steady_after - kTenYears);
+  }
+  SECTION("UINT64_MAX saturates to the future bound") {
+    const auto r = Convert([&](int64_t) { return MakeTime<uint64_t, Ticks100>(UINT64_MAX); });
+    CHECK(r.due >= r.steady_before + kTenYears);
+    CHECK(r.due <= r.steady_after + kTenYears);
+  }
+}
+
+TEST_CASE("WinSystemClock to steady_clock saturates extreme signed values", "[chrono]") {
+  using Ticks100 = std::ratio<1, 10000000>;
+  using Ticks50 = std::ratio<1, 20000000>;
+  SECTION("INT64_MIN in 100 ns ticks") {
+    const auto r = Convert([&](int64_t) { return MakeTime<int64_t, Ticks100>(INT64_MIN); });
+    CHECK(r.due >= r.steady_before - kTenYears);
+    CHECK(r.due <= r.steady_after - kTenYears);
+  }
+  SECTION("INT64_MIN and INT64_MAX in 50 ns ticks") {
+    const auto past = Convert([&](int64_t) { return MakeTime<int64_t, Ticks50>(INT64_MIN); });
+    CHECK(past.due >= past.steady_before - kTenYears);
+    CHECK(past.due <= past.steady_after - kTenYears);
+    const auto future = Convert([&](int64_t) { return MakeTime<int64_t, Ticks50>(INT64_MAX); });
+    CHECK(future.due >= future.steady_before + kTenYears);
+    CHECK(future.due <= future.steady_after + kTenYears);
+  }
+}
+
+TEST_CASE("WinSystemClock to steady_clock keeps a sub-tick offset from finer durations",
+          "[chrono]") {
+  using Ticks50 = std::ratio<1, 20000000>;
+  const auto fifty = std::chrono::nanoseconds(50);
+  // 50 ns period: nt_now is 2 ticks per 100 ns tick, so +/-1 is +/-50 ns.
+  SECTION("signed, now + 50 ns") {
+    const auto r = Convert([&](int64_t now) { return MakeTime<int64_t, Ticks50>(now * 2 + 1); });
+    CHECK(r.due >= r.steady_before + fifty - r.nt_span);
+    CHECK(r.due <= r.steady_after + fifty);
+  }
+  SECTION("signed, now - 50 ns") {
+    const auto r = Convert([&](int64_t now) { return MakeTime<int64_t, Ticks50>(now * 2 - 1); });
+    CHECK(r.due >= r.steady_before - fifty - r.nt_span);
+    CHECK(r.due <= r.steady_after - fifty);
+  }
+  SECTION("unsigned, now + 50 ns") {
+    const auto r = Convert([&](int64_t now) { return MakeTime<uint64_t, Ticks50>(now * 2 + 1); });
+    CHECK(r.due >= r.steady_before + fifty - r.nt_span);
+    CHECK(r.due <= r.steady_after + fifty);
+  }
 }

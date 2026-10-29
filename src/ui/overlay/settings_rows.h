@@ -400,6 +400,13 @@ inline bool IsSaved(const rex::cvar::FlagEntry& entry) {
          entry.audience != rex::cvar::Audience::kHidden;
 }
 
+// Application defaults follow other settings and are not unsaved changes;
+// reverting them would pin their old values as player choices.
+inline bool IsUnsavedChange(const rex::cvar::FlagEntry& entry, std::string_view saved_value) {
+  return IsSaved(entry) && entry.source != rex::cvar::Source::kApplicationDefault &&
+         entry.getter() != saved_value;
+}
+
 struct PlacedSection {
   std::string title;
   bool collapsed = false;

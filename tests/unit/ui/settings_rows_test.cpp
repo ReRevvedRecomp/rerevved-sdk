@@ -241,6 +241,23 @@ TEST_CASE("settings rows save and revert only config-persisted visible rows", "[
   CHECK_FALSE(rows::IsSaved(entry));
 }
 
+TEST_CASE("settings unsaved changes skip application defaults", "[settings]") {
+  auto entry = MakeEntry("a", "", Audience::kPlayer);
+  std::string value = "100";
+  entry.getter = [&value] { return value; };
+  CHECK_FALSE(rows::IsUnsavedChange(entry, "100"));
+  entry.source = rex::cvar::Source::kRuntime;
+  CHECK(rows::IsUnsavedChange(entry, "90"));
+  entry.source = rex::cvar::Source::kConfig;
+  CHECK(rows::IsUnsavedChange(entry, "90"));
+  // Another setting moved this default; Revert must not pin the old value.
+  entry.source = rex::cvar::Source::kApplicationDefault;
+  CHECK_FALSE(rows::IsUnsavedChange(entry, "90"));
+  entry.source = rex::cvar::Source::kRuntime;
+  entry.persistence = rex::cvar::Persistence::kSessionOnly;
+  CHECK_FALSE(rows::IsUnsavedChange(entry, "90"));
+}
+
 TEST_CASE("settings integer choices list mapped values in numeric order", "[settings]") {
   auto entry = MakeEntry("quality", "", Audience::kPlayer);
   entry.type = rex::cvar::FlagType::Int32;

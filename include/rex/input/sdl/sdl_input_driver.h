@@ -44,6 +44,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnWindowAvailable(rex::ui::Window* window) override;
 
  private:
+  friend struct SDLInputDriverTestAccess;
+
   enum class RepeatState {
     Idle,       // no buttons pressed or repeating has ended
     Waiting,    // a button is held and the delay is awaited
@@ -75,6 +77,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
   void HandleEvent(const SDL_Event& event);
+  static bool EventWatch(void* userdata, SDL_Event* event);
+  // Both run on the UI thread. Teardown is idempotent and is used by OnClosing and the
+  // destructor, so a title that quits on its own leaves no SDL watch or subsystem behind.
+  void InitializeSubsystems();
+  void Teardown();
+
+  // Teardown actions performed process-wide, for the lifecycle test.
+  static int WatchRemovalCount();
+  static int SubsystemQuitCount();
   std::unique_lock<std::mutex> DrainAndLock();
   void ProcessEventLocked(const SDL_Event& event);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
@@ -93,6 +104,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
+  bool event_watch_added_ = false;
+  bool background_callback_registered_ = false;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
   // Appended in connection order, never re-sorted, and unbounded: the

@@ -47,6 +47,11 @@ std::vector<DeviceId> For(const DeviceAssignment& a, uint32_t user) {
 class FakeDriver final : public InputDriver {
  public:
   FakeDriver() : InputDriver(nullptr, 0) {}
+  ~FakeDriver() override {
+    if (destroyed) {
+      *destroyed = true;
+    }
+  }
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
 
@@ -103,6 +108,7 @@ class FakeDriver final : public InputDriver {
     return vibration_result;
   }
 
+  bool* destroyed = nullptr;
   std::map<DeviceId, X_INPUT_VIBRATION> vibrations;
   size_t vibration_calls = 0;
   X_RESULT vibration_result = X_ERROR_SUCCESS;
@@ -329,4 +335,20 @@ TEST_CASE("Vibration gate preserves driver results and disconnected users", "[in
   CHECK(system->SetState(1, &request) == X_ERROR_DEVICE_NOT_CONNECTED);
   InputSystem unassigned(nullptr);
   CHECK(unassigned.SetState(0, &request) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+// ReXApp::OnDestroy shuts the input system down before it destroys the window,
+// so drivers never touch a freed window (upstream issue 525). The later
+// Runtime teardown calls Shutdown again.
+TEST_CASE("input system shutdown destroys drivers and is repeatable", "[input]") {
+  bool destroyed = false;
+  auto driver = std::make_unique<FakeDriver>();
+  driver->destroyed = &destroyed;
+  driver->Add(1);
+  InputSystem system(nullptr);
+  system.AddDriver(std::move(driver));
+  CHECK_FALSE(destroyed);
+  system.Shutdown();
+  CHECK(destroyed);
+  system.Shutdown();
 }

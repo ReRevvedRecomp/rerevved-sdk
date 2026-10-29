@@ -839,6 +839,34 @@ TEST_CASE("cvar TOML serialization", "[cvar]") {
   CHECK(toml.find("test_bool_flag") == std::string::npos);
 }
 
+// Upstream issue 518: backslashes and quotes in a string value must survive a
+// save and reload.
+TEST_CASE("cvar string values with backslashes and quotes round-trip through TOML", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+  const std::string value = R"(Z:\games\"quoted" dir\)";
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", value));
+
+  const auto toml = rex::cvar::SerializeToTOML();
+  CHECK(toml.find(R"(test_string_flag = "Z:\\games\\\"quoted\" dir\\")") != std::string::npos);
+
+  const auto config_path =
+      std::filesystem::temp_directory_path() / "rexglue_cvar_string_escape_test.toml";
+  {
+    std::ofstream file(config_path);
+    file << toml;
+  }
+  rex::cvar::testing::ResetAllForTesting();
+  rex::cvar::LoadConfig(config_path);
+  CHECK(rex::cvar::GetFlagByName("test_string_flag") == value);
+
+  REQUIRE(rex::cvar::TrySaveConfig(config_path));
+  rex::cvar::testing::ResetAllForTesting();
+  rex::cvar::LoadConfig(config_path);
+  CHECK(rex::cvar::GetFlagByName("test_string_flag") == value);
+
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
 TEST_CASE("cvar metadata integration test", "[cvar][integration]") {
   rex::cvar::testing::ResetAllForTesting();
 

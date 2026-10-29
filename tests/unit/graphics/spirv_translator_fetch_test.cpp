@@ -16,7 +16,8 @@ using namespace rex::graphics;
 
 // One tfetch2D from fetch constant 0, using the named field positions in
 // ucode.h.
-std::vector<uint32_t> TextureFetchUcode() {
+std::vector<uint32_t> TextureFetchUcode(
+    xenos::FetchOpDimension dimension = xenos::FetchOpDimension::k2D) {
   return {1 | (1 << 12) | (1 << 16),
           uint32_t(ucode::ControlFlowOpcode::kExecEnd) << 12,
           0,
@@ -26,7 +27,7 @@ std::vector<uint32_t> TextureFetchUcode() {
               (uint32_t(xenos::TextureFilter::kUseFetchConst) << 16) |
               (uint32_t(xenos::AnisoFilter::kUseFetchConst) << 18) | (3u << 24) | (3u << 26) |
               (1u << 28),
-          uint32_t(xenos::FetchOpDimension::k2D) << 14};
+          uint32_t(dimension) << 14};
 }
 
 struct SpirvInstruction {
@@ -116,4 +117,68 @@ TEST_CASE("SPIR-V texture fetch takes the result exponent from fetch word 3", "[
   REQUIRE(exponent_sources.size() == 1);
   CAPTURE(exponent_sources[0]);
   CHECK(exponent_sources[0] == std::vector<uint32_t>{0, 0, 3});
+}
+
+// Filtering between stacked texture layers must be s0 + (s1 - s0) * f. Adding
+// the difference to the second sample instead gives s1 + (s1 - s0) * f.
+TEST_CASE("SPIR-V stacked texture layer filtering interpolates from the first layer",
+          "[graphics][spirv]") {
+  const auto words = TextureFetchUcode(xenos::FetchOpDimension::k3DOrStacked);
+  Shader shader(xenos::ShaderType::kPixel, 1, words.data(), words.size(), std::endian::native);
+  rex::string::StringBuffer disassembly;
+  shader.AnalyzeUcode(disassembly);
+  REQUIRE(shader.is_ucode_analyzed());
+
+  SpirvShaderTranslator translator(SpirvShaderTranslator::Features(true), false, false, false);
+  Shader::Translation* translation = shader.GetOrCreateTranslation(
+      translator.GetDefaultPixelShaderModification(shader.GetDynamicAddressableRegisterCount(0)));
+  REQUIRE(translation != nullptr);
+  REQUIRE(translator.TranslateAnalyzedShader(*translation));
+  const auto& binary = translation->translated_binary();
+  REQUIRE(binary.size() % sizeof(uint32_t) == 0);
+  std::vector<uint32_t> spirv(binary.size() / sizeof(uint32_t));
+  std::memcpy(spirv.data(), binary.data(), binary.size());
+  REQUIRE(spirv.size() > 5);
+
+  constexpr uint32_t kOpFAdd = 129;
+  constexpr uint32_t kOpFSub = 131;
+  constexpr uint32_t kOpVectorTimesScalar = 142;
+  // Operands of each: result type, result, left, right.
+  std::unordered_map<uint32_t, SpirvInstruction> subtracts;
+  std::vector<SpirvInstruction> scales;
+  std::vector<SpirvInstruction> adds;
+  for (size_t i = 5; i < spirv.size();) {
+    const uint32_t word_count = spirv[i] >> 16;
+    REQUIRE(word_count != 0);
+    REQUIRE(i + word_count <= spirv.size());
+    SpirvInstruction instruction{spirv[i] & 0xFFFF,
+                                 {spirv.begin() + i + 1, spirv.begin() + i + word_count}};
+    if (instruction.operands.size() == 4) {
+      if (instruction.opcode == kOpFSub) {
+        subtracts[instruction.operands[1]] = instruction;
+      } else if (instruction.opcode == kOpVectorTimesScalar) {
+        scales.push_back(instruction);
+      } else if (instruction.opcode == kOpFAdd) {
+        adds.push_back(instruction);
+      }
+    }
+    i += word_count;
+  }
+
+  // One interpolation per signedness: (s1 - s0) * f, then added to a sample.
+  size_t checked = 0;
+  for (const SpirvInstruction& scale : scales) {
+    auto difference = subtracts.find(scale.operands[2]);
+    if (difference == subtracts.end()) {
+      continue;
+    }
+    const uint32_t first_sample = difference->second.operands[3];
+    for (const SpirvInstruction& add : adds) {
+      if (add.operands[3] == scale.operands[1]) {
+        CHECK(add.operands[2] == first_sample);
+        ++checked;
+      }
+    }
+  }
+  CHECK(checked == 2);
 }

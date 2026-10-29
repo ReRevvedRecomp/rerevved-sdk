@@ -988,6 +988,11 @@ void ReXApp::OnDestroy() {
   if (module_thread_.joinable()) {
     module_thread_.join();
   }
+  // Drivers hold listeners on the window. When the title quits on its own the
+  // window never sends OnClosing, so detach them before the window goes away.
+  if (runtime_ && runtime_->input_system()) {
+    runtime_->input_system()->Shutdown();
+  }
   if (window_) {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
