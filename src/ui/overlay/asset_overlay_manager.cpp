@@ -257,7 +257,7 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
     }
     const auto current_diagnostics =
         source_.catalog ? source_.diagnostics()
-                    : std::vector<rex::system::AssetOverlayLoadoutDiagnostic>{};
+                        : std::vector<rex::system::AssetOverlayLoadoutDiagnostic>{};
     if (!current_diagnostics.empty()) {
       ImGui::TextColored(kErrorText, "Current %s has errors:", source_.order_file.c_str());
       for (const auto& diagnostic : current_diagnostics) {
