@@ -68,12 +68,17 @@ void AssetOverlayManagerPane::ApplyStaged(bool replace_invalid_current) {
 }
 
 void AssetOverlayManagerPane::DrawDiscardPopup(const Style& style) {
+  const bool was_open = ImGui::IsPopupOpen("Discard asset overlay changes?");
   if (discard_popup_) {
     ImGui::OpenPopup("Discard asset overlay changes?");
   }
   if (!ImGui::BeginPopupModal("Discard asset overlay changes?", nullptr,
                               ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
+  }
+  if (was_open && OverlayPadBackPressed()) {
+    discard_popup_ = false;
+    ImGui::CloseCurrentPopup();
   }
   ImGui::TextWrapped("Discard asset overlay enable and priority changes?");
   if (OverlayButton(style, "Discard")) {
@@ -93,12 +98,17 @@ void AssetOverlayManagerPane::DrawDiscardPopup(const Style& style) {
 }
 
 void AssetOverlayManagerPane::DrawReplacementPopup(const Style& style) {
+  const bool was_open = ImGui::IsPopupOpen("Replace invalid asset_order.txt?");
   if (replacement_popup_) {
     ImGui::OpenPopup("Replace invalid asset_order.txt?");
   }
   if (!ImGui::BeginPopupModal("Replace invalid asset_order.txt?", nullptr,
                               ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
+  }
+  if (was_open && OverlayPadBackPressed()) {
+    replacement_popup_ = false;
+    ImGui::CloseCurrentPopup();
   }
   ImGui::TextWrapped(
       "The current asset overlay loadout has errors. Replace it with the selected packs?");
@@ -147,7 +157,8 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
   }
 
   if (editing_priority_) {
-    ImGui::BeginChild("##assetpriority", ImVec2(0.0f, -footer_height), false);
+    ImGui::BeginChild("##assetpriority", ImVec2(0.0f, -footer_height),
+                      ImGuiChildFlags_NavFlattened);
     if (staged_ids_.empty()) {
       ImGui::TextDisabled("No enabled asset overrides.");
     }
@@ -186,7 +197,7 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
     }
     ImGui::EndChild();
   } else {
-    ImGui::BeginChild("##assetlist", ImVec2(0.0f, -footer_height), false);
+    ImGui::BeginChild("##assetlist", ImVec2(0.0f, -footer_height), ImGuiChildFlags_NavFlattened);
     if (!staged.IsValid()) {
       ImGui::TextColored(kErrorText, "Selected loadout has errors:");
       for (const auto& diagnostic : staged.diagnostics) {

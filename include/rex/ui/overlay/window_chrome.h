@@ -19,9 +19,22 @@ bool BeginOverlayWindow(const Style& style, const char* label, bool* p_open, ImG
                         float background_alpha);
 
 /// Begins a padded child region drawn with ChromeStyle::draw_panel, or a
-/// bordered child without it. Always pair with EndOverlayPanel().
+/// bordered child without it. Its items take part in the window's gamepad
+/// navigation. Always pair with EndOverlayPanel().
 bool BeginOverlayPanel(const Style& style, const char* id, ImVec2 size, ImGuiWindowFlags flags = 0);
 void EndOverlayPanel();
+
+/// LB/RB target tab for the focused overlay, or -1. `selected` is current;
+/// `count` is the tab count. Pass ImGuiTabItemFlags_SetSelected to BeginTabItem.
+/// No request while a popup or active item owns the shoulder buttons.
+int OverlayTabRequest(int selected, int count);
+
+/// True on B press. ImGui's cancel leaves modals open; use for their safe choice.
+bool OverlayPadBackPressed();
+
+/// True on B press with no ImGui item or popup to cancel; closes like Escape.
+/// Decided before the frame so closing a popup cannot also close its window.
+bool OverlayPadClosePressed();
 
 /// ImGui::Button, or ImGui::SmallButton when compact is set, drawn over
 /// ChromeStyle::draw_button when the skin has one.

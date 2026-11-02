@@ -18,7 +18,8 @@
 namespace rex {
 namespace ui {
 
-ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer) : imgui_drawer_(imgui_drawer) {
+ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer, bool wants_gamepad)
+    : imgui_drawer_(imgui_drawer), wants_gamepad_(wants_gamepad) {
   imgui_drawer_->AddDialog(this);
 }
 
@@ -55,14 +56,22 @@ void ImGuiDialog::Draw() {
 class MessageBoxDialog final : public ImGuiDialog {
  public:
   MessageBoxDialog(ImGuiDrawer* imgui_drawer, std::string title, std::string body)
-      : ImGuiDialog(imgui_drawer), title_(std::move(title)), body_(std::move(body)) {}
+      : ImGuiDialog(imgui_drawer, /*wants_gamepad=*/true),
+        title_(std::move(title)),
+        body_(std::move(body)) {}
 
   void OnDraw(ImGuiIO& io) override {
+    const bool was_open = has_opened_;
     if (!has_opened_) {
       ImGui::OpenPopup(title_.c_str());
       has_opened_ = true;
     }
     if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      // ImGui's cancel leaves modals open, so the pad's B answers it.
+      if (was_open && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
       char* text = const_cast<char*>(body_.c_str());
       ImGui::InputTextMultiline("##body", text, body_.size(), ImVec2(600, 0),
                                 ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_ReadOnly);

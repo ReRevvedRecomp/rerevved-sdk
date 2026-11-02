@@ -274,6 +274,21 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   return X_ERROR_SUCCESS;
 }
 
+X_RESULT SDLInputDriver::GetDevicePhysicalState(DeviceId id, X_INPUT_STATE* out_state) {
+  assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
+
+  QueueControllerUpdate();
+
+  auto guard = DrainAndLock();
+
+  auto controller = FindController(id);
+  if (!controller) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  return X_ERROR_SUCCESS;
+}
+
 X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
 
@@ -458,12 +473,14 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
 }
 
 std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
+  // Lock controllers first so concurrent drainers cannot reverse button edges.
+  // HandleEvent takes only the queue lock, so this order cannot invert.
+  std::unique_lock<std::mutex> guard(controllers_mutex_);
   std::vector<SDL_Event> events;
   {
-    std::lock_guard<std::mutex> guard(event_queue_mutex_);
+    std::lock_guard<std::mutex> queue_guard(event_queue_mutex_);
     events.swap(pending_events_);
   }
-  std::unique_lock<std::mutex> guard(controllers_mutex_);
   for (const auto& event : events) {
     ProcessEventLocked(event);
   }

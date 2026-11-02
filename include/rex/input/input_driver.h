@@ -38,6 +38,11 @@ class InputDriver {
   virtual void EnumerateDevices(std::vector<DeviceInfo>& out) = 0;
 
   virtual X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) = 0;
+  /// Reads held input despite is_active(), without changing GetDeviceState
+  /// packet bookkeeping for the guest.
+  virtual X_RESULT GetDevicePhysicalState(DeviceId id, X_INPUT_STATE* out_state) {
+    return GetDeviceState(id, out_state);
+  }
   virtual X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
                                          X_INPUT_CAPABILITIES* out_caps) = 0;
   virtual X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) = 0;

@@ -66,7 +66,7 @@ static void InputInteger(const rex::cvar::FlagEntry& entry, const std::string& t
 
 SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
                                std::function<void()> close_callback, SettingsLayout layout)
-    : ImGuiDialog(imgui_drawer),
+    : ImGuiDialog(imgui_drawer, /*wants_gamepad=*/true),
       config_path_(std::move(config_path)),
       close_callback_(std::move(close_callback)),
       layout_(std::move(layout)) {
@@ -281,13 +281,16 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
   if (close_callback_ && !was_capturing &&
       ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() &&
       !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
-      ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || OverlayPadClosePressed())) {
     open = false;
   }
 
   // Search bar at the top (full width).
+  // D-pad reachable, but not initial focus: A would start typing.
   ImGui::SetNextItemWidth(-1.0f);
+  ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
   ImGui::InputTextWithHint("##search", "Search settings", search_buf_, sizeof(search_buf_));
+  ImGui::PopItemFlag();
 
   const float footer_height = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
   const float panel_width = 200.0f * scale;
@@ -666,7 +669,10 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
             if (selected)
               flags |= ImGuiTreeNodeFlags_Selected;
             bool node_open = ImGui::TreeNodeEx(node.label.c_str(), flags);
-            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            // A also toggles the node, so test it separately.
+            const bool pad_pressed =
+                ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false);
+            if ((ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) || pad_pressed) {
               selected_category_ = node.full_path;
               search_buf_[0] = '\0';
             }

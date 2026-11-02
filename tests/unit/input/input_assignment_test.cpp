@@ -23,6 +23,7 @@ using rex::input::InputSystem;
 using rex::input::SharedAssignment;
 using rex::input::SlotAssignment;
 using rex::input::X_INPUT_CAPABILITIES;
+using rex::input::X_INPUT_GAMEPAD;
 using rex::input::X_INPUT_GAMEPAD_A;
 using rex::input::X_INPUT_GAMEPAD_B;
 using rex::input::X_INPUT_KEYSTROKE;
@@ -74,6 +75,17 @@ class FakeDriver final : public InputDriver {
     states_[static_cast<DeviceId>(id)].gamepad.buttons = buttons;
   }
 
+  void SetPacket(uint64_t id, uint32_t packet) {
+    states_[static_cast<DeviceId>(id)].packet_number = packet;
+  }
+
+  /// Models SDL UI capture: neutral guest state, unchanged physical state.
+  void SetGuestGated(bool gated) { guest_gated_ = gated; }
+
+  void SetLeftTrigger(uint64_t id, uint8_t value) {
+    states_[static_cast<DeviceId>(id)].gamepad.left_trigger = value;
+  }
+
   void QueueKeystroke(uint64_t id, uint16_t vk) {
     X_INPUT_KEYSTROKE ks = {};
     ks.virtual_key = vk;
@@ -88,6 +100,24 @@ class FakeDriver final : public InputDriver {
       return X_ERROR_DEVICE_NOT_CONNECTED;
     }
     *out_state = it->second;
+    if (guest_gated_) {
+      out_state->gamepad = {};
+    }
+    if (after_state_read) {
+      after_state_read();
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+  X_RESULT GetDevicePhysicalState(DeviceId id, X_INPUT_STATE* out_state) override {
+    auto it = states_.find(id);
+    if (it == states_.end()) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    *out_state = it->second;
+    if (after_physical_read) {
+      after_physical_read();
+    }
     return X_ERROR_SUCCESS;
   }
 
@@ -110,6 +140,10 @@ class FakeDriver final : public InputDriver {
     return vibration_result;
   }
 
+  /// Runs once guest state is copied, to model changes between reads.
+  std::function<void()> after_state_read;
+  /// Runs after copying the physical sample, before the reader acts on it.
+  std::function<void()> after_physical_read;
   bool* destroyed = nullptr;
   std::map<DeviceId, X_INPUT_VIBRATION> vibrations;
   size_t vibration_calls = 0;
@@ -128,6 +162,7 @@ class FakeDriver final : public InputDriver {
   }
 
  private:
+  bool guest_gated_ = false;
   std::vector<DeviceInfo> devices_;
   std::map<DeviceId, X_INPUT_STATE> states_;
   std::map<DeviceId, X_INPUT_KEYSTROKE> keystrokes_;
@@ -426,4 +461,337 @@ TEST_CASE("Gamepad family forgets an unplugged pad whose id returns", "[input]")
   driver->Add(2, false, GamepadFamily::kPlayStation);
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   CHECK(system->ActiveGamepadFamily() == GamepadFamily::kXbox);
+}
+
+namespace {
+
+constexpr uint16_t kVkPadA = 0x5800;
+constexpr uint16_t kVkPadB = 0x5801;
+
+uint16_t Buttons(const X_INPUT_STATE& state) {
+  return static_cast<uint16_t>(state.gamepad.buttons);
+}
+
+uint32_t Packet(const X_INPUT_STATE& state) {
+  return static_cast<uint32_t>(state.packet_number);
+}
+
+}  // namespace
+
+TEST_CASE("A captured pad reads neutral to the guest", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  driver->SetLeftTrigger(1, 200);
+  bool captured = false;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  X_INPUT_STATE open = {};
+  REQUIRE(system->GetState(0, &open) == X_ERROR_SUCCESS);
+  CHECK(Buttons(open) == X_INPUT_GAMEPAD_A);
+  CHECK(open.gamepad.left_trigger == 200);
+
+  captured = true;
+  X_INPUT_STATE gated = {};
+  REQUIRE(system->GetState(0, &gated) == X_ERROR_SUCCESS);
+  CHECK(Buttons(gated) == 0);
+  CHECK(gated.gamepad.left_trigger == 0);
+  // The guest only re-reads a pad whose packet number moved.
+  CHECK(Packet(gated) != Packet(open));
+}
+
+TEST_CASE("A button held when the capture ends stays released until it is let go",
+          "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  bool captured = false;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  // B closes the window while still held.
+  captured = true;
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  captured = false;
+  X_INPUT_STATE after = {};
+  REQUIRE(system->GetState(0, &after) == X_ERROR_SUCCESS);
+  CHECK(Buttons(after) == 0);
+  CHECK(Packet(after) != Packet(state));
+
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B | X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_A);
+
+  driver->SetButtons(1, 0);
+  X_INPUT_STATE released = {};
+  REQUIRE(system->GetState(0, &released) == X_ERROR_SUCCESS);
+  CHECK(Buttons(released) == 0);
+  CHECK(Packet(released) != Packet(state));
+
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_B);
+}
+
+TEST_CASE("Capturing the pad leaves keyboard and mouse emulation alone", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, /*synthetic=*/true);
+  driver->Add(2);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  driver->SetButtons(2, X_INPUT_GAMEPAD_B);
+  system->SetGamepadCaptureCallback([] { return true; });
+
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_A);
+}
+
+TEST_CASE("Clearing the capture callback returns the pad", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  system->SetGamepadCaptureCallback([] { return true; });
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  system->SetGamepadCaptureCallback(nullptr);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_A);
+}
+
+TEST_CASE("Keystrokes are withheld while the pad is captured and for held buttons",
+          "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  driver->QueueKeystroke(1, kVkPadA);
+  bool captured = false;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  X_INPUT_KEYSTROKE ks = {};
+  REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_SUCCESS);
+
+  captured = true;
+  CHECK(system->GetKeystroke(0, 0, &ks) == X_ERROR_EMPTY);
+
+  // A is still down when the capture ends, so it is not yet a press.
+  captured = false;
+  CHECK(system->GetKeystroke(0, 0, &ks) == X_ERROR_EMPTY);
+
+  driver->QueueKeystroke(1, kVkPadB);
+  REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(ks.virtual_key) == kVkPadB);
+
+  driver->SetButtons(1, 0);
+  driver->QueueKeystroke(1, kVkPadA);
+  REQUIRE(system->GetKeystroke(0, 0, &ks) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(ks.virtual_key) == kVkPadA);
+}
+
+TEST_CASE("The navigation pad is the first physical pad, captured or not", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  X_INPUT_GAMEPAD pad = {};
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+
+  driver->Add(1, /*synthetic=*/true);
+  driver->Add(2);
+  driver->Add(3);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  driver->SetButtons(2, X_INPUT_GAMEPAD_B);
+  driver->SetButtons(3, X_INPUT_GAMEPAD_A);
+  bool captured = true;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetNavigationPadState(&pad));
+  CHECK(static_cast<uint16_t>(pad.buttons) == X_INPUT_GAMEPAD_B);
+
+  captured = false;
+  driver->SetButtons(2, X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetNavigationPadState(&pad));
+  CHECK(static_cast<uint16_t>(pad.buttons) == X_INPUT_GAMEPAD_A);
+
+  driver->Remove(2);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  driver->SetButtons(3, X_INPUT_GAMEPAD_B);
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+  REQUIRE(system->GetNavigationPadState(&pad));
+  CHECK(static_cast<uint16_t>(pad.buttons) == X_INPUT_GAMEPAD_B);
+
+  driver->Remove(3);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+
+  driver->Add(4);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetNavigationPadState(&pad));
+  system->Shutdown();
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+}
+
+TEST_CASE("A driver that gates itself off still has its held buttons remembered",
+          "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  bool captured = true;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  // Models the mouse over an overlay: the driver reports neutral guest input.
+  driver->SetGuestGated(true);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == 0);
+
+  captured = false;
+  driver->SetGuestGated(false);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == 0);
+
+  driver->SetButtons(1, 0);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_B);
+}
+
+TEST_CASE("A press the guest never polled during the capture stays hidden", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  bool captured = false;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  captured = true;
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  X_INPUT_GAMEPAD pad = {};
+  REQUIRE(system->GetNavigationPadState(&pad));
+  CHECK(static_cast<uint16_t>(pad.buttons) == X_INPUT_GAMEPAD_B);
+
+  captured = false;
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == 0);
+  driver->SetButtons(1, 0);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_B);
+}
+
+TEST_CASE("The guest sees the gate's change next to a busier keyboard packet", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, /*synthetic=*/true);
+  driver->Add(2);
+  driver->SetPacket(1, 1000);
+  driver->SetPacket(2, 5);
+  driver->SetButtons(2, X_INPUT_GAMEPAD_A);
+  bool captured = false;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+
+  X_INPUT_STATE open = {};
+  REQUIRE(system->GetState(0, &open) == X_ERROR_SUCCESS);
+  CHECK(Buttons(open) == X_INPUT_GAMEPAD_A);
+
+  captured = true;
+  X_INPUT_STATE gated = {};
+  REQUIRE(system->GetState(0, &gated) == X_ERROR_SUCCESS);
+  CHECK(Buttons(gated) == 0);
+  CHECK(Packet(gated) != Packet(open));
+}
+
+TEST_CASE("Navigation moving to another pad reads as a pad that just arrived", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  driver->Add(2);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  X_INPUT_GAMEPAD pad = {};
+  REQUIRE(system->GetNavigationPadState(&pad));
+
+  driver->Remove(1);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+  CHECK(system->GetNavigationPadState(&pad));
+}
+
+TEST_CASE("A closing B let go in the middle of a poll stays hidden", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  bool captured = true;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  captured = false;
+  driver->after_state_read = [&] { driver->SetButtons(1, 0); };
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == 0);
+}
+
+TEST_CASE("A change of navigation pad stays pending until the UI reads it", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  driver->Add(2);
+  X_INPUT_STATE state = {};
+  X_INPUT_GAMEPAD pad = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetNavigationPadState(&pad));
+
+  driver->Remove(1);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+  CHECK(system->GetNavigationPadState(&pad));
+
+  // Reconnection without the UI observing the disconnect.
+  driver->Remove(2);
+  CHECK(system->GetState(0, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+  driver->Add(5);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK_FALSE(system->GetNavigationPadState(&pad));
+  CHECK(system->GetNavigationPadState(&pad));
+}
+
+TEST_CASE("A guest poll's stale sample cannot undo a newer latch", "[input][gamepad]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  bool captured = true;
+  system->SetGamepadCaptureCallback([&] { return captured; });
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  // UI latches B after the guest samples neutral but before it acts.
+  driver->after_physical_read = [&] {
+    driver->after_physical_read = nullptr;
+    driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+    X_INPUT_GAMEPAD pad = {};
+    REQUIRE(system->GetNavigationPadState(&pad));
+  };
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  captured = false;
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == 0);
+  driver->SetButtons(1, 0);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  driver->SetButtons(1, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(Buttons(state) == X_INPUT_GAMEPAD_B);
 }

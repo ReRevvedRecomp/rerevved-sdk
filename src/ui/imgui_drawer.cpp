@@ -26,6 +26,8 @@
 
 #include <imgui.h>
 
+#include "gamepad_nav.h"
+
 namespace rex {
 namespace ui {
 
@@ -95,7 +97,8 @@ ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallb
     : window_(window),
       z_order_(z_order),
       font_setup_(std::move(font_setup)),
-      style_setup_(std::move(style_setup)) {
+      style_setup_(std::move(style_setup)),
+      gamepad_nav_(std::make_unique<GamepadNav>()) {
   Initialize();
 }
 
@@ -134,6 +137,10 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+  if (dialog->wants_gamepad()) {
+    gamepad_dialogs_.fetch_add(1, std::memory_order_relaxed);
+    gamepad_nav_->NotifyWindowOpened();
+  }
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -150,6 +157,9 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.erase(it);
+  if (dialog->wants_gamepad()) {
+    gamepad_dialogs_.fetch_sub(1, std::memory_order_relaxed);
+  }
   DetachIfLastDialogRemoved();
 }
 
@@ -417,6 +427,11 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
   UpdateOverlayScale(io.DisplaySize.y);
 
+  const bool wants_gamepad = WantsGamepad();
+  input::X_INPUT_GAMEPAD pad = {};
+  const bool have_pad = wants_gamepad && gamepad_source_ && gamepad_source_(&pad);
+  gamepad_nav_->Update(io, wants_gamepad, have_pad ? &pad : nullptr);
+
   ImGui::NewFrame();
 
   assert_true(!IsDrawingDialogs());
@@ -635,6 +650,7 @@ void ImGuiDrawer::ClearInput() {
   io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
   std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
   io.ClearInputKeys();
+  gamepad_nav_->Release(io);
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
 }
