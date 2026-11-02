@@ -1295,6 +1295,21 @@ void SaveConfigSubset(const std::filesystem::path& config_path,
   WriteConfigSubsetLocked(config_path, names, false);
 }
 
+bool TrySaveConfigSubset(const std::filesystem::path& config_path,
+                         const std::vector<std::string>& names) {
+  std::lock_guard lock(GetRegistryMutex());
+  for (const auto& name : names) {
+    const auto& registry = GetRegistryStorage();
+    const auto it = std::find_if(registry.begin(), registry.end(),
+                                 [&name](const FlagEntry& entry) { return entry.name == name; });
+    if (it == registry.end() || it->persistence != Persistence::kConfig ||
+        it->type == FlagType::Command) {
+      return false;
+    }
+  }
+  return WriteConfigSubsetLocked(config_path, names, false);
+}
+
 bool TrySaveConfig(const std::filesystem::path& config_path) {
   std::lock_guard lock(GetRegistryMutex());
   std::vector<std::string> names;
