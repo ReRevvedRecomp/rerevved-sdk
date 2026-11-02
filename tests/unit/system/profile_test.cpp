@@ -198,6 +198,24 @@ TEST_CASE("profile content roots share only marketplace packages and headers", "
       fs::exists(base / baseline_xuid / title / "Headers" / "00000001" / "profile-save.header"));
 }
 
+TEST_CASE("content listing describes a package without a header file", "[profile]") {
+  TempDirectory temp("rex_content_headerless");
+  const auto base = temp.path() / "base";
+  constexpr uint32_t title_id = 0x1234ABCD;
+  fs::create_directories(base / "0000000000000000" / "1234ABCD" / "00000002" / "loose-dlc");
+
+  rex::system::xam::ContentManager manager(nullptr, base);
+  const auto listed =
+      manager.ListContent(1, 0, rex::system::XContentType::kMarketplaceContent, title_id);
+  REQUIRE(listed.size() == 1);
+  CHECK(listed[0].device_id == 1u);
+  CHECK(listed[0].content_type == rex::system::XContentType::kMarketplaceContent);
+  CHECK(listed[0].file_name() == "loose-dlc");
+  CHECK(listed[0].display_name() == u"loose-dlc");
+  CHECK(listed[0].title_id == title_id);
+  CHECK(listed[0].xuid == 0u);
+}
+
 TEST_CASE("profile copy rejects invalid specifications", "[profile]") {
   TempDirectory temp("rex_profile_invalid_spec");
   const auto base = temp.path() / "user";
