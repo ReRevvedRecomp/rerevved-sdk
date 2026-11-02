@@ -480,6 +480,12 @@ CollectResult CollectAllowlist(const ProfilePaths& target,
   if (result != CollectResult::kSuccess && result != CollectResult::kMissing) {
     return result;
   }
+  for (const auto& relative : specification.optional_relative_files) {
+    result = CollectOptionalFile(target.base_root / relative, relative, files, destinations);
+    if (result != CollectResult::kSuccess && result != CollectResult::kMissing) {
+      return result;
+    }
+  }
   return CollectResult::kSuccess;
 }
 
@@ -671,7 +677,8 @@ std::optional<ProfilePaths> ResolveProfile(const fs::path& base_root, std::strin
 
 ProfileCopyResult CopyFromDefault(const ProfilePaths& target,
                                   const ProfileCopySpecification& specification) {
-  if (specification.title_id == 0 || !IsSafeRelativePath(specification.config_relative_path)) {
+  if (specification.title_id == 0 || !IsSafeRelativePath(specification.config_relative_path) ||
+      !std::ranges::all_of(specification.optional_relative_files, IsSafeRelativePath)) {
     return ProfileCopyResult::kInvalidSpecification;
   }
 

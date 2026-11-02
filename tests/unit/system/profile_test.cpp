@@ -15,6 +15,7 @@
 namespace {
 
 namespace fs = std::filesystem;
+using rex::X_RESULT;
 
 class TempDirectory {
  public:
@@ -198,6 +199,74 @@ TEST_CASE("profile content roots share only marketplace packages and headers", "
       fs::exists(base / baseline_xuid / title / "Headers" / "00000001" / "profile-save.header"));
 }
 
+TEST_CASE("content listing describes a package without a header file", "[profile]") {
+  TempDirectory temp("rex_content_headerless");
+  const auto base = temp.path() / "base";
+  constexpr uint32_t title_id = 0x1234ABCD;
+  fs::create_directories(base / "0000000000000000" / "1234ABCD" / "00000002" / "loose-dlc");
+
+  rex::system::xam::ContentManager manager(nullptr, base);
+  const auto listed =
+      manager.ListContent(1, 0, rex::system::XContentType::kMarketplaceContent, title_id);
+  REQUIRE(listed.size() == 1);
+  CHECK(listed[0].device_id == 1u);
+  CHECK(listed[0].content_type == rex::system::XContentType::kMarketplaceContent);
+  CHECK(listed[0].file_name() == "loose-dlc");
+  CHECK(listed[0].display_name() == u"loose-dlc");
+  CHECK(listed[0].title_id == title_id);
+  CHECK(listed[0].xuid == 0u);
+}
+
+TEST_CASE("title packages list as marketplace content and refuse writes", "[profile]") {
+  TempDirectory temp("rex_content_title_package");
+  const auto base = temp.path() / "base";
+  const auto pack = temp.path() / "packs" / "map-pack";
+  constexpr uint32_t title_id = 0x1234ABCD;
+  const auto other = temp.path() / "packs" / "other";
+  WriteFile(pack / "dlc.fpk", "archive");
+  WriteFile(other / "dlc.fpk", "other");
+  const auto market = base / "0000000000000000" / "1234ABCD" / "00000002";
+  fs::create_directories(market / "installed");
+  fs::create_directories(market / "RR_MAP");
+
+  rex::system::xam::ContentManager manager(nullptr, base);
+  CHECK(manager.AddTitlePackage(title_id, "rr_map", pack) == X_ERROR_SUCCESS);
+  CHECK(manager.AddTitlePackage(title_id, "RR_MAP", pack) == X_ERROR_ALREADY_EXISTS);
+  CHECK(manager.AddTitlePackage(title_id, "", pack) == X_ERROR_INVALID_PARAMETER);
+  CHECK(manager.AddTitlePackage(title_id, "a/b", pack) == X_ERROR_INVALID_PARAMETER);
+  CHECK(manager.AddTitlePackage(title_id, "gone", temp.path() / "missing") ==
+        X_ERROR_PATH_NOT_FOUND);
+  CHECK(manager.AddTitlePackage(0x0BADF00D, "rr_other", other) == X_ERROR_SUCCESS);
+
+  const auto listed =
+      manager.ListContent(1, 0, rex::system::XContentType::kMarketplaceContent, title_id);
+  REQUIRE(listed.size() == 2);
+  const auto& title_package = listed[0].file_name() == "RR_MAP" ? listed[0] : listed[1];
+  CHECK(title_package.file_name() == "RR_MAP");
+  CHECK(title_package.device_id == 1u);
+  CHECK(title_package.title_id == title_id);
+  CHECK(manager.ListContent(1, 0, rex::system::XContentType::kSavedGame, title_id).empty());
+  CHECK(manager.ListContent(1, 0, rex::system::XContentType::kMarketplaceContent, 0x0BADF00D)
+            .size() == 1);
+
+  rex::system::xam::XCONTENT_AGGREGATE_DATA lowercase = title_package;
+  lowercase.set_file_name("rr_map");
+  fs::remove_all(market / "RR_MAP");
+  CHECK(manager.ContentExists(0, title_package));
+  CHECK(manager.ContentExists(0, lowercase));
+
+  rex::system::xam::XCONTENT_AGGREGATE_DATA other_title = title_package;
+  other_title.set_file_name("rr_other");
+  CHECK_FALSE(manager.ContentExists(0, other_title));
+
+  CHECK(manager.CreateContent("rr", 0, title_package) == X_ERROR_ACCESS_DENIED);
+  CHECK(manager.SetContentThumbnail(0, title_package, {1, 2, 3}) == X_ERROR_ACCESS_DENIED);
+  CHECK(manager.DeleteContent(0, title_package) == X_ERROR_ACCESS_DENIED);
+  CHECK(manager.UnmountAndDeleteContent(0, title_package) == X_ERROR_ACCESS_DENIED);
+  CHECK(ReadFile(pack / "dlc.fpk") == "archive");
+  CHECK_FALSE(fs::exists(pack / "__thumbnail.png"));
+}
+
 TEST_CASE("profile copy rejects invalid specifications", "[profile]") {
   TempDirectory temp("rex_profile_invalid_spec");
   const auto base = temp.path() / "user";
@@ -319,6 +388,27 @@ TEST_CASE("profile copy preserves empty and absent asset loadouts", "[profile]")
 
     CHECK_FALSE(fs::exists(resolved->active_root / "asset_order.txt"));
   }
+}
+
+TEST_CASE("profile copy carries title-named optional files", "[profile]") {
+  TempDirectory temp("rex_profile_copy_optional_files");
+  const auto base = temp.path() / "user";
+  WriteFile(base / "rerevved.toml", "fullscreen = false\n");
+  WriteFile(base / "map_order.txt", "island\n");
+
+  const auto resolved = rex::system::ResolveProfile(base, "alpha");
+  REQUIRE(resolved);
+  const rex::system::ProfileCopySpecification unsafe{
+      fs::path("rerevved.toml"), 0x1234ABCD, {fs::path("../map_order.txt")}};
+  CHECK(rex::system::CopyFromDefault(*resolved, unsafe) ==
+        rex::system::ProfileCopyResult::kInvalidSpecification);
+
+  const rex::system::ProfileCopySpecification specification{
+      fs::path("rerevved.toml"), 0x1234ABCD, {fs::path("map_order.txt"), fs::path("absent.txt")}};
+  REQUIRE(rex::system::CopyFromDefault(*resolved, specification) ==
+          rex::system::ProfileCopyResult::kSuccess);
+  CHECK(ReadFile(resolved->active_root / "map_order.txt") == "island\n");
+  CHECK_FALSE(fs::exists(resolved->active_root / "absent.txt"));
 }
 
 TEST_CASE("profile copy rejects destination collisions without publication", "[profile]") {
