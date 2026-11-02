@@ -3,6 +3,7 @@
 # Core UI sources
 set(REXUI_CORE_SOURCES
     graphics_upload_buffer_pool.cpp
+    gamepad_nav.cpp
     graphics_util.cpp
     image_decode.cpp
     imgui_dialog.cpp

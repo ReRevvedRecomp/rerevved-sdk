@@ -137,6 +137,10 @@ bool TrySaveConfig(const std::filesystem::path& config_path);
 void SaveConfigSubset(const std::filesystem::path& config_path,
                       const std::vector<std::string>& names);
 
+// Like SaveConfigSubset; false on write failure or an unregistered, non-persistent or command name.
+bool TrySaveConfigSubset(const std::filesystem::path& config_path,
+                         const std::vector<std::string>& names);
+
 //=============================================================================
 // Flag Registry
 //=============================================================================

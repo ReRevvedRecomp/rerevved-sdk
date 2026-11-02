@@ -6,6 +6,7 @@ add_executable(unit_tests
     ui/bar_fill_test.cpp
     ui/detached_presentation_test.cpp
     ui/frame_rate_meter_test.cpp
+    ui/gamepad_nav_test.cpp
     ui/notifications_test.cpp
     ui/settings_rows_test.cpp
     ui/window_size_test.cpp
@@ -31,6 +32,7 @@ add_executable(unit_tests
     core/filesystem_test.cpp
     filesystem/virtual_file_system_test.cpp
     core/first_seen_test.cpp
+    core/vfs_overwrite_test.cpp
     core/hash_test.cpp
     core/sha256_test.cpp
     core/relay_test.cpp

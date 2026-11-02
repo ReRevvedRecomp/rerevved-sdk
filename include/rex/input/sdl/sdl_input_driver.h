@@ -27,6 +27,20 @@
 
 namespace rex::input::sdl {
 
+constexpr GamepadFamily GamepadFamilyForType(SDL_GamepadType type) {
+  switch (type) {
+    case SDL_GAMEPAD_TYPE_XBOX360:
+    case SDL_GAMEPAD_TYPE_XBOXONE:
+      return GamepadFamily::kXbox;
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5:
+      return GamepadFamily::kPlayStation;
+    default:
+      return GamepadFamily::kOther;
+  }
+}
+
 class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
  public:
   explicit SDLInputDriver(rex::ui::Window* window, size_t window_z_order);
@@ -36,6 +50,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
 
   void EnumerateDevices(std::vector<DeviceInfo>& out) override;
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override;
+  X_RESULT GetDevicePhysicalState(DeviceId id, X_INPUT_STATE* out_state) override;
   X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
                                  X_INPUT_CAPABILITIES* out_caps) override;
   X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) override;

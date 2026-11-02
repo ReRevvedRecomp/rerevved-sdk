@@ -1,6 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include <rex/input/sdl/sdl_input_driver.h>
 
@@ -11,6 +15,17 @@ struct SDLInputDriverTestAccess {
   static bool WatchAdded(const SDLInputDriver& driver) { return driver.event_watch_added_; }
   static bool EventsInit(const SDLInputDriver& driver) { return driver.sdl_events_initialized_; }
   static bool GamepadInit(const SDLInputDriver& driver) { return driver.SDL_Gamepad_initialized_; }
+  static std::unique_lock<std::mutex> LockControllers(SDLInputDriver& driver) {
+    return std::unique_lock<std::mutex>(driver.controllers_mutex_);
+  }
+  static std::unique_lock<std::mutex> Drain(SDLInputDriver& driver) {
+    return driver.DrainAndLock();
+  }
+  static void Push(SDLInputDriver& driver, const SDL_Event& event) { driver.HandleEvent(event); }
+  static size_t Pending(SDLInputDriver& driver) {
+    std::lock_guard<std::mutex> guard(driver.event_queue_mutex_);
+    return driver.pending_events_.size();
+  }
   static int WatchRemovals() { return SDLInputDriver::WatchRemovalCount(); }
   static int SubsystemQuits() { return SDLInputDriver::SubsystemQuitCount(); }
 };
@@ -65,4 +80,41 @@ TEST_CASE("SDL input driver that never initialized tears down nothing", "[input]
   { SDLInputDriver driver(nullptr, 0); }
   CHECK(Access::WatchRemovals() == removals);
   CHECK(Access::SubsystemQuits() == quits);
+}
+
+TEST_CASE("SDL gamepad types map to glyph families", "[input][sdl]") {
+  using rex::input::GamepadFamily;
+  using rex::input::sdl::GamepadFamilyForType;
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_XBOX360) == GamepadFamily::kXbox);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_XBOXONE) == GamepadFamily::kXbox);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS3) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS4) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS5) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_UNKNOWN) == GamepadFamily::kOther);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_STANDARD) == GamepadFamily::kOther);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO) == GamepadFamily::kOther);
+}
+
+TEST_CASE("SDL drain takes the controllers lock before it takes the queued events",
+          "[input][sdl]") {
+  SDLInputDriver driver(nullptr, 0);
+  SDL_Event event = {};
+  event.type = SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+
+  auto held = Access::LockControllers(driver);
+  Access::Push(driver, event);
+  std::atomic<bool> started = false;
+  std::thread drainer([&] {
+    started = true;
+    auto guard = Access::Drain(driver);
+  });
+  while (!started) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  Access::Push(driver, event);
+  held.unlock();
+  drainer.join();
+  CHECK(Access::Pending(driver) == 0);
 }

@@ -25,7 +25,7 @@ AchievementsOverlayDialog::AchievementsOverlayDialog(ImGuiDrawer* imgui_drawer,
                                                      rex::Runtime* runtime,
                                                      rex::system::AchievementManager* achievements,
                                                      std::function<void()> close_callback)
-    : ImGuiDialog(imgui_drawer),
+    : ImGuiDialog(imgui_drawer, /*wants_gamepad=*/true),
       achievements_(achievements),
       icon_cache_(immediate_drawer, runtime),
       close_callback_(std::move(close_callback)) {}
@@ -55,7 +55,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
                          close_callback_ ? &open : nullptr, ImGuiWindowFlags_NoCollapse, 0.92f)) {
     if (close_callback_ && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || OverlayPadClosePressed())) {
       open = false;
     }
     const auto groups = achievement_groups::Split(achievements_->ListAchievements());
@@ -85,7 +85,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
       ImGui::Spacing();
 
       // ---- List --------------------------------------------------------------
-      ImGui::BeginChild("##achlist", ImVec2(0.0f, 0.0f), false);
+      ImGui::BeginChild("##achlist", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
       ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
       for (const auto& a : achievements) {
@@ -99,7 +99,8 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
         draw_list->ChannelsSplit(2);
         draw_list->ChannelsSetCurrent(1);
 
-        const float row_start_y = ImGui::GetCursorScreenPos().y;
+        const ImVec2 row_start = ImGui::GetCursorScreenPos();
+        const float row_start_y = row_start.y;
         const float pad = 4.0f;
         ImGui::Dummy(ImVec2(0.0f, pad * 0.5f));
 
@@ -131,7 +132,17 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
         ImGui::EndGroup();
 
         ImGui::Dummy(ImVec2(0.0f, pad * 0.5f));
-        const float row_end_y = ImGui::GetCursorScreenPos().y;
+        const ImVec2 row_end = ImGui::GetCursorScreenPos();
+        const float row_end_y = row_end.y;
+
+        // Invisible stops let the pad focus, highlight and scroll plain-text rows.
+        ImGui::SetCursorScreenPos(row_start);
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+        ImGui::Selectable("##focus", false, 0, ImVec2(0.0f, row_end_y - row_start_y));
+        ImGui::PopStyleColor(3);
+        ImGui::SetCursorScreenPos(row_end);
 
         // Paint the band behind unlocked rows on the lower channel.
         if (is_unlocked) {
@@ -151,12 +162,17 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
 
     if (groups.custom.empty()) {
       draw_group(groups.original);
-    } else if (ImGui::BeginTabBar("##ach-tabs")) {
-      if (ImGui::BeginTabItem("Original")) {
+    } else if (const int requested_tab = OverlayTabRequest(selected_tab_, 2);
+               ImGui::BeginTabBar("##ach-tabs")) {
+      if (ImGui::BeginTabItem("Original", nullptr,
+                              requested_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        selected_tab_ = 0;
         draw_group(groups.original);
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Custom")) {
+      if (ImGui::BeginTabItem("Custom", nullptr,
+                              requested_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        selected_tab_ = 1;
         draw_group(groups.custom);
         ImGui::EndTabItem();
       }

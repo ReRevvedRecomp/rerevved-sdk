@@ -21,20 +21,69 @@ constexpr ImVec4 kHeaderText{0.60f, 0.85f, 1.00f, 1.00f};
 constexpr ImVec4 kMutedText{0.60f, 0.62f, 0.66f, 1.00f};
 constexpr ImVec4 kErrorText{1.00f, 0.82f, 0.30f, 1.00f};
 
+AssetOverlayLoadoutSource RuntimeAssetSource(rex::Runtime* runtime) {
+  AssetOverlayLoadoutSource source;
+  source.title = "Asset Overrides";
+  source.noun = "asset overrides";
+  source.kind = "asset overlay";
+  source.order_file = "asset_order.txt";
+  if (!runtime) {
+    return source;
+  }
+  source.catalog = [runtime]() -> const rex::system::AssetOverlayCatalog& {
+    return runtime->asset_overlay_catalog();
+  };
+  source.order_ids = [runtime]() { return runtime->asset_order_ids(); };
+  source.validate = [runtime](std::span<const std::string> ids) {
+    return runtime->ValidateAssetOverlayLoadout(ids);
+  };
+  source.apply = [runtime](std::span<const std::string> ids, bool replace_invalid_current) {
+    return runtime->ApplyAssetOverlayLoadout(ids, replace_invalid_current);
+  };
+  source.rescan = [runtime]() { runtime->RescanAssetOverlayCatalog(); };
+  source.diagnostics = [runtime]() { return runtime->asset_loadout_diagnostics(); };
+  source.file_exists = [runtime]() { return runtime->asset_order_file_exists(); };
+  source.file_invalid = [runtime]() { return runtime->asset_order_file_invalid(); };
+  source.restart_required = [runtime]() { return runtime->asset_overlay_restart_required(); };
+  return source;
+}
+
 }  // namespace
 
 AssetOverlayManagerPane::AssetOverlayManagerPane(rex::Runtime* runtime,
                                                  std::function<void()> close_callback)
-    : runtime_(runtime), close_callback_(std::move(close_callback)) {
-  if (runtime_) {
-    staged_ids_ = runtime_->asset_order_ids();
+    : AssetOverlayManagerPane(RuntimeAssetSource(runtime), std::move(close_callback)) {}
+
+AssetOverlayManagerPane::AssetOverlayManagerPane(AssetOverlayLoadoutSource source,
+                                                 std::function<void()> close_callback)
+    : source_(std::move(source)),
+      discard_title_("Discard " + source_.kind + " changes?"),
+      replace_title_("Replace invalid " + source_.order_file + "?"),
+      close_callback_(std::move(close_callback)) {
+  if (source_.catalog) {
+    saved_ids_ = source_.order_ids();
+    staged_ids_ = saved_ids_;
   }
+}
+
+void AssetOverlayManagerPane::SyncSaved() {
+  if (!source_.catalog) {
+    return;
+  }
+  auto saved = source_.order_ids();
+  if (saved == saved_ids_) {
+    return;
+  }
+  if (staged_ids_ == saved_ids_) {
+    staged_ids_ = saved;
+  }
+  saved_ids_ = std::move(saved);
 }
 
 AssetOverlayManagerPane::~AssetOverlayManagerPane() = default;
 
 bool AssetOverlayManagerPane::IsDirty() const {
-  return runtime_ && staged_ids_ != runtime_->asset_order_ids();
+  return source_.catalog && staged_ids_ != source_.order_ids();
 }
 
 void AssetOverlayManagerPane::ClearStatus() {
@@ -51,33 +100,38 @@ bool AssetOverlayManagerPane::RequestClose() {
 }
 
 void AssetOverlayManagerPane::ApplyStaged(bool replace_invalid_current) {
-  if (!runtime_) {
+  if (!source_.catalog) {
     return;
   }
-  const auto result = runtime_->ApplyAssetOverlayLoadout(staged_ids_, replace_invalid_current);
+  const auto result = source_.apply(staged_ids_, replace_invalid_current);
   if (result.status == rex::system::AssetOverlayLoadoutApplyStatus::kInvalidCurrent) {
     replacement_popup_ = true;
     return;
   }
   if (result.succeeded()) {
+    SyncSaved();
     status_message_.clear();
     return;
   }
-  status_message_ = result.diagnostics.empty() ? "Could not save the asset overlay loadout."
+  status_message_ = result.diagnostics.empty() ? "Could not save the " + source_.kind + " loadout."
                                                : result.diagnostics.front().message;
 }
 
 void AssetOverlayManagerPane::DrawDiscardPopup(const Style& style) {
+  const bool was_open = ImGui::IsPopupOpen(discard_title_.c_str());
   if (discard_popup_) {
-    ImGui::OpenPopup("Discard asset overlay changes?");
+    ImGui::OpenPopup(discard_title_.c_str());
   }
-  if (!ImGui::BeginPopupModal("Discard asset overlay changes?", nullptr,
-                              ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::BeginPopupModal(discard_title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
   }
-  ImGui::TextWrapped("Discard asset overlay enable and priority changes?");
+  if (was_open && OverlayPadBackPressed()) {
+    discard_popup_ = false;
+    ImGui::CloseCurrentPopup();
+  }
+  ImGui::TextWrapped("Discard %s enable and priority changes?", source_.kind.c_str());
   if (OverlayButton(style, "Discard")) {
-    staged_ids_ = runtime_ ? runtime_->asset_order_ids() : std::vector<std::string>{};
+    staged_ids_ = source_.catalog ? source_.order_ids() : std::vector<std::string>{};
     discard_popup_ = false;
     ImGui::CloseCurrentPopup();
     if (close_callback_) {
@@ -93,15 +147,19 @@ void AssetOverlayManagerPane::DrawDiscardPopup(const Style& style) {
 }
 
 void AssetOverlayManagerPane::DrawReplacementPopup(const Style& style) {
+  const bool was_open = ImGui::IsPopupOpen(replace_title_.c_str());
   if (replacement_popup_) {
-    ImGui::OpenPopup("Replace invalid asset_order.txt?");
+    ImGui::OpenPopup(replace_title_.c_str());
   }
-  if (!ImGui::BeginPopupModal("Replace invalid asset_order.txt?", nullptr,
-                              ImGuiWindowFlags_AlwaysAutoResize)) {
+  if (!ImGui::BeginPopupModal(replace_title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
   }
-  ImGui::TextWrapped(
-      "The current asset overlay loadout has errors. Replace it with the selected packs?");
+  if (was_open && OverlayPadBackPressed()) {
+    replacement_popup_ = false;
+    ImGui::CloseCurrentPopup();
+  }
+  ImGui::TextWrapped("The current %s loadout has errors. Replace it with the selected packs?",
+                     source_.kind.c_str());
   if (OverlayButton(style, "Replace and save")) {
     replacement_popup_ = false;
     ImGui::CloseCurrentPopup();
@@ -116,9 +174,9 @@ void AssetOverlayManagerPane::DrawReplacementPopup(const Style& style) {
 }
 
 void AssetOverlayManagerPane::DrawContents(const Style& style) {
-  const auto* catalog = runtime_ ? &runtime_->asset_overlay_catalog() : nullptr;
-  const auto staged = runtime_ ? runtime_->ValidateAssetOverlayLoadout(staged_ids_)
-                               : rex::system::AssetOverlayLoadoutSelection{};
+  const auto* catalog = source_.catalog ? &source_.catalog() : nullptr;
+  const auto staged =
+      source_.catalog ? source_.validate(staged_ids_) : rex::system::AssetOverlayLoadoutSelection{};
   const float footer_height =
       ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 16.0f;
 
@@ -132,12 +190,14 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
     ImGui::Text("%zu installed | %zu enabled", catalog ? catalog->packages.size() : 0,
                 staged_ids_.size());
     ImGui::PopStyleColor();
-    ImGui::TextColored(kMutedText, "Enable or disable asset overrides, then save changes.");
-    if (runtime_ && OverlayButton(style, "Rescan")) {
-      runtime_->RescanAssetOverlayCatalog();
+    ImGui::TextColored(kMutedText, "Enable or disable %s, then save changes.",
+                       source_.noun.c_str());
+    if (source_.catalog && OverlayButton(style, "Rescan")) {
+      source_.rescan();
+      SyncSaved();
       ClearStatus();
     }
-    if (runtime_) {
+    if (source_.catalog) {
       ImGui::SameLine();
       if (OverlayButton(style, "Edit Order")) {
         editing_priority_ = true;
@@ -147,9 +207,10 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
   }
 
   if (editing_priority_) {
-    ImGui::BeginChild("##assetpriority", ImVec2(0.0f, -footer_height), false);
+    ImGui::BeginChild("##assetpriority", ImVec2(0.0f, -footer_height),
+                      ImGuiChildFlags_NavFlattened);
     if (staged_ids_.empty()) {
-      ImGui::TextDisabled("No enabled asset overrides.");
+      ImGui::TextDisabled("No enabled %s.", source_.noun.c_str());
     }
     for (size_t order = 0; order < staged_ids_.size(); ++order) {
       const auto& id = staged_ids_[order];
@@ -186,7 +247,7 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
     }
     ImGui::EndChild();
   } else {
-    ImGui::BeginChild("##assetlist", ImVec2(0.0f, -footer_height), false);
+    ImGui::BeginChild("##assetlist", ImVec2(0.0f, -footer_height), ImGuiChildFlags_NavFlattened);
     if (!staged.IsValid()) {
       ImGui::TextColored(kErrorText, "Selected loadout has errors:");
       for (const auto& diagnostic : staged.diagnostics) {
@@ -194,9 +255,12 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
       }
       ImGui::Separator();
     }
-    if (runtime_ && !runtime_->asset_loadout_diagnostics().empty()) {
-      ImGui::TextColored(kErrorText, "Current asset_order.txt has errors:");
-      for (const auto& diagnostic : runtime_->asset_loadout_diagnostics()) {
+    const auto current_diagnostics =
+        source_.catalog ? source_.diagnostics()
+                        : std::vector<rex::system::AssetOverlayLoadoutDiagnostic>{};
+    if (!current_diagnostics.empty()) {
+      ImGui::TextColored(kErrorText, "Current %s has errors:", source_.order_file.c_str());
+      for (const auto& diagnostic : current_diagnostics) {
         ImGui::TextWrapped("- %s", diagnostic.message.c_str());
       }
       ImGui::Separator();
@@ -251,10 +315,9 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
   }
 
   ImGui::Separator();
-  const bool can_save =
-      runtime_ &&
-      (IsDirty() || !runtime_->asset_order_file_exists() || runtime_->asset_order_file_invalid()) &&
-      staged.IsValid();
+  const bool can_save = source_.catalog &&
+                        (IsDirty() || !source_.file_exists() || source_.file_invalid()) &&
+                        staged.IsValid();
   if (editing_priority_) {
     if (OverlayButton(style, "Done")) {
       editing_priority_ = false;
@@ -265,7 +328,7 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
     ImGui::BeginDisabled();
   }
   if (OverlayButton(style, "Save changes")) {
-    if (runtime_->asset_order_file_invalid()) {
+    if (source_.file_invalid()) {
       replacement_popup_ = true;
     } else {
       ApplyStaged(false);
@@ -280,7 +343,7 @@ void AssetOverlayManagerPane::DrawContents(const Style& style) {
   } else if (IsDirty()) {
     ImGui::SameLine();
     ImGui::TextColored(kMutedText, "Unsaved changes");
-  } else if (runtime_ && runtime_->asset_overlay_restart_required()) {
+  } else if (source_.catalog && source_.restart_required()) {
     ImGui::SameLine();
     ImGui::TextColored(kErrorText, "Restart required for saved changes.");
   }

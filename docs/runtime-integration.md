@@ -202,6 +202,13 @@ other values go through `format_label`. An empty layout keeps the category tree
 with its "All" entry. Key bindings show as a button that starts a capture, with
 Reset only when the binding differs from its default.
 
+`ReXApp::OnConfigureModManager` runs each time the mod manager opens. Add an
+`ui::AssetOverlayLoadoutSource` (`rex/ui/overlay/asset_overlay_manager.h`) to
+its list to show another loadout tab after Asset Overrides: a catalog of
+asset-overlay style packages with its own order file, edited with the same
+enable, order, save and restart behavior as Asset Overrides. Every callback of
+the source is required.
+
 `SettingsLayout::float_decimals` maps a Double cvar name to fixed decimal places
 (0 through 17); an absent or invalid entry keeps four decimals. The editor seeds
 its field text from that rounded display. With a precision entry, it submits the
@@ -247,7 +254,11 @@ write keeps the unsaved count and shows an error. Revert restores the values
 present at the last save or when the overlay opened. Both cover rows saved in
 configuration, except hidden rows and commands. Escape or the close button
 closes the settings, mods and achievements overlays; queued close and FPS
-counter work is dropped once `ShutdownOverlays()` runs.
+counter work is dropped once `ShutdownOverlays()` runs. A title opens a built-in
+overlay with `OpenBuiltinOverlay` and closes it with `CloseBuiltinOverlay`; both
+run on the UI thread in request order. `cvar::TrySaveConfigSubset` saves named
+config-persistent flags like `SaveConfigSubset`, reports failure, and refuses
+unknown names and commands.
 
 `ui::Style` offers optional scaling and drawing customization:
 

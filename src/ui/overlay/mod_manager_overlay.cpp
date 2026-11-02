@@ -38,18 +38,24 @@ const char* DiagnosticLabel(const rex::system::ModDiagnostic& diagnostic) {
 }  // namespace
 
 ModManagerDialog::ModManagerDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* immediate_drawer,
-                                   rex::Runtime* runtime, std::function<void()> close_callback)
-    : ImGuiDialog(imgui_drawer),
+                                   rex::Runtime* runtime, std::function<void()> close_callback,
+                                   std::vector<AssetOverlayLoadoutSource> extra_tabs)
+    : ImGuiDialog(imgui_drawer, /*wants_gamepad=*/true),
       immediate_drawer_(immediate_drawer),
       runtime_(runtime),
       close_callback_(std::move(close_callback)) {
+  // Discard resumes closing; the next dirty pane may still ask for confirmation.
+  const auto pane_closed = [this]() {
+    if (RequestClose() && close_callback_) {
+      close_callback_();
+    }
+  };
   if (runtime_) {
     staged_ids_ = runtime_->mod_order_ids();
-    asset_manager_ = std::make_unique<AssetOverlayManagerPane>(runtime_, [this]() {
-      if (close_callback_) {
-        close_callback_();
-      }
-    });
+    asset_manager_ = std::make_unique<AssetOverlayManagerPane>(runtime_, pane_closed);
+  }
+  for (auto& tab : extra_tabs) {
+    extra_panes_.push_back(std::make_unique<AssetOverlayManagerPane>(std::move(tab), pane_closed));
   }
 }
 
@@ -64,12 +70,24 @@ void ModManagerDialog::ClearStaleStatus() {
   replacement_popup_ = false;
 }
 
+bool ModManagerDialog::RequestPanesClose() {
+  if (asset_manager_ && !asset_manager_->RequestClose()) {
+    return false;
+  }
+  for (auto& pane : extra_panes_) {
+    if (!pane->RequestClose()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool ModManagerDialog::RequestClose() {
   if (IsDirty()) {
     discard_popup_ = true;
     return false;
   }
-  return !asset_manager_ || asset_manager_->RequestClose();
+  return RequestPanesClose();
 }
 
 void ModManagerDialog::ApplyStaged(bool replace_invalid_current) {
@@ -94,7 +112,9 @@ void ModManagerDialog::ApplyStaged(bool replace_invalid_current) {
 }
 
 void ModManagerDialog::DrawDiscardPopup() {
-  bool request_asset_close = false;
+  bool discarded = false;
+  // B that opened the popup must not also answer it.
+  const bool was_open = ImGui::IsPopupOpen("Discard unsaved changes?");
   if (discard_popup_) {
     ImGui::OpenPopup("Discard unsaved changes?");
   }
@@ -102,12 +122,16 @@ void ModManagerDialog::DrawDiscardPopup() {
                               ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
   }
+  if (was_open && OverlayPadBackPressed()) {
+    discard_popup_ = false;
+    ImGui::CloseCurrentPopup();
+  }
   ImGui::TextWrapped("Discard enabled and load-order changes?");
   if (OverlayButton(imgui_drawer()->style(), "Discard")) {
     staged_ids_ = runtime_ ? runtime_->mod_order_ids() : std::vector<std::string>{};
     discard_popup_ = false;
     ImGui::CloseCurrentPopup();
-    request_asset_close = asset_manager_ != nullptr;
+    discarded = true;
   }
   ImGui::SameLine();
   if (OverlayButton(imgui_drawer()->style(), "Keep editing")) {
@@ -115,23 +139,23 @@ void ModManagerDialog::DrawDiscardPopup() {
     ImGui::CloseCurrentPopup();
   }
   ImGui::EndPopup();
-  if (request_asset_close && !asset_manager_->RequestClose()) {
-    return;
-  }
-  if (request_asset_close || !asset_manager_) {
-    if (close_callback_) {
-      close_callback_();
-    }
+  if (discarded && RequestPanesClose() && close_callback_) {
+    close_callback_();
   }
 }
 
 void ModManagerDialog::DrawReplacementPopup() {
+  const bool was_open = ImGui::IsPopupOpen("Replace invalid mod_order.txt?");
   if (replacement_popup_) {
     ImGui::OpenPopup("Replace invalid mod_order.txt?");
   }
   if (!ImGui::BeginPopupModal("Replace invalid mod_order.txt?", nullptr,
                               ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
+  }
+  if (was_open && OverlayPadBackPressed()) {
+    replacement_popup_ = false;
+    ImGui::CloseCurrentPopup();
   }
   ImGui::TextWrapped(
       "The current profile loadout has errors. Replace it with the selected packages?");
@@ -199,11 +223,15 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
                          close_callback_ ? &open : nullptr, ImGuiWindowFlags_NoCollapse, 0.92f)) {
     if (close_callback_ && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         !ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || OverlayPadClosePressed())) {
       open = false;
     }
+    const int requested_tab =
+        OverlayTabRequest(selected_tab_, 2 + static_cast<int>(extra_panes_.size()));
     if (ImGui::BeginTabBar("##package-tabs")) {
-      if (ImGui::BeginTabItem("Mods")) {
+      if (ImGui::BeginTabItem("Mods", nullptr,
+                              requested_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        selected_tab_ = 0;
         const auto* catalog = runtime_ ? &runtime_->mod_catalog() : nullptr;
         const size_t installed_count = catalog ? catalog->packages.size() : 0;
         const size_t staged_count = staged_ids_.size();
@@ -246,7 +274,8 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         const float footer_height =
             ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 16.0f;
         if (editing_load_order_) {
-          ImGui::BeginChild("##modlist", ImVec2(0.0f, -footer_height), false);
+          ImGui::BeginChild("##modlist", ImVec2(0.0f, -footer_height),
+                            ImGuiChildFlags_NavFlattened);
           if (staged_ids_.empty()) {
             ImGui::TextDisabled("No enabled mods.");
           } else {
@@ -363,7 +392,8 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
               !has_unavailable_active) {
             ImGui::TextDisabled("No installed mod packages.");
           } else {
-            ImGui::BeginChild("##modlist", ImVec2(0.0f, -footer_height), false);
+            ImGui::BeginChild("##modlist", ImVec2(0.0f, -footer_height),
+                              ImGuiChildFlags_NavFlattened);
             for (const auto& id : unavailable_staged_ids) {
               ImGui::PushID(("unavailable:" + id).c_str());
               ImGui::TextColored(kCodeBadge, "Unavailable enabled package: %s", id.c_str());
@@ -515,11 +545,22 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
         }
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Asset Overrides")) {
+      if (ImGui::BeginTabItem("Asset Overrides", nullptr,
+                              requested_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        selected_tab_ = 1;
         if (asset_manager_) {
           asset_manager_->DrawContents(imgui_drawer()->style());
         }
         ImGui::EndTabItem();
+      }
+      for (size_t i = 0; i < extra_panes_.size(); ++i) {
+        const int index = 2 + static_cast<int>(i);
+        if (ImGui::BeginTabItem(extra_panes_[i]->title().c_str(), nullptr,
+                                requested_tab == index ? ImGuiTabItemFlags_SetSelected : 0)) {
+          selected_tab_ = index;
+          extra_panes_[i]->DrawContents(imgui_drawer()->style());
+          ImGui::EndTabItem();
+        }
       }
       ImGui::EndTabBar();
     }
@@ -534,6 +575,9 @@ void ModManagerDialog::OnDraw(ImGuiIO& io) {
   DrawReplacementPopup();
   if (asset_manager_) {
     asset_manager_->DrawPopups(imgui_drawer()->style());
+  }
+  for (auto& pane : extra_panes_) {
+    pane->DrawPopups(imgui_drawer()->style());
   }
 }
 

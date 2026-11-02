@@ -12,6 +12,7 @@
 #ifndef REX_UI_IMGUI_DRAWER_H_
 #define REX_UI_IMGUI_DRAWER_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -19,6 +20,7 @@
 #include <optional>
 #include <vector>
 
+#include <rex/input/input.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/style.h>
@@ -28,6 +30,7 @@
 namespace rex {
 namespace ui {
 
+class GamepadNav;
 class ImGuiDialog;
 class Window;
 
@@ -35,6 +38,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   using FontSetupCallback = std::function<void(ImFontAtlas*)>;
   using StyleSetupCallback = std::function<void(ImGuiStyle&, Style&)>;
+  // Reads the pad that navigates the dialogs; false when none is connected.
+  using GamepadSource = std::function<bool(input::X_INPUT_GAMEPAD*)>;
   ImGuiDrawer(Window* window, size_t z_order, FontSetupCallback font_setup = nullptr,
               StyleSetupCallback style_setup = nullptr);
   ~ImGuiDrawer();
@@ -55,6 +60,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // Whether Draw would render anything, so a caller that has to marshal to the
   // UI thread can skip the round trip entirely.
   bool HasDialogs() const { return !dialogs_.empty(); }
+
+  // Any thread. While true the caller must give the guest a neutral pad.
+  bool WantsGamepad() const { return gamepad_dialogs_.load(std::memory_order_relaxed) > 0; }
+  void SetGamepadSource(GamepadSource source) { gamepad_source_ = std::move(source); }
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -109,6 +118,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
+  std::atomic<int> gamepad_dialogs_{0};
+  GamepadSource gamepad_source_;
+  std::unique_ptr<GamepadNav> gamepad_nav_;
   // Using an index, not an iterator, because after the erasure, the adjustment
   // must be done for the vector element indices that would be in the iterator
   // range that would be invalidated.

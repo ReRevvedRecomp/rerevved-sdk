@@ -31,6 +31,7 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/asset_overlay_manager.h>
 #include <rex/ui/overlay/fps_counter_overlay.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
@@ -187,6 +188,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// audience overrides and labels; leaving it empty keeps the category tree.
   virtual void OnConfigureSettings(ui::SettingsLayout& layout) { (void)layout; }
 
+  /// On each mod manager opening, add sources to `tabs` after Asset Overrides.
+  virtual void OnConfigureModManager(std::vector<ui::AssetOverlayLoadoutSource>& tabs) {
+    (void)tabs;
+  }
+
   /// Called after the config is loaded and logging is up, immediately before
   /// the online startup settings freeze. Set session options such as
   /// `live_invite` here, for example after waiting for a chat client's join
@@ -312,6 +318,14 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// refresh rate.
   void SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider);
 
+  enum class BuiltinOverlay { kSettings, kModManager, kAchievements };
+
+  /// Any thread; queued to the UI thread, dropped before setup or after shutdown.
+  void OpenBuiltinOverlay(BuiltinOverlay overlay);
+
+  /// Any thread; queued to the UI thread. A mod manager with unsaved work may refuse.
+  void CloseBuiltinOverlay(BuiltinOverlay overlay);
+
   /// Release overlay binds, runtime input/drawer references, SDK dialogs and
   /// both drawers. Safe to call again from OnDestroy, and re-armed by the next
   /// overlay setup. Call on the UI thread after stopping input polling and
@@ -344,6 +358,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void SyncFpsCounter();
   // Runs fn on the UI thread unless ShutdownOverlays runs first.
   void DeferWhileOverlaysAlive(std::function<void()> fn);
+  // UI thread only; no-op if already in the target state or overlays are shut down.
+  void CreateBuiltinOverlay(BuiltinOverlay overlay);
+  void DestroyBuiltinOverlay(BuiltinOverlay overlay);
 
   // WindowedApp overrides
   bool OnInitialize() override;

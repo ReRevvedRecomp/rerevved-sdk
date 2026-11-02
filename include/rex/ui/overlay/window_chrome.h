@@ -23,6 +23,15 @@ bool BeginOverlayWindow(const Style& style, const char* label, bool* p_open, ImG
 bool BeginOverlayPanel(const Style& style, const char* id, ImVec2 size, ImGuiWindowFlags flags = 0);
 void EndOverlayPanel();
 
+/// LB/RB tab target for the focused overlay, or -1. Pass SetSelected to BeginTabItem.
+int OverlayTabRequest(int selected, int count);
+
+/// B press; ImGui's cancel leaves modals open, so use this for their safe choice.
+bool OverlayPadBackPressed();
+
+/// B press with no item or popup to cancel; closes like Escape.
+bool OverlayPadClosePressed();
+
 /// ImGui::Button, or ImGui::SmallButton when compact is set, drawn over
 /// ChromeStyle::draw_button when the skin has one.
 bool OverlayButton(const Style& style, const char* label, ImVec2 size = ImVec2(0, 0),

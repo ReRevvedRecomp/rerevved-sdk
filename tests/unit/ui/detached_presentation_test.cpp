@@ -55,6 +55,10 @@ struct ReXAppTestAccess {
 
   static bool HasFpsCounter(const ReXApp& app) { return app.fps_counter_overlay_ != nullptr; }
 
+  static bool HasAchievementsOverlay(const ReXApp& app) {
+    return app.achievements_overlay_ != nullptr;
+  }
+
   static void SetGraphics(ReXApp& app, std::unique_ptr<system::IGraphicsSystem> graphics) {
     app.config_.graphics = std::move(graphics);
   }
@@ -97,20 +101,25 @@ class TestApp final : public rex::ReXApp {
  public:
   explicit TestApp(TestContext& context) : ReXApp(context, "detached test", {}) {}
 
+  using ReXApp::BuiltinOverlay;
+  using ReXApp::CloseBuiltinOverlay;
   using ReXApp::imgui_drawer;
   using ReXApp::immediate_drawer;
   using ReXApp::IsOverlayInputCaptured;
+  using ReXApp::OpenBuiltinOverlay;
   using ReXApp::runtime;
 
   void ShutdownOverlays() { ReXApp::ShutdownOverlays(); }
 
   bool accept_close = true;
+  int achievements_created = 0;
   int shutdown_count = 0;
   int before_hard_exit_count = 0;
 
  protected:
   bool OnWindowCloseRequested() override { return accept_close; }
   void OnShutdown() override { ++shutdown_count; }
+  std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   void OnBeforeHardExit() override {
     ++before_hard_exit_count;
     // Intercept the runtime path before process termination, including if a
@@ -166,6 +175,11 @@ class TestDialog final : public rex::ui::ImGuiDialog {
  private:
   std::function<void()> on_destroy_;
 };
+
+std::unique_ptr<rex::ui::ImGuiDialog> TestApp::CreateAchievementsOverlay() {
+  ++achievements_created;
+  return std::make_unique<TestDialog>(imgui_drawer());
+}
 
 class TestInputDriver final : public rex::input::InputDriver {
  public:
@@ -442,6 +456,68 @@ TEST_CASE("Queued FPS counter work does not outlive overlay shutdown", "[ui][det
     rex::cvar::UnregisterFlag(name);
   }
   rex::cvar::ResetToDefault("show_fps_counter");
+}
+
+TEST_CASE("Opening a built-in overlay leaves an open one alone", "[ui][detached]") {
+  TestContext context;
+  auto app = std::make_unique<TestApp>(context);
+  app->OpenBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+  CHECK(app->achievements_created == 0);
+
+  Access::SetWindow(*app, std::make_unique<TestWindow>(context), std::make_unique<TestDrawer>());
+  Access::SetupOverlays(*app);
+  for (int i = 0; i < 2; ++i) {
+    app->OpenBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+    context.ExecutePendingFunctionsFromUIThread();
+    CHECK(Access::HasAchievementsOverlay(*app));
+  }
+  CHECK(app->achievements_created == 1);
+
+  CHECK(DispatchKey(rex::ui::VirtualKey::kF7));
+  CHECK_FALSE(Access::HasAchievementsOverlay(*app));
+
+  app->OpenBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  app->InvokeOnDestroy();
+  app.reset();
+  context.ExecutePendingFunctionsFromUIThread();
+
+  for (const char* name : {"bind_debug_overlay", "bind_console", "bind_settings",
+                           "bind_mod_manager", "bind_achievements", "bind_fps_counter"}) {
+    rex::cvar::UnregisterFlag(name);
+  }
+}
+
+TEST_CASE("Closing a built-in overlay follows earlier requests", "[ui][detached]") {
+  TestContext context;
+  auto app = std::make_unique<TestApp>(context);
+  app->CloseBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+
+  Access::SetWindow(*app, std::make_unique<TestWindow>(context), std::make_unique<TestDrawer>());
+  Access::SetupOverlays(*app);
+  app->CloseBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+  CHECK_FALSE(Access::HasAchievementsOverlay(*app));
+
+  app->OpenBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+  CHECK(Access::HasAchievementsOverlay(*app));
+  app->CloseBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+  CHECK_FALSE(Access::HasAchievementsOverlay(*app));
+
+  app->OpenBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  context.ExecutePendingFunctionsFromUIThread();
+  app->CloseBuiltinOverlay(TestApp::BuiltinOverlay::kAchievements);
+  app->InvokeOnDestroy();
+  app.reset();
+  context.ExecutePendingFunctionsFromUIThread();
+
+  for (const char* name : {"bind_debug_overlay", "bind_console", "bind_settings",
+                           "bind_mod_manager", "bind_achievements", "bind_fps_counter"}) {
+    rex::cvar::UnregisterFlag(name);
+  }
 }
 
 TEST_CASE("Application bind defaults replace registered defaults", "[ui][keybinds]") {
