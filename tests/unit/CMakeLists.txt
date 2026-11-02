@@ -31,6 +31,7 @@ add_executable(unit_tests
     core/filesystem_test.cpp
     filesystem/virtual_file_system_test.cpp
     core/first_seen_test.cpp
+    core/vfs_overwrite_test.cpp
     core/hash_test.cpp
     core/sha256_test.cpp
     core/relay_test.cpp
