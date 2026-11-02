@@ -69,19 +69,19 @@ struct AssetOverlayLoadoutApplyResult {
 };
 
 AssetOverlayLoadoutFile ReadAssetOverlayLoadout(const std::filesystem::path& profile_root);
-// Reads the profile-local order when present. If it is absent, reads
-// <bundled_root>/default_asset_order.txt. A present profile file, including an
+// Falls back to <bundled_root>/default_<file_name>. A present profile file, including an
 // explicitly empty file, always takes precedence over the bundled default.
-AssetOverlayLoadoutFile ReadAssetOverlayLoadout(const std::filesystem::path& profile_root,
-                                                const std::filesystem::path& bundled_root);
+AssetOverlayLoadoutFile ReadAssetOverlayLoadout(
+    const std::filesystem::path& profile_root, const std::filesystem::path& bundled_root,
+    std::string_view file_name = kAssetOverlayOrderFileName);
 AssetOverlayLoadoutSelection SelectAssetOverlayLoadout(const AssetOverlayCatalog& catalog,
                                                        const AssetOverlayLoadoutFile& loadout);
 AssetOverlayLoadoutSelection ValidateAssetOverlayLoadout(const AssetOverlayCatalog& catalog,
                                                          std::span<const std::string> ids,
                                                          const std::filesystem::path& path = {});
-AssetOverlayLoadoutApplyResult ApplyAssetOverlayLoadout(const std::filesystem::path& profile_root,
-                                                        const AssetOverlayCatalog& catalog,
-                                                        std::span<const std::string> ids,
-                                                        bool replace_invalid_current = false);
+AssetOverlayLoadoutApplyResult ApplyAssetOverlayLoadout(
+    const std::filesystem::path& profile_root, const AssetOverlayCatalog& catalog,
+    std::span<const std::string> ids, bool replace_invalid_current = false,
+    std::string_view file_name = kAssetOverlayOrderFileName);
 
 }  // namespace rex::system

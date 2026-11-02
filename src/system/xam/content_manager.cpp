@@ -40,14 +40,14 @@ static int content_device_id_ = 0;
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
-                               const std::filesystem::path& package_path)
+                               const std::filesystem::path& package_path, bool read_only)
     : kernel_state_(kernel_state), root_name_(root_name), package_path_(package_path), license_(0) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
-                                                                  /*allow_share_delete=*/true);
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+      device_path_, package_path, read_only, /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -117,6 +117,9 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
                                                          const XCONTENT_AGGREGATE_DATA& data) {
+  if (auto title_package = FindTitlePackage(data); !title_package.empty()) {
+    return title_package;
+  }
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
 
   // DLCs are stored in common directory
@@ -194,7 +197,69 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
   }
 
+  if (content_type == XContentType::kMarketplaceContent) {
+    auto global_lock = global_critical_region_.Acquire();
+    for (const auto& package : title_packages_) {
+      // A same-named installed child already resolves to the title package.
+      if (package.title_id != title_id ||
+          std::any_of(result.begin(), result.end(), [&](const auto& listed) {
+            return string::string_key_case(listed.file_name()) ==
+                   string::string_key_case(package.file_name);
+          })) {
+        continue;
+      }
+      XCONTENT_AGGREGATE_DATA content_data;
+      content_data.device_id = device_id;
+      content_data.content_type = content_type;
+      content_data.set_display_name(string::to_utf16(package.file_name));
+      content_data.set_file_name(package.file_name);
+      content_data.title_id = title_id;
+      content_data.xuid = 0;
+      result.emplace_back(std::move(content_data));
+    }
+  }
+
   return result;
+}
+
+X_RESULT ContentManager::AddTitlePackage(uint32_t title_id, const std::string_view file_name,
+                                         const std::filesystem::path& host_path) {
+  if (file_name.empty() || file_name.size() > 42 ||
+      file_name.find_first_of("\\/:") != std::string_view::npos) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  std::error_code ec;
+  if (!std::filesystem::is_directory(host_path, ec)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& package : title_packages_) {
+    if (package.title_id == title_id &&
+        string::string_key_case(package.file_name) == string::string_key_case(file_name)) {
+      return X_ERROR_ALREADY_EXISTS;
+    }
+  }
+  title_packages_.push_back({title_id, std::string(file_name), host_path});
+  return X_ERROR_SUCCESS;
+}
+
+std::filesystem::path ContentManager::FindTitlePackage(const XCONTENT_AGGREGATE_DATA& data) {
+  if (data.content_type != XContentType::kMarketplaceContent) {
+    return {};
+  }
+  uint32_t title_id = data.title_id;
+  if (title_id == kCurrentlyRunningTitleId && kernel_state_) {
+    title_id = kernel_state_->title_id();
+  }
+  const auto file_name = data.file_name();
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& package : title_packages_) {
+    if (package.title_id == title_id &&
+        string::string_key_case(package.file_name) == string::string_key_case(file_name)) {
+      return package.host_path;
+    }
+  }
+  return {};
 }
 
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
@@ -203,7 +268,8 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
   if (!std::filesystem::exists(package_path)) {
     return nullptr;
   }
-  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path,
+                                                  !FindTitlePackage(data).empty());
   return package;
 }
 
@@ -281,6 +347,9 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
 
 X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
+  if (!FindTitlePackage(data).empty()) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   {
     auto global_lock = global_critical_region_.Acquire();
     if (open_packages_.count(string::string_key_case(root_name))) {
@@ -324,8 +393,11 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
   }
   auto package = ResolvePackage(root_name, xuid, data);
   assert_not_null(package);
-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  // Title packages carry no license header; a same-named installed one is unrelated.
+  if (FindTitlePackage(data).empty()) {
+    package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+        data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  }
   content_license = package->GetPackageLicense();
 
   {
@@ -374,6 +446,9 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 
 X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t> buffer) {
+  if (!FindTitlePackage(data).empty()) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
   std::filesystem::create_directories(package_path);
@@ -389,6 +464,9 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 }
 
 X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (!FindTitlePackage(data).empty()) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto global_lock = global_critical_region_.Acquire();
 
   if (IsContentOpen(data)) {
@@ -431,6 +509,9 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
 
 X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
                                                  const XCONTENT_AGGREGATE_DATA& data) {
+  if (!FindTitlePackage(data).empty()) {
+    return X_ERROR_ACCESS_DENIED;
+  }
   // Unmount phase: tolerant of not-mounted state
   ContentPackage* package = nullptr;
   {

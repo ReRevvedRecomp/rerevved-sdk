@@ -137,6 +137,38 @@ TEST_CASE("asset overlay loadout is profile-local and atomic", "[asset_overlay]"
   REQUIRE(replaced.succeeded());
 }
 
+TEST_CASE("a named loadout file keeps an order independent of asset_order.txt", "[asset_overlay]") {
+  TempDirectory temp("rex_asset_overlay_named_order");
+  const auto maps = temp.path() / "maps";
+  WritePack(maps / "first", "first");
+  WritePack(maps / "second", "second");
+  std::ofstream(maps / "default_map_order.txt", std::ios::binary) << "second\n";
+  const auto catalog = rex::system::DiscoverAssetOverlayCatalog(maps);
+  const auto profile = temp.path() / "profile";
+
+  const auto bundled = rex::system::ReadAssetOverlayLoadout(profile, maps, "map_order.txt");
+  CHECK(bundled.uses_bundled_default);
+  REQUIRE(bundled.entries.size() == 1);
+  CHECK(bundled.entries.front().id == "second");
+
+  const auto order = std::vector<std::string>{"first", "second"};
+  REQUIRE(rex::system::ApplyAssetOverlayLoadout(profile, catalog, order, false, "map_order.txt")
+              .succeeded());
+  CHECK(std::filesystem::exists(profile / "map_order.txt"));
+  CHECK_FALSE(std::filesystem::exists(profile / "asset_order.txt"));
+  CHECK_FALSE(std::filesystem::exists(profile / ".map_order.txt.tmp"));
+  const auto read = rex::system::ReadAssetOverlayLoadout(profile, maps, "map_order.txt");
+  REQUIRE(read.exists);
+  REQUIRE(read.entries.size() == 2);
+  CHECK(read.entries[0].id == "first");
+
+  std::ofstream(profile / "map_order.txt", std::ios::binary) << "missing\n";
+  const auto missing = rex::system::SelectAssetOverlayLoadout(
+      catalog, rex::system::ReadAssetOverlayLoadout(profile, maps, "map_order.txt"));
+  REQUIRE_FALSE(missing.IsValid());
+  CHECK(missing.diagnostics.front().message.starts_with("map_order.txt line 1"));
+}
+
 TEST_CASE("asset overlay loadout falls back to the bundled default order", "[asset_overlay]") {
   TempDirectory temp("rex_asset_overlay_default");
   const auto overlays = temp.path() / "asset-overrides";
