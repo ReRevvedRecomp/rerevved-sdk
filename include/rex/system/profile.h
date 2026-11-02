@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rex::system {
 
@@ -43,6 +44,8 @@ std::optional<ProfilePaths> ResolveProfile(const std::filesystem::path& base_roo
 struct ProfileCopySpecification {
   std::filesystem::path config_relative_path;
   uint32_t title_id = 0;
+  // Further title-owned files, such as order files, copied when present.
+  std::vector<std::filesystem::path> optional_relative_files;
 };
 
 enum class ProfileCopyResult {

@@ -119,7 +119,8 @@ static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 class ContentPackage {
  public:
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
-                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path);
+                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path,
+                 bool read_only = false);
   ~ContentPackage();
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);
@@ -187,7 +188,21 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // Lists a title-owned host directory beside installed packages as XUID-zero marketplace
+  // content file_name for title_id. Mounted read-only; XAM never creates, rewrites or deletes it.
+  // Fails with X_ERROR_ALREADY_EXISTS when the name is already registered.
+  X_RESULT AddTitlePackage(uint32_t title_id, const std::string_view file_name,
+                           const std::filesystem::path& host_path);
+
  private:
+  struct TitlePackage {
+    uint32_t title_id;
+    std::string file_name;
+    std::filesystem::path host_path;
+  };
+  // Host path of the title package data names, or empty.
+  std::filesystem::path FindTitlePackage(const XCONTENT_AGGREGATE_DATA& data);
+
   const std::filesystem::path& ResolveContentRoot(XContentType content_type) const;
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -205,6 +220,7 @@ class ContentManager {
   KernelState* kernel_state_;
   std::filesystem::path base_root_path_;
   std::filesystem::path active_root_path_;
+  std::vector<TitlePackage> title_packages_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
