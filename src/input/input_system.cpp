@@ -54,6 +54,8 @@ void InputSystem::Shutdown() {
   devices_.clear();
   device_owners_.clear();
   drivers_.clear();
+  last_physical_ = DeviceId::kInvalid;
+  PublishGamepadFamily();
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
@@ -65,6 +67,8 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
   }
+  // The UI needs pad families before the guest's first poll.
+  RefreshDevices();
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
@@ -142,6 +146,9 @@ void InputSystem::RefreshDevices() {
     if (std::none_of(seen.begin(), seen.end(),
                      [&](const DeviceInfo& d) { return d.id == old.id; })) {
       active_devices_.Forget(old.id);
+      if (last_physical_ == old.id) {
+        last_physical_ = DeviceId::kInvalid;
+      }
       changed = true;
     }
   }
@@ -165,6 +172,34 @@ void InputSystem::RefreshDevices() {
   if (changed && assignment_) {
     assignment_->OnDevicesChanged(devices_);
   }
+  PublishGamepadFamily();
+}
+
+void InputSystem::PublishGamepadFamily() {
+  GamepadFamily family = GamepadFamily::kOther;
+  // devices_ is in ordinal order, so this is the lowest connected pad.
+  const DeviceInfo* first_physical = nullptr;
+  for (const auto& device : devices_) {
+    if (!device.synthetic) {
+      first_physical = &device;
+      break;
+    }
+  }
+  if (const auto* info = DeviceInfoFor(last_physical_)) {
+    family = info->family;
+  } else if (first_physical) {
+    family = first_physical->family;
+  }
+  gamepad_family_.store(family, std::memory_order_relaxed);
+  gamepad_connected_.store(first_physical != nullptr, std::memory_order_relaxed);
+}
+
+GamepadFamily InputSystem::ActiveGamepadFamily() const {
+  return gamepad_family_.load(std::memory_order_relaxed);
+}
+
+bool InputSystem::HasConnectedGamepad() const {
+  return gamepad_connected_.load(std::memory_order_relaxed);
 }
 
 InputDriver* InputSystem::DriverForDevice(DeviceId id) {
@@ -235,6 +270,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    if (!IsNeutral(state.gamepad) && id != last_physical_) {
+      if (const auto* info = DeviceInfoFor(id); info && !info->synthetic) {
+        last_physical_ = id;
+        PublishGamepadFamily();
+      }
+    }
     if (!any) {
       merged = state;
       any = true;
