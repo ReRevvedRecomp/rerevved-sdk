@@ -17,6 +17,7 @@ using rex::X_STATUS;
 using rex::input::DeviceAssignment;
 using rex::input::DeviceId;
 using rex::input::DeviceInfo;
+using rex::input::GamepadFamily;
 using rex::input::InputDriver;
 using rex::input::InputSystem;
 using rex::input::SharedAssignment;
@@ -55,10 +56,11 @@ class FakeDriver final : public InputDriver {
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
 
-  void Add(uint64_t id, bool synthetic = false) {
+  void Add(uint64_t id, bool synthetic = false, GamepadFamily family = GamepadFamily::kOther) {
     DeviceInfo info;
     info.id = static_cast<DeviceId>(id);
     info.synthetic = synthetic;
+    info.family = family;
     devices_.push_back(info);
     states_[static_cast<DeviceId>(id)] = {};
   }
@@ -351,4 +353,76 @@ TEST_CASE("input system shutdown destroys drivers and is repeatable", "[input]")
   system.Shutdown();
   CHECK(destroyed);
   system.Shutdown();
+}
+
+TEST_CASE("Gamepad family falls back to the first connected pad", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kOther);
+  CHECK_FALSE(system->HasConnectedGamepad());
+  driver->Add(9, true, GamepadFamily::kXbox);
+  system->AttachWindow(nullptr);
+  CHECK_FALSE(system->HasConnectedGamepad());
+  driver->Add(1, false, GamepadFamily::kPlayStation);
+  driver->Add(2, false, GamepadFamily::kXbox);
+  system->AttachWindow(nullptr);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kPlayStation);
+  CHECK(system->HasConnectedGamepad());
+}
+
+TEST_CASE("An unknown pad still counts as connected", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, false, GamepadFamily::kOther);
+  system->AttachWindow(nullptr);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kOther);
+  CHECK(system->HasConnectedGamepad());
+  system->Shutdown();
+  CHECK_FALSE(system->HasConnectedGamepad());
+}
+
+TEST_CASE("Gamepad family follows the physical pad in hand", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(9, true, GamepadFamily::kOther);
+  driver->Add(1, false, GamepadFamily::kPlayStation);
+  driver->Add(2, false, GamepadFamily::kXbox);
+  X_INPUT_STATE state = {};
+
+  driver->SetButtons(2, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kXbox);
+
+  driver->SetButtons(2, 0);
+  driver->SetButtons(9, X_INPUT_GAMEPAD_A);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kXbox);
+
+  driver->Remove(2);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kPlayStation);
+
+  driver->Remove(1);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kOther);
+  CHECK_FALSE(system->HasConnectedGamepad());
+
+  system->Shutdown();
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kOther);
+}
+
+TEST_CASE("Gamepad family forgets an unplugged pad whose id returns", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, false, GamepadFamily::kXbox);
+  driver->Add(2, false, GamepadFamily::kXbox);
+  X_INPUT_STATE state = {};
+  driver->SetButtons(2, X_INPUT_GAMEPAD_B);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+
+  driver->Remove(2);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  driver->Add(2, false, GamepadFamily::kPlayStation);
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(system->ActiveGamepadFamily() == GamepadFamily::kXbox);
 }

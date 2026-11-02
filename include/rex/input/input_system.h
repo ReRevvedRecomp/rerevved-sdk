@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -47,10 +48,16 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  GamepadFamily ActiveGamepadFamily() const;
+
+  /// Physical pads only; excludes keyboard and mouse emulation.
+  bool HasConnectedGamepad() const;
+
  private:
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();
+  void PublishGamepadFamily();
   InputDriver* DriverForDevice(DeviceId id);
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
 
@@ -65,6 +72,12 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+
+  // Written by the poll path like devices_; ActiveGamepadFamily reads only the
+  // atomic.
+  DeviceId last_physical_ = DeviceId::kInvalid;
+  std::atomic<GamepadFamily> gamepad_family_{GamepadFamily::kOther};
+  std::atomic<bool> gamepad_connected_{false};
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

@@ -22,12 +22,16 @@ constexpr uint32_t kMaxGuestUsers = 4;
 /// device took the freed slot.
 enum class DeviceId : uint64_t { kInvalid = 0 };
 
+/// Driver-reported family for button glyphs.
+enum class GamepadFamily : uint8_t { kOther, kXbox, kPlayStation };
+
 struct DeviceInfo {
   DeviceId id = DeviceId::kInvalid;
   uint32_t ordinal = 0;  // connection order, assigned by InputSystem
   std::string name;
   std::string guid;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  GamepadFamily family = GamepadFamily::kOther;
 };
 
 }  // namespace rex::input

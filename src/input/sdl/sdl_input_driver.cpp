@@ -211,6 +211,7 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
                      static_cast<int>(sizeof(guid_text)));
     info.guid = guid_text;
     info.synthetic = false;
+    info.family = GamepadFamilyForType(SDL_GetGamepadType(controller.sdl));
     out.push_back(info);
   }
 }

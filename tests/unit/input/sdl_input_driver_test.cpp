@@ -66,3 +66,16 @@ TEST_CASE("SDL input driver that never initialized tears down nothing", "[input]
   CHECK(Access::WatchRemovals() == removals);
   CHECK(Access::SubsystemQuits() == quits);
 }
+
+TEST_CASE("SDL gamepad types map to glyph families", "[input][sdl]") {
+  using rex::input::GamepadFamily;
+  using rex::input::sdl::GamepadFamilyForType;
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_XBOX360) == GamepadFamily::kXbox);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_XBOXONE) == GamepadFamily::kXbox);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS3) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS4) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_PS5) == GamepadFamily::kPlayStation);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_UNKNOWN) == GamepadFamily::kOther);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_STANDARD) == GamepadFamily::kOther);
+  CHECK(GamepadFamilyForType(SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO) == GamepadFamily::kOther);
+}
