@@ -440,6 +440,44 @@ TEST_CASE("cvar config saving uses application defaults", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 }
 
+TEST_CASE("cvar single-key save reports its result and keeps other lines", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+  const auto config_path = std::filesystem::temp_directory_path() / "test_subset_save.toml";
+  const auto read = [&] {
+    std::ifstream file(config_path);
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  };
+  {
+    std::ofstream file(config_path);
+    file << "# keep this comment\ntest_string_flag = \"saved\"\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "edited"));
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "77"));
+  REQUIRE(rex::cvar::TrySaveConfigSubset(config_path, {"test_int32_flag"}));
+  const std::string saved = read();
+  CHECK(saved.find("# keep this comment") != std::string::npos);
+  CHECK(saved.find("test_string_flag = \"saved\"") != std::string::npos);
+  CHECK(saved.find("test_int32_flag = 77") != std::string::npos);
+
+  // A key at its default is still written.
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "42"));
+  REQUIRE(rex::cvar::TrySaveConfigSubset(config_path, {"test_int32_flag"}));
+  CHECK(read().find("test_int32_flag = 42") != std::string::npos);
+
+  const std::string before = read();
+  CHECK_FALSE(rex::cvar::TrySaveConfigSubset(config_path, {"no_such_flag"}));
+  CHECK_FALSE(rex::cvar::TrySaveConfigSubset(config_path, {"test_int32_flag", "test_noarg_cmd"}));
+  CHECK(read() == before);
+
+  CHECK_FALSE(
+      rex::cvar::TrySaveConfigSubset(config_path / "missing" / "x.toml", {"test_int32_flag"}));
+
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
 TEST_CASE("cvar effective defaults drive metadata reset and modified queries", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
   // Store the getter's canonical spelling, rather than the accepted input alias.

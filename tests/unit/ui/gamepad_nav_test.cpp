@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/overlay/achievements_overlay.h>
+#include <rex/ui/overlay/asset_overlay_manager.h>
 #include <rex/ui/overlay/mod_manager_overlay.h>
 #include <rex/ui/overlay/window_chrome.h>
 #include <rex/ui/overlay/settings_overlay.h>
@@ -458,6 +460,49 @@ TEST_CASE("Mods window: focus, LB/RB tabs and B close", "[ui][gamepad]") {
   CHECK(closes == 1);
   h.Frames(2, true, Pad(), ui);
   CHECK(closes == 1);
+}
+
+TEST_CASE("Mods window: an app tab joins the LB/RB cycle", "[ui][gamepad]") {
+  Harness h;
+  rex::Runtime runtime{std::filesystem::path{}};
+  rex::system::AssetOverlayCatalog catalog;
+  rex::ui::AssetOverlayLoadoutSource maps;
+  maps.title = "Maps";
+  maps.noun = "map packs";
+  maps.kind = "map pack";
+  maps.order_file = "map_order.txt";
+  maps.catalog = [&catalog]() -> const rex::system::AssetOverlayCatalog& { return catalog; };
+  maps.order_ids = [] { return std::vector<std::string>{}; };
+  maps.validate = [](std::span<const std::string>) {
+    return rex::system::AssetOverlayLoadoutSelection{};
+  };
+  maps.apply = [](std::span<const std::string>, bool) {
+    return rex::system::AssetOverlayLoadoutApplyResult{};
+  };
+  maps.rescan = [] {};
+  maps.diagnostics = [] { return std::vector<rex::system::AssetOverlayLoadoutDiagnostic>{}; };
+  maps.file_exists = [] { return true; };
+  maps.file_invalid = [] { return false; };
+  maps.restart_required = [] { return false; };
+  std::vector<rex::ui::AssetOverlayLoadoutSource> extra;
+  extra.push_back(std::move(maps));
+  auto dialog = std::make_unique<rex::ui::ModManagerDialog>(
+      &h.drawer(), nullptr, &runtime, std::function<void()>{}, std::move(extra));
+  auto ui = [&dialog] { dialog->Draw(); };
+  h.Frames(4, h.drawer().WantsGamepad(), Pad(X_INPUT_GAMEPAD_A), ui);
+  h.Frames(2, true, Pad(), ui);
+
+  ImGuiContext& g = *ImGui::GetCurrentContext();
+  ImGuiWindow* window = ImGui::FindWindowByName("Mods##overlay");
+  REQUIRE(window != nullptr);
+  ImGuiTabBar* bar = g.TabBars.GetByKey(window->GetID("##package-tabs"));
+  REQUIRE(bar != nullptr);
+  REQUIRE(bar->Tabs.Size == 3);
+  Tap(h, X_INPUT_GAMEPAD_RIGHT_SHOULDER, ui);
+  Tap(h, X_INPUT_GAMEPAD_RIGHT_SHOULDER, ui);
+  CHECK(bar->SelectedTabId == bar->Tabs[2].ID);
+  Tap(h, X_INPUT_GAMEPAD_RIGHT_SHOULDER, ui);
+  CHECK(bar->SelectedTabId == bar->Tabs[0].ID);
 }
 
 TEST_CASE("Settings window is navigable by pad and closes with B", "[ui][gamepad]") {

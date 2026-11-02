@@ -662,31 +662,24 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
-      ui::SettingsLayout layout;
-      OnConfigureSettings(layout);
-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(
-          imgui_drawer_.get(), config_path_,
-          [this]() { DeferWhileOverlaysAlive([this]() { settings_overlay_.reset(); }); },
-          std::move(layout));
+      CreateBuiltinOverlay(BuiltinOverlay::kSettings);
     }
   });
-  rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this, drawer] {
+  rex::ui::RegisterBind("bind_mod_manager", "F1", "Toggle mod manager overlay", [this] {
     if (mod_manager_overlay_) {
       auto* dialog = static_cast<ui::ModManagerDialog*>(mod_manager_overlay_.get());
       if (dialog->RequestClose()) {
         mod_manager_overlay_.reset();
       }
     } else {
-      mod_manager_overlay_ = std::make_unique<ui::ModManagerDialog>(
-          imgui_drawer_.get(), drawer, runtime_.get(),
-          [this]() { DeferWhileOverlaysAlive([this]() { mod_manager_overlay_.reset(); }); });
+      CreateBuiltinOverlay(BuiltinOverlay::kModManager);
     }
   });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
     } else {
-      achievements_overlay_ = CreateAchievementsOverlay();
+      CreateBuiltinOverlay(BuiltinOverlay::kAchievements);
     }
   });
   rex::ui::RegisterBind("bind_fps_counter", "F12", "Toggle FPS counter", [] {
@@ -710,6 +703,67 @@ ui::DebugOverlayDialog::FrameStatsProvider ReXApp::EffectiveFrameStatsProvider()
     return [presenter]() { return presenter->GetGuestOutputRefreshStats(); };
   }
   return {};
+}
+
+void ReXApp::OpenBuiltinOverlay(BuiltinOverlay overlay) {
+  DeferWhileOverlaysAlive([this, overlay]() { CreateBuiltinOverlay(overlay); });
+}
+
+void ReXApp::CloseBuiltinOverlay(BuiltinOverlay overlay) {
+  DeferWhileOverlaysAlive([this, overlay]() { DestroyBuiltinOverlay(overlay); });
+}
+
+void ReXApp::DestroyBuiltinOverlay(BuiltinOverlay overlay) {
+  if (overlays_shutdown_ || !imgui_drawer_) {
+    return;
+  }
+  switch (overlay) {
+    case BuiltinOverlay::kSettings:
+      settings_overlay_.reset();
+      break;
+    case BuiltinOverlay::kModManager:
+      if (mod_manager_overlay_ &&
+          static_cast<ui::ModManagerDialog*>(mod_manager_overlay_.get())->RequestClose()) {
+        mod_manager_overlay_.reset();
+      }
+      break;
+    case BuiltinOverlay::kAchievements:
+      achievements_overlay_.reset();
+      break;
+  }
+}
+
+void ReXApp::CreateBuiltinOverlay(BuiltinOverlay overlay) {
+  if (overlays_shutdown_ || !imgui_drawer_) {
+    return;
+  }
+  switch (overlay) {
+    case BuiltinOverlay::kSettings:
+      if (!settings_overlay_) {
+        ui::SettingsLayout layout;
+        OnConfigureSettings(layout);
+        settings_overlay_ = std::make_unique<ui::SettingsDialog>(
+            imgui_drawer_.get(), config_path_,
+            [this]() { DeferWhileOverlaysAlive([this]() { settings_overlay_.reset(); }); },
+            std::move(layout));
+      }
+      break;
+    case BuiltinOverlay::kModManager:
+      if (!mod_manager_overlay_) {
+        std::vector<ui::AssetOverlayLoadoutSource> extra_tabs;
+        OnConfigureModManager(extra_tabs);
+        mod_manager_overlay_ = std::make_unique<ui::ModManagerDialog>(
+            imgui_drawer_.get(), immediate_drawer_.get(), runtime_.get(),
+            [this]() { DeferWhileOverlaysAlive([this]() { mod_manager_overlay_.reset(); }); },
+            std::move(extra_tabs));
+      }
+      break;
+    case BuiltinOverlay::kAchievements:
+      if (!achievements_overlay_) {
+        achievements_overlay_ = CreateAchievementsOverlay();
+      }
+      break;
+  }
 }
 
 void ReXApp::DeferWhileOverlaysAlive(std::function<void()> fn) {

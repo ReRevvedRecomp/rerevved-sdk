@@ -34,7 +34,8 @@ class ImmediateTexture;
 class ModManagerDialog : public ImGuiDialog {
  public:
   ModManagerDialog(ImGuiDrawer* imgui_drawer, ImmediateDrawer* immediate_drawer,
-                   rex::Runtime* runtime, std::function<void()> close_callback = {});
+                   rex::Runtime* runtime, std::function<void()> close_callback = {},
+                   std::vector<AssetOverlayLoadoutSource> extra_tabs = {});
   ~ModManagerDialog() override;
 
   // Returns true when the manager can close immediately. If staged edits are
@@ -47,6 +48,9 @@ class ModManagerDialog : public ImGuiDialog {
  private:
   ImmediateTexture* GetIcon(const rex::system::ModPackage& mod);
   bool IsDirty() const;
+  // True if all panes after Mods are clean; otherwise the first dirty pane
+  // opens its discard confirmation and returns false.
+  bool RequestPanesClose();
   void ClearStaleStatus();
   void DrawDiscardPopup();
   void DrawReplacementPopup();
@@ -56,6 +60,8 @@ class ModManagerDialog : public ImGuiDialog {
   rex::Runtime* runtime_ = nullptr;
   std::function<void()> close_callback_;
   std::unique_ptr<AssetOverlayManagerPane> asset_manager_;
+  // The app's own tabs after Asset Overrides (ReXApp::OnConfigureModManager).
+  std::vector<std::unique_ptr<AssetOverlayManagerPane>> extra_panes_;
   std::unordered_map<std::string, std::unique_ptr<ImmediateTexture>> icon_cache_;
   std::vector<std::string> staged_ids_;
   bool editing_load_order_ = false;
