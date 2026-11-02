@@ -53,9 +53,12 @@ bool BeginOverlayWindow(const Style& style, const char* label, bool* p_open, ImG
       const float button = ImGui::GetFrameHeight();
       ImGui::SetCursorPos(
           ImVec2(size.x - imgui_style.WindowPadding.x - button, (title_height - button) * 0.5f));
+      // Start pad focus on content rather than the leading close button.
+      ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
       if (OverlayButton(style, "X##rex_chrome_close", ImVec2(button, button))) {
         *p_open = false;
       }
+      ImGui::PopItemFlag();
     }
     ImGui::SetCursorPos(
         ImVec2(imgui_style.WindowPadding.x, title_height + imgui_style.WindowPadding.y));
@@ -66,10 +69,12 @@ bool BeginOverlayWindow(const Style& style, const char* label, bool* p_open, ImG
 bool BeginOverlayPanel(const Style& style, const char* id, ImVec2 size, ImGuiWindowFlags flags) {
   const ChromeStyle& chrome = style.chrome;
   if (!chrome.draw_panel) {
-    return ImGui::BeginChild(id, size, ImGuiChildFlags_Borders, flags);
+    return ImGui::BeginChild(id, size, ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened,
+                             flags);
   }
   ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-  const bool visible = ImGui::BeginChild(id, size, ImGuiChildFlags_AlwaysUseWindowPadding, flags);
+  const bool visible = ImGui::BeginChild(
+      id, size, ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_NavFlattened, flags);
   ImGui::PopStyleColor();
   if (visible) {
     const ImVec2 min = ImGui::GetWindowPos();
@@ -123,6 +128,24 @@ bool DrawOverSkin(const SkinCallback& skin, std::initializer_list<ImGuiCol> hidd
 }
 
 }  // namespace
+
+int OverlayTabRequest(int selected, int count) {
+  if (count < 2 || !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
+      ImGui::IsAnyItemActive() || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
+    return -1;
+  }
+  const int step = (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) ? 1 : 0) -
+                   (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) ? 1 : 0);
+  return step == 0 ? -1 : (selected + step + count) % count;
+}
+
+bool OverlayPadBackPressed() {
+  return ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false);
+}
+
+bool OverlayPadClosePressed() {
+  return ImGui::IsKeyPressed(ImGuiKey_GamepadBack, false);
+}
 
 bool OverlayButton(const Style& style, const char* label, ImVec2 size, bool compact) {
   auto widget = [&] { return compact ? ImGui::SmallButton(label) : ImGui::Button(label, size); };

@@ -41,6 +41,7 @@ class AchievementsOverlayDialog : public ImGuiDialog {
   rex::system::AchievementManager* achievements_ = nullptr;
   AchievementIconCache icon_cache_;
   std::function<void()> close_callback_;
+  int selected_tab_ = 0;
 };
 
 }  // namespace rex::ui

@@ -6,6 +6,7 @@ add_executable(unit_tests
     ui/bar_fill_test.cpp
     ui/detached_presentation_test.cpp
     ui/frame_rate_meter_test.cpp
+    ui/gamepad_nav_test.cpp
     ui/notifications_test.cpp
     ui/settings_rows_test.cpp
     ui/window_size_test.cpp

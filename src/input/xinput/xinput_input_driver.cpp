@@ -11,6 +11,7 @@
 
 #include <array>
 #include <filesystem>
+#include <mutex>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -43,8 +44,11 @@ bool SlotForDevice(rex::input::DeviceId id, uint32_t* out_slot) {
 // Querying an empty slot costs milliseconds, so back off after a miss.
 constexpr uint64_t SKIP_INVALID_CONTROLLER_TIME = 1100;
 uint64_t last_invalid_time[kXinputSlotCount];
+// Shared by guest polls, device enumeration and UI pad reads.
+std::mutex last_invalid_mutex;
 
 DWORD should_skip(uint32_t user_index) {
+  std::lock_guard<std::mutex> lock(last_invalid_mutex);
   uint64_t time = last_invalid_time[user_index];
   if (time) {
     uint64_t deltatime = rex::chrono::Clock::QueryHostUptimeMillis() - time;
@@ -58,6 +62,7 @@ DWORD should_skip(uint32_t user_index) {
 }
 
 void set_skip(uint32_t user_index) {
+  std::lock_guard<std::mutex> lock(last_invalid_mutex);
   last_invalid_time[user_index] = rex::chrono::Clock::QueryHostUptimeMillis();
 }
 

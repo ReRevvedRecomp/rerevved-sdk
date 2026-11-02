@@ -39,8 +39,11 @@ class ImGuiDialog {
 
   void Draw();
 
+  bool wants_gamepad() const { return wants_gamepad_; }
+
  protected:
-  ImGuiDialog(ImGuiDrawer* imgui_drawer);
+  // wants_gamepad: pad navigation plus neutral guest input while open.
+  ImGuiDialog(ImGuiDrawer* imgui_drawer, bool wants_gamepad = false);
 
   ImGuiDrawer* imgui_drawer() const { return imgui_drawer_; }
   ImGuiIO& GetIO();
@@ -54,6 +57,7 @@ class ImGuiDialog {
 
  private:
   ImGuiDrawer* imgui_drawer_ = nullptr;
+  bool wants_gamepad_ = false;
   bool has_close_pending_ = false;
   std::vector<rex::thread::Fence*> waiting_fences_;
 };

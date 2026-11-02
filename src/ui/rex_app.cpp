@@ -454,6 +454,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() { return !IsOverlayInputCaptured(); });
+      input_sys->SetGamepadCaptureCallback(
+          [this]() { return imgui_drawer_ && imgui_drawer_->WantsGamepad(); });
+      imgui_drawer_->SetGamepadSource([input_sys](input::X_INPUT_GAMEPAD* pad) {
+        return input_sys->GetNavigationPadState(pad);
+      });
     }
   }
 
@@ -936,6 +941,7 @@ void ReXApp::ShutdownOverlays(input::InputSystem* input_system) {
   // Stop borrowed access before any dialog or drawer is destroyed.
   if (input_system) {
     input_system->SetActiveCallback(nullptr);
+    input_system->SetGamepadCaptureCallback(nullptr);
   }
   if (runtime_) {
     runtime_->set_imgui_drawer(nullptr);
