@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 #include <rex/runtime.h>
@@ -22,6 +23,18 @@
 #include <rex/ui/immediate_drawer.h>
 
 namespace rex::ui {
+
+namespace {
+
+std::mutex provider_mutex;
+AchievementIconProvider provider;
+
+}  // namespace
+
+void AchievementIconCache::SetProvider(AchievementIconProvider new_provider) {
+  std::lock_guard lock(provider_mutex);
+  provider = std::move(new_provider);
+}
 
 AchievementIconCache::AchievementIconCache(ImmediateDrawer* immediate_drawer, rex::Runtime* runtime)
     : immediate_drawer_(immediate_drawer), runtime_(runtime) {}
@@ -35,7 +48,20 @@ ImmediateTexture* AchievementIconCache::GetIcon(const rex::system::AchievementIn
   }
 
   std::unique_ptr<ImmediateTexture> texture;
-  if (!achievement.icon_path.empty()) {
+  AchievementIconProvider current;
+  {
+    std::lock_guard lock(provider_mutex);
+    current = provider;
+  }
+  if (current && immediate_drawer_) {
+    const AchievementIconPixels pixels = current(achievement);
+    if (pixels.width && pixels.height &&
+        pixels.rgba.size() == static_cast<size_t>(pixels.width) * pixels.height * 4) {
+      texture = immediate_drawer_->CreateTexture(
+          pixels.width, pixels.height, ImmediateTextureFilter::kLinear, false, pixels.rgba.data());
+    }
+  }
+  if (!texture && !achievement.icon_path.empty()) {
     texture = LoadMetadataTexture(std::filesystem::path(achievement.icon_path));
   }
   if (!texture && achievement.image_id != 0) {
