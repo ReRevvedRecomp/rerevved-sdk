@@ -290,6 +290,15 @@ gamerscore from lowest to highest, then label. It has its own count and
 gamerscore totals. The marker is separate from `flags`, the XDBF value the guest
 reads.
 
+`AchievementIconCache::SetProvider` registers a process-wide
+`AchievementIconProvider`. Each cache, including the toast and
+achievements overlay caches, requests an achievement's R8G8B8A8 pixels
+from the provider first. The cache falls back to `icon_path`,
+`icons/<image_id>.png` and the title XDBF image if the provider returns no
+pixels or a buffer whose size is not `width * height * 4` bytes. The
+provider runs on the UI thread, once per cache and icon, and keeps its
+own decode cache.
+
 These features use the public C++ layouts of `ui::Style`, `ImGuiDrawer`,
 `Presenter`, `ReXApp` and the settings and achievements dialogs. Build the SDK
 and its consumers with matching headers.

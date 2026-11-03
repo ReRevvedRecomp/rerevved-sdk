@@ -13,9 +13,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <rex/system/achievement_store.h>
 
@@ -28,16 +30,32 @@ namespace rex::ui {
 class ImmediateDrawer;
 class ImmediateTexture;
 
+// Tightly packed R8G8B8A8 pixels. Empty or inconsistent data means no icon.
+struct AchievementIconPixels {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::vector<uint8_t> rgba;
+};
+
+using AchievementIconProvider =
+    std::function<AchievementIconPixels(const rex::system::AchievementInfo&)>;
+
 class AchievementIconCache {
  public:
   AchievementIconCache(ImmediateDrawer* immediate_drawer, rex::Runtime* runtime);
 
+  // Registers the process-wide provider that every cache consults first. Pass
+  // an empty function to remove it. Providers run on the UI thread, once per
+  // cache and icon, and should cache their own decoded results.
+  static void SetProvider(AchievementIconProvider provider);
+
   // Loads the achievement icon in priority order:
-  // 1. explicit metadata icon_path
-  // 2. embedded metadata icon_path
-  // 3. metadata icons/<image_id>.png
-  // 4. embedded metadata icons/<image_id>.png
-  // 5. title XDBF image <image_id> embedded in the loaded XEX
+  // 1. provider pixels
+  // 2. explicit metadata icon_path
+  // 3. embedded metadata icon_path
+  // 4. metadata icons/<image_id>.png
+  // 5. embedded metadata icons/<image_id>.png
+  // 6. title XDBF image <image_id> embedded in the loaded XEX
   ImmediateTexture* GetIcon(const rex::system::AchievementInfo& achievement);
 
  private:
