@@ -196,6 +196,73 @@ std::optional<ProbeFields> ParseProbe(std::span<const uint8_t> payload) {
 }
 }  // namespace
 
+namespace {
+struct CounterField {
+  const char* name;
+  uint64_t value;
+};
+
+std::array<CounterField, 24> CounterFields(const Stats& stats) {
+  return {{
+      {"delivered", stats.delivered},
+      {"heartbeats", stats.heartbeats},
+      {"unknown_port", stats.unknown_port},
+      {"invalid_wire", stats.invalid_wire},
+      {"invalid_envelope", stats.invalid_envelope},
+      {"rejected_destination", stats.rejected_destination},
+      {"queue_full", stats.queue_full},
+      {"oversize", stats.oversize},
+      {"socket_errors", stats.socket_errors},
+      {"connection_resets", stats.connection_resets},
+      {"discarded_pending", stats.discarded_pending},
+      {"dropped_after_cleanup", stats.dropped_after_cleanup},
+      {"directory_failed", stats.directory_failed},
+      {"requests_failed", stats.requests_failed},
+      {"probe_replies_dropped", stats.probe_replies_dropped},
+      {"invalid_probes", stats.invalid_probes},
+      {"side_channel_in", stats.side_channel_in},
+      {"side_channel_out", stats.side_channel_out},
+      {"direct_peers", stats.direct_peers},
+      {"direct_in", stats.direct_in},
+      {"direct_out", stats.direct_out},
+      {"direct_fallbacks", stats.direct_fallbacks},
+      {"direct_bad_mac", stats.direct_bad_mac},
+      {"direct_replay", stats.direct_replay},
+  }};
+}
+}  // namespace
+
+void CounterLog::Arrival(Clock::time_point now) {
+  if (last_arrival_) {
+    largest_gap_ = std::max(
+        largest_gap_, std::chrono::duration_cast<std::chrono::milliseconds>(now - *last_arrival_));
+  }
+  last_arrival_ = now;
+}
+
+std::optional<std::string> CounterLog::Line(const Stats& stats) {
+  const auto fields = CounterFields(stats);
+  bool changed = false;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    // Index 1 is heartbeats, which never triggers a line.
+    changed = changed || (i != 1 && fields[i].value != last_[i]);
+  }
+  if (!changed) {
+    return std::nullopt;
+  }
+  std::string line = "System Link relay counters:";
+  for (size_t i = 0; i < fields.size(); ++i) {
+    line += ' ';
+    line += fields[i].name;
+    line += '=';
+    line += std::to_string(fields[i].value);
+    last_[i] = fields[i].value;
+  }
+  line += " max_arrival_gap_ms=" + std::to_string(largest_gap_.count());
+  largest_gap_ = std::chrono::milliseconds{0};
+  return line;
+}
+
 bool TokenBucket::Take(Clock::time_point now) {
   if (!started_) {
     started_ = true;
@@ -1257,6 +1324,8 @@ struct Client::Impl {
     auto next_handshake = started;
     auto next_heartbeat = started;
     auto last_received = started;
+    auto next_counter_log = started + CounterLog::kInterval;
+    CounterLog counter_log;
     bool joined = false;
     bool challenged = false;
     relay::Message join;
@@ -1307,6 +1376,16 @@ struct Client::Impl {
           std::lock_guard lock(mutex);
           ++stats.heartbeats;
           next_heartbeat = now + 2s;
+        }
+        if (now >= next_counter_log) {
+          next_counter_log = now + CounterLog::kInterval;
+          Stats snapshot;
+          {
+            std::lock_guard lock(mutex);
+            snapshot = stats;
+          }
+          if (auto line = counter_log.Line(snapshot))
+            REXKRNL_INFO("{}", *line);
         }
         // Limit each drain so receive and heartbeat deadlines are serviced under load.
         for (size_t i = 0; i < 32; ++i) {
@@ -1400,6 +1479,7 @@ struct Client::Impl {
         continue;
       }
       last_received = Clock::now();
+      counter_log.Arrival(last_received);
       const std::span<uint8_t> received{bytes.data(), static_cast<size_t>(count)};
       auto message = relay::Decode(received);
       if (message && message->type == relay::Type::kTokenGrant && !joined) {

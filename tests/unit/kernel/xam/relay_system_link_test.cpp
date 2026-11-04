@@ -928,8 +928,7 @@ TEST_CASE("relay client pages follow the newest directory snapshot",
     attempts = {{{101, -1}}, {{100, 100}}, {{101, 101}}};
   }
   relay.SetFilter([&](std::vector<relay::Datagram>& output) {
-    if (output.size() != 2 || TypeOf(output[0]) != relay::Type::kResults ||
-        seen == attempts.size())
+    if (output.size() != 2 || TypeOf(output[0]) != relay::Type::kResults || seen == attempts.size())
       return;
     const auto& plan = attempts[seen++];
     std::vector<relay::Datagram> kept;
@@ -995,6 +994,46 @@ TEST_CASE("relay client bounds requests and updates and fails them on loss",
   CHECK(lost.state == RequestState::kFailed);
   CHECK(lost.failure == RequestFailure::kAssociation);
   CHECK_FALSE(host.PublishSession(LargeRecord(1)));
+}
+
+TEST_CASE("relay counter line logs only on a counter change and reports the largest gap",
+          "[kernel][relay_client]") {
+  using std::chrono::milliseconds;
+  const auto t0 = CounterLog::Clock::time_point{} + 1000s;
+  CounterLog log;
+  Stats stats;
+
+  CHECK_FALSE(log.Line(stats));
+
+  log.Arrival(t0);
+  log.Arrival(t0 + milliseconds(40));
+  log.Arrival(t0 + milliseconds(1240));
+  log.Arrival(t0 + milliseconds(1300));
+  stats.delivered = 7;
+  stats.heartbeats = 15;
+  const auto first = log.Line(stats);
+  REQUIRE(first);
+  CHECK(
+      first->starts_with("System Link relay counters: delivered=7 heartbeats=15 unknown_port=0 "));
+  CHECK(first->ends_with(" direct_replay=0 max_arrival_gap_ms=1200"));
+
+  stats.heartbeats = 30;
+  log.Arrival(t0 + milliseconds(4300));
+  CHECK_FALSE(log.Line(stats));
+
+  stats.invalid_wire = 2;
+  log.Arrival(t0 + milliseconds(4400));
+  const auto second = log.Line(stats);
+  REQUIRE(second);
+  CHECK(second->find(" invalid_wire=2 ") != std::string::npos);
+  CHECK(second->find(" heartbeats=30 ") != std::string::npos);
+  CHECK(second->ends_with(" max_arrival_gap_ms=3000"));
+
+  CHECK_FALSE(log.Line(stats));
+  stats.socket_errors = 1;
+  const auto third = log.Line(stats);
+  REQUIRE(third);
+  CHECK(third->ends_with(" max_arrival_gap_ms=0"));
 }
 }  // namespace
 }  // namespace rex::kernel::xam::relay_link
