@@ -25,6 +25,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <string>
@@ -262,7 +263,9 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
   std::vector<const rex::cvar::FlagEntry*> changed;
   for (auto& entry : registry) {
     auto it = saved_values_.find(entry.name);
-    if (it != saved_values_.end() && settings_rows::IsUnsavedChange(entry, it->second)) {
+    if (it != saved_values_.end() &&
+        settings_rows::IsRevertable(entry, it->second,
+                                    settings_rows::RowLockFor(layout_, entry.name))) {
       changed.push_back(&entry);
     }
   }
@@ -300,8 +303,10 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
   // registry entries.
   std::string clicked_command;
 
-  auto draw_value = [&](const rex::cvar::FlagEntry& entry) {
-    const std::string current_val = entry.getter();
+  auto draw_value = [&](const rex::cvar::FlagEntry& entry,
+                        const std::optional<rex::ui::SettingsRowLock>& lock) {
+    const std::string current_val = settings_rows::DisplayValue(entry, lock);
+    ImGui::BeginDisabled(lock.has_value());
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (entry.type == rex::cvar::FlagType::Boolean) {
       bool v = rex::string::from_string<bool>(current_val, false);
@@ -382,21 +387,28 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
         rex::cvar::SetFlagByName(entry.name, buf);
       }
     }
+    ImGui::EndDisabled();
   };
 
   auto draw_row = [&](const rex::cvar::FlagEntry& entry) {
     const auto* pair = settings_rows::FindInlineToggle(entry, inline_toggles);
-    const auto tooltip_text = settings_rows::RowTooltipText(entry, layout_, pair);
+    const auto lock = settings_rows::RowLockFor(layout_, entry.name);
+    const auto value_lock = pair ? settings_rows::RowLockFor(layout_, pair->value->name)
+                                 : std::optional<rex::ui::SettingsRowLock>();
+    const auto tooltip_text = settings_rows::LockedTooltipText(
+        lock ? lock : value_lock, settings_rows::RowTooltipText(entry, layout_, pair));
     const auto tooltip_plan = settings_rows::PlanRowTooltip(entry.lifecycle, layout_, tooltip_text);
     // A command row is a single button; it changes no value, so it is never
     // saved and never counts as an unsaved change.
     if (entry.type == rex::cvar::FlagType::Command) {
       ImGui::PushID(entry.name.c_str());
       const std::string label = settings_rows::Label(entry, layout_);
+      ImGui::BeginDisabled(lock.has_value());
       if (OverlayButton(ui_style, (label + "##v").c_str())) {
         clicked_command = entry.name;
       }
-      if (ImGui::IsItemHovered()) {
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         RowTooltip(entry, settings_style, tooltip_plan);
       }
       ImGui::PopID();
@@ -404,7 +416,7 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
     }
     const bool read_only = (entry.lifecycle == rex::cvar::Lifecycle::kInitOnly);
     const std::string label = settings_rows::Label(entry, layout_);
-    const std::string current_val = entry.getter();
+    const std::string current_val = settings_rows::DisplayValue(entry, lock);
 
     ImGui::PushID(entry.name.c_str());
     if (read_only)
@@ -418,15 +430,15 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
 
     if (pair) {
       // The bool and value retain separate lifecycle locks, as separate rows do.
-      draw_value(entry);
+      draw_value(entry, lock);
       if (read_only)
         ImGui::EndDisabled();
-      const bool checked = rex::string::from_string<bool>(entry.getter(), false);
+      const bool checked = rex::string::from_string<bool>(current_val, false);
       ImGui::SameLine();
       ImGui::PushID(pair->value->name.c_str());
       ImGui::BeginDisabled(!settings_rows::InlineValueEnabled(*pair, checked));
       if (settings_rows::InlineValueShown(*pair, checked)) {
-        draw_value(*pair->value);
+        draw_value(*pair->value, value_lock);
       } else {
         char blank[1] = {};
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -447,6 +459,10 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
           (entry.category == "Input/Keybinds/Controller" && !REXCVAR_QUERY(bool, mnk_mode));
       if (mnk_disabled)
         ImGui::BeginDisabled();
+      ImGui::BeginDisabled(lock.has_value());
+      if (lock && capturing_bind_name_ == entry.name) {
+        capturing_bind_name_.clear();
+      }
 
       const ImVec2 bind_size(160.0f * scale, 0.0f);
       if (capturing_bind_name_ == entry.name) {
@@ -516,10 +532,11 @@ void SettingsDialog::OnDraw(ImGuiIO& io) {
         }
       }
 
+      ImGui::EndDisabled();
       if (mnk_disabled)
         ImGui::EndDisabled();
     } else {
-      draw_value(entry);
+      draw_value(entry, lock);
     }
 
     if (read_only)

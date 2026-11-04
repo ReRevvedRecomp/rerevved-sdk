@@ -407,6 +407,32 @@ inline bool IsUnsavedChange(const rex::cvar::FlagEntry& entry, std::string_view 
          entry.getter() != saved_value;
 }
 
+inline std::optional<SettingsRowLock> RowLockFor(const SettingsLayout& layout,
+                                                 std::string_view name) {
+  if (!layout.row_lock) {
+    return std::nullopt;
+  }
+  return layout.row_lock(name);
+}
+
+inline std::string DisplayValue(const rex::cvar::FlagEntry& entry,
+                                const std::optional<SettingsRowLock>& lock) {
+  return lock ? lock->value : entry.getter();
+}
+
+inline std::optional<std::string_view> LockedTooltipText(const std::optional<SettingsRowLock>& lock,
+                                                         std::optional<std::string_view> fallback) {
+  if (lock && !lock->reason.empty()) {
+    return std::string_view(lock->reason);
+  }
+  return fallback;
+}
+
+inline bool IsRevertable(const rex::cvar::FlagEntry& entry, std::string_view saved_value,
+                         const std::optional<SettingsRowLock>& lock) {
+  return !lock && IsUnsavedChange(entry, saved_value);
+}
+
 struct PlacedSection {
   std::string title;
   bool collapsed = false;

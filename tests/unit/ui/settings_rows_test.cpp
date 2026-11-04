@@ -487,3 +487,36 @@ TEST_CASE("settings inline pairs ignore invalid or already owned cvars", "[setti
   layout.inline_toggles = {{"toggle", "value"}};
   CHECK(rows::ResolveInlineToggles(registry, layout).empty());
 }
+
+TEST_CASE("settings row lock replaces the shown value and blocks revert", "[settings]") {
+  std::string live = "false";
+  auto entry = MakeEntry("flag", "", Audience::kPlayer);
+  entry.getter = [&live] { return live; };
+  entry.persistence = rex::cvar::Persistence::kConfig;
+
+  rex::ui::SettingsLayout layout;
+  CHECK_FALSE(rows::RowLockFor(layout, "flag"));
+  CHECK(rows::DisplayValue(entry, rows::RowLockFor(layout, "flag")) == "false");
+  CHECK(rows::IsRevertable(entry, "true", rows::RowLockFor(layout, "flag")));
+
+  layout.row_lock = [](std::string_view name) -> std::optional<rex::ui::SettingsRowLock> {
+    if (name == "flag") {
+      return rex::ui::SettingsRowLock{"true", "Set for this session"};
+    }
+    return std::nullopt;
+  };
+  const auto lock = rows::RowLockFor(layout, "flag");
+  REQUIRE(lock);
+  CHECK(rows::DisplayValue(entry, lock) == "true");
+  CHECK(live == "false");
+  CHECK_FALSE(rows::RowLockFor(layout, "other"));
+
+  CHECK(rows::IsUnsavedChange(entry, "true"));
+  CHECK_FALSE(rows::IsRevertable(entry, "true", lock));
+  CHECK(rows::IsRevertable(entry, "true", rows::RowLockFor(layout, "other")));
+
+  CHECK(rows::LockedTooltipText(lock, "custom") == "Set for this session");
+  CHECK(rows::LockedTooltipText(std::nullopt, "custom") == "custom");
+  const rex::ui::SettingsRowLock quiet{"true", ""};
+  CHECK(rows::LockedTooltipText(quiet, "custom") == "custom");
+}

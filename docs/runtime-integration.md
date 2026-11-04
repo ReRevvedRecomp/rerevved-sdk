@@ -233,6 +233,16 @@ immediately. It appears only on the row label, including disabled rows; the
 value control then shows no tooltip. For an inline pair, the toggle's entry is
 used; the value's entry is used only when the toggle has none.
 
+`SettingsLayout::row_lock` locks rows for the current session. When set, the
+overlay calls it on the UI thread each frame with a cvar name; a returned
+`SettingsRowLock` makes that row draw its `value` instead of the cvar's live
+value, disabled (including inline toggles, combos, key bindings and command
+buttons), with `reason` as its hover text in place of custom text. `value` uses
+the text the cvar's getter returns, such as `true` or `false` for a checkbox.
+The cvar is never written: Save keeps writing its stored value, and a locked
+row is left out of the unsaved-change count and Revert. An unset callback costs
+nothing.
+
 `SettingsLayout` is part of its containing dialog's public C++ layout;
 rebuild the SDK and consumers together when changing it. Plugin ABI versions are
 defined in the [GPU](../include/rex/system/gpu_plugin.h) and
