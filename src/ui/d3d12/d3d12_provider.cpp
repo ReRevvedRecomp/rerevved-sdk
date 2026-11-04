@@ -316,6 +316,12 @@ bool D3D12Provider::Initialize() {
                   adapter_desc.VendorId, adapter_desc.DeviceId);
     }
   }
+  LARGE_INTEGER driver_version;
+  if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version))) {
+    REXGPU_INFO("DXGI adapter driver version: {}.{}.{}.{}", uint32_t(driver_version.HighPart) >> 16,
+                uint32_t(driver_version.HighPart) & 0xFFFF, uint32_t(driver_version.LowPart) >> 16,
+                uint32_t(driver_version.LowPart) & 0xFFFF);
+  }
 
   // Create the Direct3D 12 device.
   ID3D12Device* device;

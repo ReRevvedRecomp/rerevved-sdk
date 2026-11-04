@@ -74,8 +74,17 @@ bool D3D12SubmissionTracker::AwaitSubmissionCompletion(UINT64 submission_index) 
     if (FAILED(fence_->SetEventOnCompletion(fence_value, fence_completion_event_))) {
       return false;
     }
-    if (WaitForSingleObject(fence_completion_event_, INFINITE) != WAIT_OBJECT_0) {
-      return false;
+    // A removed device may leave the fence unsignaled, so poll for removal.
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    (void)fence_->GetDevice(IID_PPV_ARGS(&device));
+    for (;;) {
+      const DWORD wait_result = WaitForSingleObject(fence_completion_event_, 250);
+      if (wait_result == WAIT_OBJECT_0) {
+        break;
+      }
+      if (wait_result != WAIT_TIMEOUT || (device && FAILED(device->GetDeviceRemovedReason()))) {
+        return false;
+      }
     }
   }
   return fence_value == submission_index;

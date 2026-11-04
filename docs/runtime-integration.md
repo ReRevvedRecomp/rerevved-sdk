@@ -149,6 +149,27 @@ terminates the title and hard-exits. `OnBeforeHardExit()` runs on the UI thread
 after title termination, immediately before the hard exit. Its default is a
 no-op.
 
+When the host GPU device is lost (D3D12 device removal or a Vulkan device lost
+result), `GraphicsSystem::OnHostGpuLossFromAnyThread` acts once, from any
+thread. It posts to the UI thread, where a native message box says the graphics
+driver stopped responding and the game will close. The box does not need the lost
+device. It then calls `WindowedAppContext::RequestWindowClosesFromUIThread()`,
+which the SDL context implements as the user's own close request for each open
+window, so `OnWindowCloseRequested()` runs and may veto and finish the close
+later as above. With no window open the UI loop quits. The command processor
+refuses all further submissions after the loss, and its fence waits end once the
+device is found removed. The close does not make the guest leave a network
+session. A graphics system with no `WindowedAppContext` (headless) still aborts
+on device loss. A fence failure on a healthy device is an internal error and also
+still aborts. The D3D12 provider logs the adapter's user-mode driver version once
+at startup.
+
+For development, `d3d12_debug_remove_device_after_swaps=N` (hot reload, developer
+audience, session-only so a config file cannot set it) calls
+`ID3D12Device5::RemoveDevice` on the Nth guest swap after the value is set.
+Pass it on the command line, or set it from the console after reaching the
+scene to test. 0, the default, is off.
+
 Guest threads may still poll input, create XAM dialogs or push achievement
 toasts during `OnBeforeHardExit()`, and stragglers that termination left running
 can continue to do so. The hook may only drain and release the title's own

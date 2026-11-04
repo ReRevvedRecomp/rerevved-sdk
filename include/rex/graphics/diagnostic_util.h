@@ -21,6 +21,8 @@ bool IsFenceCompletionValueValid(uint64_t completed_value);
 bool IsFenceWaitReady(uint64_t completed_value, uint64_t awaited_value, bool value_was_signaled,
                       bool event_was_armed, bool wait_succeeded);
 bool IsFenceFailureTerminal(bool tracking_is_unrecoverable, bool device_is_removed);
+// True for DXGI results where the GPU device itself stopped, not a failure it survives.
+bool IsDxgiDeviceLossResult(uint32_t hresult);
 bool CanReleaseSubmittedGpuResources(bool queue_is_idle, bool device_is_removed);
 
 struct Texture2DSourceRange {

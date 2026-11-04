@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -25,6 +26,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
+#include <rex/system.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -42,6 +44,10 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "runtime spikes and freezes when playing the game not for the first time.");
 
 namespace {
+
+constexpr std::string_view kHostGpuLossMessage =
+    "The graphics driver stopped responding, so the game cannot continue and will now close.\n\n"
+    "Please restart the game. If this keeps happening, update your graphics driver.";
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     const std::string& effect_name) {
@@ -74,7 +80,11 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 }  // extern "C"
 #endif  // REX_PLATFORM_WIN32
 
-GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+GraphicsSystem::GraphicsSystem()
+    : host_gpu_loss_notifier_([](std::string_view message) {
+        rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, message);
+      }),
+      vsync_worker_running_(false) {}
 
 GraphicsSystem::~GraphicsSystem() = default;
 
@@ -254,7 +264,7 @@ void GraphicsSystem::Shutdown() {
   provider_.reset();
 }
 
-void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
+void GraphicsSystem::OnHostGpuLossFromAnyThread(bool is_responsible) {
   // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
   // used by the command processor, the presenter, and possibly anything else,
   // it's considered free-threaded, except for lifetime management which will be
@@ -265,10 +275,34 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   // in this case there's no user who needs uninterrupted gameplay, or somehow
   // protect it with a mutex so any thread can be considered a UI thread and
   // reset).
-  if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
+  if (host_gpu_loss_reported_.test_and_set(std::memory_order_acq_rel)) {
     return;
   }
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  REXGPU_ERROR(
+      "Host GPU device lost (is_responsible={}); the player will be told and the windows closed",
+      is_responsible);
+  if (!app_context_) {
+    // No UI thread to tell the player, and the guest cannot run without its GPU.
+    rex::FatalError("Graphics device lost (probably due to an internal error)");
+  }
+  // The task can outlive this object, so it captures only the context and a notifier copy.
+  ui::WindowedAppContext* const context = app_context_;
+  const bool posted =
+      context->CallInUIThreadDeferred([context, notifier = host_gpu_loss_notifier_]() {
+        if (context->HasQuitFromUIThread()) {
+          return;
+        }
+        if (notifier) {
+          notifier(kHostGpuLossMessage);
+        }
+        // The player may have closed the app while the message was up.
+        if (!context->HasQuitFromUIThread()) {
+          context->RequestWindowClosesFromUIThread();
+        }
+      });
+  if (!posted) {
+    REXGPU_ERROR("Host GPU device lost after the UI loop ended; the app is already exiting");
+  }
 }
 
 uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {

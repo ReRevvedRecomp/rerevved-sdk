@@ -56,6 +56,16 @@ REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(d3d12_debug_remove_device_after_swaps, 0, "GPU/D3D12",
+                     "Development only: remove the D3D12 device with ID3D12Device5::RemoveDevice "
+                     "on this guest swap, counted from when the value is set, to exercise the "
+                     "graphics-driver-stopped exit (0 = off)")
+    .range(0, 100000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .audience(rex::cvar::Audience::kDeveloper)
+    .persistence(rex::cvar::Persistence::kSessionOnly)
+    .debug_only();
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2581,6 +2591,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height,
                                       const system::SwapPresentationAspect& presentation) {
   SCOPE_profile_cpu_f("gpu");
+  MaybeForceDeviceRemovalForTesting();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -6890,7 +6901,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         return false;
       }
       PROFILE_CMD_BUFFER_STALL();
-      DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+      DWORD wait_result = AwaitFenceCompletionEvent();
       if (wait_result != WAIT_OBJECT_0) {
         HRESULT wait_error =
             wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
@@ -6940,7 +6951,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       return false;
     }
     PROFILE_CMD_BUFFER_STALL();
-    DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+    DWORD wait_result = AwaitFenceCompletionEvent();
     if (wait_result != WAIT_OBJECT_0) {
       HRESULT wait_error = wait_result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL;
       HandleFenceFailure("Submission fence wait", wait_error, false);
@@ -7015,6 +7026,40 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   return submission_completed_ >= await_submission;
 }
 
+DWORD D3D12CommandProcessor::AwaitFenceCompletionEvent() {
+  // A removed device may leave the fence unsignaled, so poll for removal.
+  constexpr DWORD kRemovalPollMs = 250;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  for (;;) {
+    const DWORD wait_result = WaitForSingleObject(fence_completion_event_, kRemovalPollMs);
+    if (wait_result != WAIT_TIMEOUT) {
+      return wait_result;
+    }
+    if (FAILED(device->GetDeviceRemovedReason())) {
+      return WAIT_TIMEOUT;
+    }
+  }
+}
+
+void D3D12CommandProcessor::MaybeForceDeviceRemovalForTesting() {
+  const int32_t after_swaps = REXCVAR_GET(d3d12_debug_remove_device_after_swaps);
+  if (after_swaps <= 0) {
+    debug_swaps_toward_device_removal_ = 0;
+    return;
+  }
+  if (debug_device_removal_done_ || ++debug_swaps_toward_device_removal_ < uint32_t(after_swaps)) {
+    return;
+  }
+  debug_device_removal_done_ = true;
+  Microsoft::WRL::ComPtr<ID3D12Device5> device5;
+  if (FAILED(GetD3D12Provider().GetDevice()->QueryInterface(IID_PPV_ARGS(&device5)))) {
+    REXGPU_WARN("d3d12_debug_remove_device_after_swaps: ID3D12Device5 is unavailable");
+    return;
+  }
+  REXGPU_WARN("d3d12_debug_remove_device_after_swaps: removing the D3D12 device now");
+  device5->RemoveDevice();
+}
+
 void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT operation_result,
                                                bool tracking_is_unrecoverable) {
   REXGPU_ERROR("{} failed with HRESULT 0x{:08X}", operation, uint32_t(operation_result));
@@ -7025,22 +7070,28 @@ void D3D12CommandProcessor::HandleFenceFailure(const char* operation, HRESULT op
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
-  if (SUCCEEDED(device_removed_reason) && operation_result == DXGI_ERROR_DEVICE_REMOVED) {
+  if (SUCCEEDED(device_removed_reason) &&
+      diagnostic::IsDxgiDeviceLossResult(uint32_t(operation_result))) {
     device_removed_reason = operation_result;
   }
   const bool device_is_removed = FAILED(device_removed_reason);
   if (device_is_removed && !device_removed_) {
     LogDeviceRemovalDiagnostics(device, device_removed_reason);
   }
-  if (diagnostic::IsFenceFailureTerminal(tracking_is_unrecoverable, device_is_removed) &&
-      !device_removed_) {
-    device_removed_ = true;
+  if (!diagnostic::IsFenceFailureTerminal(tracking_is_unrecoverable, device_is_removed) ||
+      device_removed_) {
+    return;
+  }
+  device_removed_ = true;
+  if (device_is_removed) {
+    // Submissions are refused now; the graphics system tells the player and closes.
     if (graphics_system_) {
       graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                    DXGI_ERROR_DEVICE_REMOVED);
     }
-    rex::FatalError("Graphics submission completion tracking failed");
+    return;
   }
+  rex::FatalError("Graphics submission completion tracking failed");
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {

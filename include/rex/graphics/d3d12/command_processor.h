@@ -484,6 +484,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() { return CheckSubmissionFence(submission_current_); }
+  // Returns WAIT_TIMEOUT once the device is found removed during the wait.
+  DWORD AwaitFenceCompletionEvent();
+  // Development hook behind d3d12_debug_remove_device_after_swaps.
+  void MaybeForceDeviceRemovalForTesting();
   void HandleFenceFailure(const char* operation, HRESULT operation_result,
                           bool tracking_is_unrecoverable);
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
@@ -611,6 +615,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   bool device_removed_ = false;
+  uint32_t debug_swaps_toward_device_removal_ = 0;
+  bool debug_device_removal_done_ = false;
 
   bool cache_clear_requested_ = false;
 
