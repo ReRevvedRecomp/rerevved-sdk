@@ -77,6 +77,17 @@ TEST_CASE("Diagnostic fence readiness rejects removal and incomplete waits",
   CHECK(CanReleaseSubmittedGpuResources(true, true));
 }
 
+TEST_CASE("Diagnostic device loss results are the DXGI stop codes", "[graphics][diagnostic]") {
+  CHECK(IsDxgiDeviceLossResult(0x887A0005u));        // DXGI_ERROR_DEVICE_REMOVED
+  CHECK(IsDxgiDeviceLossResult(0x887A0006u));        // DXGI_ERROR_DEVICE_HUNG
+  CHECK(IsDxgiDeviceLossResult(0x887A0007u));        // DXGI_ERROR_DEVICE_RESET
+  CHECK(IsDxgiDeviceLossResult(0x887A0020u));        // DXGI_ERROR_DRIVER_INTERNAL_ERROR
+  CHECK_FALSE(IsDxgiDeviceLossResult(0));            // S_OK
+  CHECK_FALSE(IsDxgiDeviceLossResult(0x887A0001u));  // DXGI_ERROR_INVALID_CALL
+  CHECK_FALSE(IsDxgiDeviceLossResult(0x8007000Eu));  // E_OUTOFMEMORY
+  CHECK_FALSE(IsDxgiDeviceLossResult(0x80004005u));  // E_FAIL
+}
+
 TEST_CASE("Diagnostic texture range validates fetch field bounds", "[graphics][diagnostic]") {
   constexpr uint32_t kPitchFieldMax = (1 << 9) - 1;
   constexpr uint32_t kDimensionFieldMax = 1 << 13;

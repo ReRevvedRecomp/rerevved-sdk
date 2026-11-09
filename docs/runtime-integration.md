@@ -149,6 +149,27 @@ terminates the title and hard-exits. `OnBeforeHardExit()` runs on the UI thread
 after title termination, immediately before the hard exit. Its default is a
 no-op.
 
+When the host GPU device is lost (D3D12 device removal or a Vulkan device lost
+result), `GraphicsSystem::OnHostGpuLossFromAnyThread` acts once, from any
+thread. It posts to the UI thread, where a native message box says the graphics
+driver stopped responding and the game will close. The box does not need the lost
+device. It then calls `WindowedAppContext::RequestWindowClosesFromUIThread()`,
+which the SDL context implements as the user's own close request for each open
+window, so `OnWindowCloseRequested()` runs and may veto and finish the close
+later as above. With no window open the UI loop quits. The command processor
+refuses all further submissions after the loss, and its fence waits end once the
+device is found removed. The close does not make the guest leave a network
+session. A graphics system with no `WindowedAppContext` (headless) still aborts
+on device loss. A fence failure on a healthy device is an internal error and also
+still aborts. The D3D12 provider logs the adapter's user-mode driver version once
+at startup.
+
+For development, `d3d12_debug_remove_device_after_swaps=N` (hot reload, developer
+audience, session-only so a config file cannot set it) calls
+`ID3D12Device5::RemoveDevice` on the Nth guest swap after the value is set.
+Pass it on the command line, or set it from the console after reaching the
+scene to test. 0, the default, is off.
+
 Guest threads may still poll input, create XAM dialogs or push achievement
 toasts during `OnBeforeHardExit()`, and stragglers that termination left running
 can continue to do so. The hook may only drain and release the title's own
@@ -232,6 +253,16 @@ followed by the colored lifecycle note only when the field does not apply
 immediately. It appears only on the row label, including disabled rows; the
 value control then shows no tooltip. For an inline pair, the toggle's entry is
 used; the value's entry is used only when the toggle has none.
+
+`SettingsLayout::row_lock` locks rows for the current session. When set, the
+overlay calls it on the UI thread each frame with a cvar name; a returned
+`SettingsRowLock` makes that row draw its `value` instead of the cvar's live
+value, disabled (including inline toggles, combos, key bindings and command
+buttons), with `reason` as its hover text in place of custom text. `value` uses
+the text the cvar's getter returns, such as `true` or `false` for a checkbox.
+The cvar is never written: Save keeps writing its stored value, and a locked
+row is left out of the unsaved-change count and Revert. An unset callback costs
+nothing.
 
 `SettingsLayout` is part of its containing dialog's public C++ layout;
 rebuild the SDK and consumers together when changing it. Plugin ABI versions are

@@ -109,6 +109,8 @@ class WindowedAppContext {
   // explicit completion forcing in case the storage of the pointer is lost
   // before the function is called).
   void QuitFromUIThread();
+  // UI thread only. Uses the user's close route, so close handlers may veto.
+  virtual void RequestWindowClosesFromUIThread() { QuitFromUIThread(); }
   // Callable from any thread. This is a special case where a completely
   // fire-and-forget CallInUIThreadDeferred is safe, as the function only
   // references nonvirtual functions of the context itself, and will be called

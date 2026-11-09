@@ -105,6 +105,18 @@ bool IsFenceFailureTerminal(bool tracking_is_unrecoverable, bool device_is_remov
   return tracking_is_unrecoverable || device_is_removed;
 }
 
+bool IsDxgiDeviceLossResult(uint32_t hresult) {
+  switch (hresult) {
+    case 0x887A0005u:  // DXGI_ERROR_DEVICE_REMOVED
+    case 0x887A0006u:  // DXGI_ERROR_DEVICE_HUNG
+    case 0x887A0007u:  // DXGI_ERROR_DEVICE_RESET
+    case 0x887A0020u:  // DXGI_ERROR_DRIVER_INTERNAL_ERROR
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool CanReleaseSubmittedGpuResources(bool queue_is_idle, bool device_is_removed) {
   return queue_is_idle || device_is_removed;
 }

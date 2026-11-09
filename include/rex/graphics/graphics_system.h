@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <rex/graphics/register_file.h>
@@ -93,9 +94,10 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void NotifySwapPresentation(const system::SwapPresentationReport& report) override;
   void Shutdown() override;
 
-  // May be called from any thread any number of times, even during recovery
-  // from a device loss.
+  // Any thread; only the first call acts. Tells the player, then closes from the UI thread.
   void OnHostGpuLossFromAnyThread(bool is_responsible);
+
+  bool host_gpu_lost() const { return host_gpu_loss_reported_.test(std::memory_order_acquire); }
 
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
@@ -129,6 +131,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   virtual void CreateProvider(bool with_presentation) = 0;
 
   virtual std::unique_ptr<CommandProcessor> CreateCommandProcessor() = 0;
+
+  // Native message box, so it needs no working GPU. Tests replace it.
+  std::function<void(std::string_view)> host_gpu_loss_notifier_;
 
   static uint32_t ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr);
   static void WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,

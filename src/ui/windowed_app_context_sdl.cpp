@@ -187,6 +187,15 @@ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event)
   return true;
 }
 
+void SDLWindowedAppContext::RequestWindowClosesFromUIThread() {
+  if (windows_.empty()) {
+    // Nothing can veto or finish a close, so end the loop directly.
+    QuitFromUIThread();
+    return;
+  }
+  ProcessQuitRequest();
+}
+
 void SDLWindowedAppContext::ProcessQuitRequest() {
   // Use the normal close-request path rather than terminating the message loop
   // directly. Window listeners use OnClosing to stop guest, audio and GPU

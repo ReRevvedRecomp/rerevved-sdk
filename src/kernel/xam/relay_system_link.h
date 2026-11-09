@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace rex::system {
@@ -204,6 +205,21 @@ struct Stats {
   uint64_t direct_replay = 0;
   uint64_t direct_fault_drops = 0;  // dropped by DirectOptions::drop_after_seconds
   uint64_t direct_evicted = 0;      // peer entries evicted to make room for another peer
+};
+
+// Heartbeats print but never trigger a line, since they advance every interval.
+class CounterLog {
+ public:
+  using Clock = std::chrono::steady_clock;
+  static constexpr std::chrono::seconds kInterval{30};
+
+  void Arrival(Clock::time_point now);
+  std::optional<std::string> Line(const Stats& stats);
+
+ private:
+  std::array<uint64_t, 24> last_{};
+  std::optional<Clock::time_point> last_arrival_;
+  std::chrono::milliseconds largest_gap_{0};
 };
 
 // Owns the relay and injector sockets on one thread. Guest handles remain owned

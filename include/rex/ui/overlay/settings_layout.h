@@ -6,6 +6,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -38,6 +39,12 @@ struct SettingsInlineToggle {
   std::string toggle;  // bool cvar; owns the row's label, placement and audience
   std::string value;   // string or integer cvar; no separate row when paired
   bool unlock_when_checked = true;
+};
+
+// Session lock for one row: draws value (getter text) disabled, with reason as hover text.
+struct SettingsRowLock {
+  std::string value;
+  std::string reason;
 };
 
 // With no explicit tabs, the overlay uses its category tree. Visible rows
@@ -84,6 +91,8 @@ struct SettingsLayout {
   // entry wins; its value's entry is used only if absent. Empty entries still
   // override.
   std::unordered_map<std::string, std::string> tooltips;
+  // Called on the UI thread for each drawn row; unset locks nothing.
+  std::function<std::optional<SettingsRowLock>(std::string_view name)> row_lock;
 };
 
 }  // namespace rex::ui
