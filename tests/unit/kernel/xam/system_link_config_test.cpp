@@ -80,6 +80,22 @@ TEST_CASE("system_link profile setter validates every startup source", "[system_
   }
 }
 
+TEST_CASE("system_link profile name applies while System Link is off", "[system_link]") {
+  Fixture f;
+  SECTION("configured") {
+    f.Set("system_link_profile_name", "Offline Name");
+    f.Freeze();
+    REQUIRE(CurrentConfig().mode == Mode::kOff);
+    CHECK(rex::system::xam::UserProfile().name() == "Offline Name");
+  }
+  SECTION("empty") {
+    f.Freeze();
+    REQUIRE(CurrentConfig().mode == Mode::kOff);
+    CHECK(rex::system::xam::UserProfile().name() == "User");
+  }
+  CHECK(rex::system::xam::UserProfile().xuid() == 0xB13EBABEBABEBABEULL);
+}
+
 TEST_CASE("system_link settings expose player advanced and read-only policies", "[system_link]") {
   StateFixture f;
   for (const char* key :

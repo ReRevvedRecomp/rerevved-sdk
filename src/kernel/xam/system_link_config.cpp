@@ -80,22 +80,23 @@ bool ParseBool(std::string_view value, bool& target) {
   return true;
 }
 using namespace rex::cvar;
-FlagRegistrar profile_flag({.name = "system_link_profile_name",
-                            .type = FlagType::String,
-                            .category = "Online",
-                            .description = "System Link player name (empty uses Player-XXXX)",
-                            .setter =
-                                [](std::string_view value) {
-                                  if (!ValidProfileName(value))
-                                    return false;
-                                  ProfileName() = value;
-                                  return true;
-                                },
-                            .getter = [] { return ProfileName(); },
-                            .lifecycle = Lifecycle::kRequiresRestart,
-                            .default_value = "",
-                            .audience = Audience::kPlayer,
-                            .persistence = Persistence::kConfig});
+FlagRegistrar profile_flag(
+    {.name = "system_link_profile_name",
+     .type = FlagType::String,
+     .category = "Online",
+     .description = "Player name (empty uses User, or Player-XXXX in System Link)",
+     .setter =
+         [](std::string_view value) {
+           if (!ValidProfileName(value))
+             return false;
+           ProfileName() = value;
+           return true;
+         },
+     .getter = [] { return ProfileName(); },
+     .lifecycle = Lifecycle::kRequiresRestart,
+     .default_value = "",
+     .audience = Audience::kPlayer,
+     .persistence = Persistence::kConfig});
 FlagRegistrar invite_flag(
     {.name = "system_link_invite",
      .type = FlagType::String,

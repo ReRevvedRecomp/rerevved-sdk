@@ -25,7 +25,8 @@ that process. ReXApp generates and persists a per-player `system_link_xuid` when
 it is zero; an explicit nonzero value is retained. The optional
 `system_link_profile_name` accepts at most 15 ASCII letters, digits, spaces,
 `-`, `_` or `.`, without leading or trailing spaces. An empty name becomes
-`Player-XXXX`, using the XUID's last four uppercase hex digits. Separate
+`Player-XXXX`, using the XUID's last four uppercase hex digits. The name also
+applies with System Link off, where an empty one reads `User`. Separate
 instances must use distinct local addresses and XUIDs.
 
 LAN enablement and player name are player settings; local address and XUID are
