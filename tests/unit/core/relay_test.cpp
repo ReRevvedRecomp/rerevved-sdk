@@ -655,7 +655,7 @@ TEST_CASE("relay options enable System Link profile identity", "[relay]") {
   REQUIRE(rex::cvar::SetFlagByName(option, ""));
   rex::system::xam::UserProfile disabled;
   CHECK(disabled.xuid() == 0xB13EBABEBABEBABE);
-  CHECK(disabled.name() == "User");
+  CHECK(disabled.name() == "123456789012345");
   CHECK(rex::kernel::xam::XamGetSystemVersion_entry() == 0);
   REQUIRE(rex::cvar::SetFlagByName("system_link_lan_enabled", "true"));
   CHECK(rex::kernel::xam::XamGetSystemVersion_entry() == 0x20449700);

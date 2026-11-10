@@ -86,7 +86,8 @@ replaced or written.
 Player names accept 0-15 ASCII bytes: letters, digits, spaces, `-`, `_` and `.`,
 without leading or trailing spaces. Invalid setter values are refused. In a
 System Link snapshot, an empty name becomes `Player-XXXX`, using the XUID's last
-four uppercase hex digits.
+four uppercase hex digits. With System Link off, a configured name still names
+the local profile and an empty one reads `User`.
 
 The snapshot entry point is internal to the runtime. The ReXApp source, compiled
 by the consumer, forward declares it, so it needs no header outside the

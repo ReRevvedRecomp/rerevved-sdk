@@ -49,14 +49,13 @@ UserProfile::UserProfile() {
     }
   }
   name_ = "User";
-  if (system_link) {
-    const auto& configured_name = config.profile_name;
-    if (!configured_name.empty()) {
-      constexpr size_t kMaxProfileNameLength = 15;
-      name_ = configured_name.substr(0, kMaxProfileNameLength);
-      if (configured_name.size() > kMaxProfileNameLength) {
-        REXSYS_WARN("System Link profile name was truncated to 15 bytes");
-      }
+  // A configured name applies offline too; System Link only adds its default.
+  const auto& configured_name = config.profile_name;
+  if (!configured_name.empty()) {
+    constexpr size_t kMaxProfileNameLength = 15;
+    name_ = configured_name.substr(0, kMaxProfileNameLength);
+    if (configured_name.size() > kMaxProfileNameLength) {
+      REXSYS_WARN("Profile name was truncated to 15 bytes");
     }
   }
 
