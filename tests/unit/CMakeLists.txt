@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     audio/output_state_test.cpp
+    audio/sdl_audio_driver_test.cpp
     ui/achievement_groups_test.cpp
     ui/achievement_icon_cache_test.cpp
     ui/bar_fill_test.cpp
@@ -295,6 +296,16 @@ if(REXGLUE_NETWORK_TESTS)
             TIMEOUT 60
     )
 endif()
+catch_discover_tests(unit_tests
+    TEST_SPEC "[.][no-audio-device]"
+    TEST_PREFIX "unit."
+    TEST_LIST unit_no_audio_device_tests
+    ADD_TAGS_AS_LABELS
+    PROPERTIES
+        LABELS "unit"
+        TIMEOUT 60
+        ENVIRONMENT "SDL_AUDIO_DRIVER=rexglue-test-missing"
+)
 catch_discover_tests(mod_plugin_tests
     TEST_PREFIX "mod_plugin."
     PROPERTIES

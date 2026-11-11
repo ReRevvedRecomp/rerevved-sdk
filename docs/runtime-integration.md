@@ -42,6 +42,11 @@ text. When the layout has no `monitor` entry, the overlay fills it from
 `rex::ui::MonitorChoiceLabels()` (`rex/ui/monitors.h`), which names the
 connected displays in the order the window resolves the `monitor` cvar.
 
+When SDL's default audio backend opens no playback device, the SDL audio
+driver tries the other compiled backends unless `SDL_AUDIO_DRIVER` names one.
+If none opens, the driver runs without sound and still consumes frames at the
+device rate, so the title's audio callbacks keep running.
+
 Player options: `audio_volume` (0 to 100 percent, hot reload) multiplies with
 the master gain from `rex::audio::SetOutputGain`, so a title or mod gain keeps
 applying. `audio_play_in_background` (default true) silences output like

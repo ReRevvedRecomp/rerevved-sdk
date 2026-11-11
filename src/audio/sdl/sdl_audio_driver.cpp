@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -45,6 +47,10 @@ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* s
     : AudioDriver(memory), semaphore_(semaphore) {}
 
 SDLAudioDriver::~SDLAudioDriver() {
+  silent_pacer_running_ = false;
+  if (silent_pacer_.joinable()) {
+    silent_pacer_.join();
+  }
   assert_true(frames_queued_.empty());
   assert_true(frames_unused_.empty());
 }
@@ -56,6 +62,72 @@ bool SDLAudioDriver::Initialize() {
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
 
+  if (InitializeSdl()) {
+    return true;
+  }
+  ShutdownSdl();
+  if (InitializeSdlWithOtherBackend()) {
+    return true;
+  }
+
+  // Titles fault on a failed driver registration, so consume frames silently.
+  REXAPU_WARN("No audio output device could be opened; continuing without sound");
+  silent_pacer_running_ = true;
+  silent_pacer_ = std::thread(&SDLAudioDriver::SilentPacerMain, this);
+  return true;
+}
+
+bool SDLAudioDriver::InitializeSdlWithOtherBackend() {
+  // Keep an explicit SDL_AUDIO_DRIVER, and a backend another client still holds.
+  if (SDL_GetHint(SDL_HINT_AUDIO_DRIVER) || SDL_WasInit(SDL_INIT_AUDIO)) {
+    return false;
+  }
+  const int count = SDL_GetNumAudioDrivers();
+  for (int i = 0; i < count; ++i) {
+    const char* name = SDL_GetAudioDriver(i);
+    if (!name || !std::strcmp(name, "dummy") || !std::strcmp(name, "disk")) {
+      continue;
+    }
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, name);
+    if (InitializeSdl()) {
+      REXAPU_INFO("Audio output opened through SDL backend '{}'", name);
+      return true;
+    }
+    ShutdownSdl();
+  }
+  SDL_ResetHint(SDL_HINT_AUDIO_DRIVER);
+  return false;
+}
+
+void SDLAudioDriver::SilentPacerMain() {
+  using clock = std::chrono::steady_clock;
+  constexpr auto kFramePeriod =
+      std::chrono::nanoseconds(INT64_C(1000000000) * channel_samples_ / frame_frequency_);
+  auto deadline = clock::now();
+  while (silent_pacer_running_) {
+    deadline += kFramePeriod;
+    std::this_thread::sleep_until(deadline);
+    bool consumed = false;
+    {
+      std::unique_lock<std::mutex> guard(frames_mutex_);
+      if (!frames_queued_.empty()) {
+        frames_unused_.push(frames_queued_.front());
+        frames_queued_.pop();
+        consumed = true;
+      }
+    }
+    if (consumed) {
+      semaphore_->Release(1, nullptr);
+    }
+    // Resume after a stall instead of releasing a burst.
+    const auto now = clock::now();
+    if (now - deadline > std::chrono::milliseconds(100)) {
+      deadline = now;
+    }
+  }
+}
+
+bool SDLAudioDriver::InitializeSdl() {
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
     return false;
@@ -151,7 +223,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 }
 
-void SDLAudioDriver::Shutdown() {
+void SDLAudioDriver::ShutdownSdl() {
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
@@ -160,6 +232,14 @@ void SDLAudioDriver::Shutdown() {
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     sdl_initialized_ = false;
   }
+}
+
+void SDLAudioDriver::Shutdown() {
+  silent_pacer_running_ = false;
+  if (silent_pacer_.joinable()) {
+    silent_pacer_.join();
+  }
+  ShutdownSdl();
   std::unique_lock<std::mutex> guard(frames_mutex_);
   while (!frames_unused_.empty()) {
     delete[] frames_unused_.top();
