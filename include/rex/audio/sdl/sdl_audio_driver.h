@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <stack>
+#include <thread>
 
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
@@ -34,11 +36,17 @@ class SDLAudioDriver : public AudioDriver {
  protected:
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
+  bool InitializeSdl();
+  bool InitializeSdlWithOtherBackend();
+  void ShutdownSdl();
+  void SilentPacerMain();
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
+  std::thread silent_pacer_;
+  std::atomic<bool> silent_pacer_running_ = false;
   uint8_t sdl_device_channels_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;
