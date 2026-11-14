@@ -988,8 +988,7 @@ bool RunFileDialog(std::string& out_path, std::span<const SDL_DialogFileFilter> 
   // callbacks arrive through SDL's event loop, so keep pumping.
   while (!state.done.load(std::memory_order_acquire)) {
     SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-    }
+    while (SDL_PollEvent(&ev)) {}
     SDL_Delay(16);
   }
 
