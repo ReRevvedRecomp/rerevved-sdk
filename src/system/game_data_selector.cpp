@@ -906,24 +906,31 @@ SiblingTitleUpdateResult ExtractSiblingTitleUpdateTo(const std::filesystem::path
 // Native dialog helpers
 // ---------------------------------------------------------------------------
 
-/// Check that default.xex exists at dir and, if expected is non-empty, that
-/// its SHA-256 matches.
-bool ValidateDefaultXexInDir(const std::filesystem::path& dir, std::string_view expected) {
+/// Check that default.xex exists at dir and matches a configured SHA-256.
+bool ValidateDefaultXexInDir(const std::filesystem::path& dir,
+                             const GameDataSelectorSettings& settings) {
   auto xex_path = dir / "default.xex";
   if (!std::filesystem::is_regular_file(xex_path)) {
     REXLOG_ERROR("default.xex not found in {}", dir.string());
     return false;
   }
+  const std::string& expected = settings.default_xex_sha256;
   if (expected.empty()) {
     return true;
   }
   std::string actual = rex::crypto::sha256_file(xex_path);
-  if (!HexEqual(actual, expected)) {
-    REXLOG_ERROR("default.xex SHA-256 mismatch: expected={}, actual={}", expected, actual);
-    return false;
+  if (HexEqual(actual, expected)) {
+    REXLOG_INFO("default.xex SHA-256 verified OK");
+    return true;
   }
-  REXLOG_INFO("default.xex SHA-256 verified OK");
-  return true;
+  for (const std::string& alternate : settings.alternate_default_xex_sha256) {
+    if (HexEqual(actual, alternate)) {
+      REXLOG_INFO("default.xex SHA-256 verified OK (alternate release {})", actual);
+      return true;
+    }
+  }
+  REXLOG_ERROR("default.xex SHA-256 mismatch: expected={}, actual={}", expected, actual);
+  return false;
 }
 
 /// Case-insensitive extension check.
@@ -1102,7 +1109,8 @@ void PersistGameDataRoot(const GameDataSelectorSettings& settings) {
 // Validation
 // =============================================================================
 
-static bool IsGameDataValid(std::string_view game_data_root, std::string_view default_xex_sha256) {
+static bool IsGameDataValid(std::string_view game_data_root,
+                            const GameDataSelectorSettings& settings) {
   if (game_data_root.empty()) {
     return false;
   }
@@ -1110,7 +1118,7 @@ static bool IsGameDataValid(std::string_view game_data_root, std::string_view de
   if (!std::filesystem::is_directory(dir)) {
     return false;
   }
-  return ValidateDefaultXexInDir(dir, default_xex_sha256);
+  return ValidateDefaultXexInDir(dir, settings);
 }
 
 // =============================================================================
@@ -1333,7 +1341,7 @@ bool EnsureGameDataImpl(const GameDataSelectorSettings& settings) {
   std::filesystem::path dir;
   {
     std::string gdr = REXCVAR_GET(game_data_root);
-    if (!gdr.empty() && IsGameDataValid(gdr, settings.default_xex_sha256)) {
+    if (!gdr.empty() && IsGameDataValid(gdr, settings)) {
       REXLOG_INFO("game_data_root already valid: {}", gdr);
       dir = std::filesystem::path(gdr);
       // A title-update failure must not send valid game data back through extraction.
@@ -1396,7 +1404,7 @@ bool EnsureGameDataImpl(const GameDataSelectorSettings& settings) {
 
   if (std::filesystem::is_directory(selected_path)) {
     dir = selected_path;
-    if (!ValidateDefaultXexInDir(dir, settings.default_xex_sha256)) {
+    if (!ValidateDefaultXexInDir(dir, settings)) {
       ShowErrorBox("Validation Failed",
                    "default.xex was not found or its SHA-256 hash did not "
                    "match.\n\n"
@@ -1442,7 +1450,7 @@ bool EnsureGameDataImpl(const GameDataSelectorSettings& settings) {
     }
     REXLOG_INFO("Extraction complete: {} files written", file_count);
 
-    if (!ValidateDefaultXexInDir(out_dir, settings.default_xex_sha256)) {
+    if (!ValidateDefaultXexInDir(out_dir, settings)) {
       ShowErrorBox("Validation Failed",
                    std::string("default.xex was not found or its SHA-256 hash did not "
                                "match after extraction.\n\nThe ") +
