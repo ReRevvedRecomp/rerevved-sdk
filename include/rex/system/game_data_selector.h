@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rex::system {
 
@@ -14,6 +15,10 @@ struct GameDataSelectorSettings {
   /// Optional SHA-256 hex string. If non-empty, default.xex inside the game
   /// data *must* match this hash or the module fails with a message box.
   std::string default_xex_sha256;
+
+  /// Other accepted SHA-256 hex strings for default.xex. Ignored when
+  /// default_xex_sha256 is empty.
+  std::vector<std::string> alternate_default_xex_sha256;
 
   /// SHA-256 hex string for the title-update package file. If non-empty, a
   /// title update is required.
