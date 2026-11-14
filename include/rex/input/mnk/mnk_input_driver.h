@@ -57,7 +57,11 @@ class MnkInputDriver final : public InputDriver,
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
  private:
+  friend struct MnkInputDriverTestAccess;
+
   bool IsEnabled() const;
+  static void DragStickDeflection(float mouse_dx, float mouse_dy, double sensitivity, bool invert,
+                                  int32_t min_deflection, int32_t& out_x, int32_t& out_y);
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
@@ -98,6 +102,7 @@ class MnkInputDriver final : public InputDriver,
   std::atomic<bool> mouse_capture_update_queued_{false};
 
   std::atomic<bool> has_focus_{true};
+  std::atomic<bool> drag_held_{false};
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
