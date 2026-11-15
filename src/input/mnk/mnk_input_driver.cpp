@@ -33,6 +33,21 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0)
     .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_BOOL(mnk_mouse_drag, false, "Input",
+                    "Drag to pan. Hold the left mouse button and move the mouse to drive the "
+                    "right stick. Mouse aim takes precedence when both are on")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_BOOL(mnk_drag_invert, true, "Input",
+                    "Drag pushes the right stick against the mouse, so the view follows a grab")
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_DOUBLE(mnk_drag_sensitivity, 1.0, "Input", "Mouse sensitivity while dragging")
+    .range(0.01, 10.0)
+    .audience(rex::cvar::Audience::kPlayer);
+REXCVAR_DEFINE_INT32(mnk_drag_min_deflection, 0, "Input",
+                     "Smallest right stick deflection a moving drag produces, on its larger "
+                     "axis, so slow drags clear a game's stick deadzone")
+    .range(0, 32767)
+    .audience(rex::cvar::Audience::kAdvanced);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button")
     .audience(rex::cvar::Audience::kPlayer);
@@ -162,6 +177,8 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
 
 std::atomic<bool> mouse_look_active{true};
 
+constexpr double kMouseBaseScale = 200.0;
+
 }  // namespace
 
 void SetMouseLookActive(bool active) {
@@ -286,8 +303,9 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   // Mouse look is opt in. Without this gate, keyboard input alone would hide
   // and lock the cursor, breaking the ImGui overlays.
-  QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
-                          has_focus_ && is_active());
+  const bool mouse_aim = REXCVAR_GET(mnk_mouse) && IsMouseLookActive();
+  const bool dragging = !mouse_aim && REXCVAR_GET(mnk_mouse_drag) && drag_held_.load();
+  QueueMouseCaptureUpdate((mouse_aim || dragging) && has_focus_ && is_active());
 
   if (!is_active() || !has_focus_) {
     if (out_state) {
@@ -356,11 +374,18 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
-  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+  if (mouse_aim) {
     double sensitivity = REXCVAR_GET(mnk_sensitivity);
-    constexpr double kBaseScale = 200.0;
-    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kMouseBaseScale);
+    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kMouseBaseScale);
+  } else if (dragging) {
+    int32_t drag_x = 0;
+    int32_t drag_y = 0;
+    DragStickDeflection(mouse_dx_, mouse_dy_, REXCVAR_GET(mnk_drag_sensitivity),
+                        REXCVAR_GET(mnk_drag_invert), REXCVAR_GET(mnk_drag_min_deflection), drag_x,
+                        drag_y);
+    rx += drag_x;
+    ry += drag_y;
   }
   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
   // mouse is off, and toggling it on would otherwise dump the whole backlog
@@ -499,6 +524,23 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
   }
 }
 
+void MnkInputDriver::DragStickDeflection(float mouse_dx, float mouse_dy, double sensitivity,
+                                         bool invert, int32_t min_deflection, int32_t& out_x,
+                                         int32_t& out_y) {
+  const double direction = invert ? -1.0 : 1.0;
+  double x = double(mouse_dx) * sensitivity * kMouseBaseScale * direction;
+  double y = double(-mouse_dy) * sensitivity * kMouseBaseScale * direction;
+  // Lift both axes together: a square deadzone passes once either axis clears it.
+  const double larger = std::max(std::abs(x), std::abs(y));
+  if (larger > 0.0 && larger < double(min_deflection)) {
+    const double scale = double(min_deflection) / larger;
+    x *= scale;
+    y *= scale;
+  }
+  out_x = static_cast<int32_t>(std::clamp(x, double(-INT16_MAX), double(INT16_MAX)));
+  out_y = static_cast<int32_t>(std::clamp(y, double(-INT16_MAX), double(INT16_MAX)));
+}
+
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
     key_down_[vk] = down;
@@ -528,6 +570,8 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), true);
+      // A press an overlay owns never becomes a drag, even once it closes.
+      drag_held_.store(is_active());
       break;
     case rex::ui::MouseEvent::Button::kRight:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), true);
@@ -547,6 +591,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), false);
+      drag_held_.store(false);
       break;
     case rex::ui::MouseEvent::Button::kRight:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), false);
@@ -585,6 +630,7 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   has_focus_ = false;
+  drag_held_.store(false);
   // Withdraw the request too, or an update queued before the focus loss grabs
   // the cursor straight back.
   mouse_capture_requested_.store(false, std::memory_order_relaxed);
