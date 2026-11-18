@@ -266,6 +266,7 @@ TEST_CASE("relay client loopback discovery and VDP use native select",
     }
   });
   Client first, second, wrong;
+  first.SetLossTimeout(10s);
   const auto resolved = Resolve("localhost:" + std::to_string((*server)->endpoint().port));
   REQUIRE(resolved);
   CHECK(*resolved == (*server)->endpoint());
@@ -959,6 +960,7 @@ TEST_CASE("relay client bounds requests and updates and fails them on loss",
           "[kernel][relay_client][directory][network]") {
   FilteredRelay relay;
   Client host, other;
+  host.SetLossTimeout(10s);
   REQUIRE(host.Start(relay.endpoint(), "bounds", "secret", {}));
   REQUIRE(other.Start(relay.endpoint(), "bounds", "secret", {}));
   // Make the last relay datagram recent so the loss deadline is predictable.
@@ -994,6 +996,27 @@ TEST_CASE("relay client bounds requests and updates and fails them on loss",
   CHECK(lost.state == RequestState::kFailed);
   CHECK(lost.failure == RequestFailure::kAssociation);
   CHECK_FALSE(host.PublishSession(LargeRecord(1)));
+}
+
+TEST_CASE("relay silence excludes worker pauses", "[kernel][relay_client]") {
+  const auto t0 = SilenceClock::Clock::time_point{} + 1000s;
+  SilenceClock silence(t0);
+  CHECK_FALSE(silence.Run(t0 + 2s));
+  CHECK(silence.received() == t0);
+  silence.Received(t0 + 3s);
+  CHECK_FALSE(silence.Run(t0 + 4s));
+  CHECK(silence.received() == t0 + 3s);
+  // Silence before a pause still counts; the 30 second pause does not.
+  const auto paused = silence.Run(t0 + 34s);
+  REQUIRE(paused);
+  CHECK(*paused == 30s);
+  CHECK(silence.received() == t0 + 33s);
+  CHECK_FALSE(silence.Run(t0 + 36s));
+  CHECK(silence.received() == t0 + 33s);
+  // A pause right after a datagram never moves the receive time past now.
+  silence.Received(t0 + 37s);
+  REQUIRE(silence.Run(t0 + 45s));
+  CHECK(silence.received() == t0 + 45s);
 }
 
 TEST_CASE("relay counter line logs only on a counter change and reports the largest gap",

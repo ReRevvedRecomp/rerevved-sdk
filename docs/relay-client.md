@@ -191,9 +191,14 @@ Windows.
 The thread waits with `select` until relay traffic, a local send/stop wakeup, or
 the next handshake or heartbeat deadline. Windows UDP connection resets are
 disabled; residual resets are counted as no-ops. The thread sends a heartbeat
-every two seconds. Ten seconds without a datagram from the configured relay
+every two seconds. Sixty seconds without a datagram from the configured relay
 endpoint marks the association lost and logs once; guest sends then fail with
-`WSAENETDOWN`. Each successful `XNetStartup`, including the Ex form and a
+`WSAENETDOWN`. The relay keeps a silent peer for the same 60 seconds, so a
+shorter outage resumes with the same identity. A gap of five seconds or more
+between worker passes, such as a suspended process, logs once, sends a heartbeat
+at once and does not count toward the loss timeout, unless the relay silence
+including the gap has already reached the timeout. Each successful
+`XNetStartup`, including the Ex form and a
 startup that left the relay disconnected, takes a reference, and each
 `XNetCleanup` releases one. Titles may send on open sockets after a cleanup and
 may call startup more often than cleanup, in which case the association lasts

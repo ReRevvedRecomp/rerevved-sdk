@@ -592,9 +592,9 @@ TEST_CASE("relay backward clocks cannot refill buckets or expire state", "[relay
   CHECK(fixture.core.counters().pending == 1);
   fixture.core.Tick(6000);
   CHECK(fixture.core.counters().pending == 0);
-  fixture.core.Tick(16999);
+  fixture.core.Tick(61999);
   CHECK(fixture.core.counters().peers == 1);
-  fixture.core.Tick(17000);
+  fixture.core.Tick(62000);
   CHECK(fixture.core.counters().peers == 0);
 }
 
@@ -682,9 +682,9 @@ TEST_CASE("relay drops spoofed endpoint and token", "[relay]") {
   CHECK(fixture.Input(kA, Data(b.token)).empty());
   CHECK(fixture.Input(kA, Data(0)).empty());
   CHECK(Drops(fixture.core, Drop::kAuth) == 3);
-  fixture.now = 14999;
+  fixture.now = 59999;
   CHECK(fixture.Input(kA, Control(Type::kHeartbeat, b.token)).empty());
-  fixture.core.Tick(15000);
+  fixture.core.Tick(60000);
   CHECK(fixture.core.counters().peers == 0);
 }
 
@@ -774,15 +774,15 @@ TEST_CASE("relay heartbeat refreshes idle deadline and BYE reuses addresses", "[
   Fixture fixture;
   const auto a = fixture.Join(kA);
   const auto b = fixture.Join(kB);
-  fixture.now = 14999;
+  fixture.now = 59999;
   const auto ack = fixture.Input(kA, Control(Type::kHeartbeat, a.token));
   REQUIRE(ack.size() == 1);
   CHECK(Read(ack[0].bytes).type == Type::kAck);
   CHECK(Read(ack[0].bytes).token == a.token);
-  fixture.core.Tick(15000);
+  fixture.core.Tick(60000);
   CHECK(fixture.core.counters().peers == 1);
   CHECK(Drops(fixture.core, Drop::kIdle) == 1);
-  fixture.now = 15000;
+  fixture.now = 60000;
   const auto c = fixture.Join(kC);
   CHECK(c.ipv4 == b.ipv4);
   CHECK(fixture.Input(kA, Control(Type::kBye, a.token)).empty());

@@ -170,7 +170,7 @@ Each peer starts with a one-second token-bucket burst of 500 packets and 256
 KiB. DATA and HEARTBEAT consume one packet and their full wire byte size. Both
 buckets refill continuously at those per-second rates. Excess traffic is
 silently dropped and counted. Authenticated BYE bypasses the buckets and frees
-the peer immediately. A peer expires after 15 seconds without an accepted DATA
+the peer immediately. A peer expires after 60 seconds without an accepted DATA
 or HEARTBEAT. Malformed, spoofed, rate-limited and unroutable traffic does not
 refresh that deadline. A broadcast to an empty room counts as valid. The last
 peer's departure removes the room and its fingerprint.

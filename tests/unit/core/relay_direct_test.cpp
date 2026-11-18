@@ -554,9 +554,9 @@ TEST_CASE("relay sends CONNECT_CLOSE when a paired member leaves", "[relay][dire
   Message heartbeat;
   heartbeat.type = Type::kHeartbeat;
   heartbeat.token = a.token;
-  f.now = 14000;
+  f.now = 59000;
   REQUIRE(f.Input(kA, heartbeat).size() == 1);
-  f.core.Tick(15000);
+  f.core.Tick(60000);
   const auto notices = f.core.TakeNotices();
   REQUIRE(notices.size() == 1);
   CHECK(notices[0].endpoint == kA);

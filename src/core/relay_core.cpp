@@ -271,7 +271,7 @@ void Core::Tick(uint64_t now) {
   for (auto it = peers_.begin(); it != peers_.end();) {
     if (it->second.join_reply && now_ - it->second.join_reply->created >= 5000)
       it->second.join_reply.reset();
-    if (now_ - it->second.last_seen >= 15000) {
+    if (now_ - it->second.last_seen >= kIdleMs) {
       Remove(it++);
       Count(Drop::kIdle);
     } else

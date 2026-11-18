@@ -263,6 +263,20 @@ std::optional<std::string> CounterLog::Line(const Stats& stats) {
   return line;
 }
 
+std::optional<Clock::duration> SilenceClock::Run(Clock::time_point now) {
+  const auto gap = now - ran_;
+  ran_ = std::max(ran_, now);
+  if (gap < kStall)
+    return std::nullopt;
+  received_ += gap;
+  return gap;
+}
+
+void SilenceClock::Received(Clock::time_point now) {
+  received_ = std::max(received_, now);
+  ran_ = std::max(ran_, now);
+}
+
 bool TokenBucket::Take(Clock::time_point now) {
   if (!started_) {
     started_ = true;
@@ -546,6 +560,7 @@ struct Client::Impl {
   bool probe_replies = false;
   SideChannelHandler side_channel;
   DirectOptions direct_options;  // copied by each association at its WELCOME
+  std::chrono::milliseconds loss_timeout = kRelayLossTimeout;
 
   // Direct paths of one association. Only the worker thread touches this state;
   // counters publish into stats under mutex, which callers must not hold.
@@ -1306,11 +1321,13 @@ struct Client::Impl {
     }
     hello.fingerprint = fingerprint;
     std::copy_n(random->begin(), hello.nonce.size(), hello.nonce.begin());
+    std::chrono::milliseconds lose_after;
     {
       std::lock_guard lock(mutex);
       std::memcpy(&envelope_token, random->data() + 16, sizeof(envelope_token));
       injector = injection.endpoint;
       wake = &signal;
+      lose_after = loss_timeout;
     }
     auto transmit = [&](const relay::Message& message) {
       auto bytes = relay::Encode(message);
@@ -1323,7 +1340,7 @@ struct Client::Impl {
     auto started = Clock::now();
     auto next_handshake = started;
     auto next_heartbeat = started;
-    auto last_received = started;
+    SilenceClock silence(started);
     auto next_counter_log = started + CounterLog::kInterval;
     CounterLog counter_log;
     bool joined = false;
@@ -1359,13 +1376,22 @@ struct Client::Impl {
             next_handshake = now + 500ms;
         }
       } else {
-        if (now - last_received >= 10s) {
+        // A pause as long as the loss timeout has outlasted the relay's idle expiry too.
+        auto silent = now - silence.received();
+        if (const auto paused = silence.Run(now); paused && silent < lose_after) {
+          REXKRNL_WARN("System Link relay worker paused for {} ms; checking the relay",
+                       std::chrono::duration_cast<std::chrono::milliseconds>(*paused).count());
+          next_heartbeat = now;
+          silent = now - silence.received();
+        }
+        if (silent >= lose_after) {
           std::lock_guard lock(mutex);
           stats.state = Association::kLost;
           stats.discarded_pending += queue.size();
           queue.clear();
           FailDirectoryLocked();
-          REXKRNL_ERROR("System Link relay association lost: no relay datagram for 10 seconds");
+          REXKRNL_ERROR("System Link relay association lost: no relay datagram for {} seconds",
+                        std::chrono::duration_cast<std::chrono::seconds>(lose_after).count());
           break;
         }
         if (now >= next_heartbeat) {
@@ -1420,7 +1446,7 @@ struct Client::Impl {
           transmit(outgoing);
         }
       }
-      auto deadline = joined ? std::min(next_heartbeat, last_received + 10s)
+      auto deadline = joined ? std::min(next_heartbeat, silence.received() + lose_after)
                              : std::min(next_handshake, started + 5s);
       if (direct)
         deadline = direct->Next(deadline);
@@ -1478,8 +1504,9 @@ struct Client::Impl {
         ++stats.invalid_wire;
         continue;
       }
-      last_received = Clock::now();
-      counter_log.Arrival(last_received);
+      const auto arrived = Clock::now();
+      silence.Received(arrived);
+      counter_log.Arrival(arrived);
       const std::span<uint8_t> received{bytes.data(), static_cast<size_t>(count)};
       auto message = relay::Decode(received);
       if (message && message->type == relay::Type::kTokenGrant && !joined) {
@@ -1954,6 +1981,10 @@ void Client::SetProbeReplies(bool enabled) {
 void Client::SetDirect(DirectOptions options) {
   std::lock_guard lock(impl_->mutex);
   impl_->direct_options = options;
+}
+void Client::SetLossTimeout(std::chrono::milliseconds timeout) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->loss_timeout = timeout;
 }
 void Client::SetSideChannelHandler(SideChannelHandler handler) {
   std::lock_guard lock(impl_->mutex);

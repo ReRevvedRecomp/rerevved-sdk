@@ -639,9 +639,9 @@ TEST_CASE("relay sessions end on remove, BYE, idle expiry and empty room", "[rel
     CHECK(fixture.Lookup(kB, b.token, 1).empty());
   }
   SECTION("idle expiry") {
-    fixture.now = 14000;
+    fixture.now = 59000;
     fixture.Input(kB, Control(Type::kHeartbeat, b.token));
-    fixture.core.Tick(15000);
+    fixture.core.Tick(60000);
     CHECK(fixture.core.counters().peers == 1);
     CHECK(fixture.core.counters().sessions == 1);
   }
