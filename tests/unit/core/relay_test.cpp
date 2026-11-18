@@ -795,6 +795,24 @@ TEST_CASE("relay heartbeat refreshes idle deadline and BYE reuses addresses", "[
   CHECK(fixture.Join(kA, "room", Digest{99}).type == Type::kWelcome);
 }
 
+TEST_CASE("relay join replaces a silent peer from the same host", "[relay]") {
+  Fixture fixture(Config{16, 2});
+  const auto a = fixture.Join(kA);
+  const auto c = fixture.Join(kC);
+  fixture.now = 5999;
+  CHECK(fixture.Input(kC, Control(Type::kHeartbeat, c.token)).size() == 1);
+  CHECK(fixture.Join(kB).type == Type::kReject);
+  fixture.now = 6000;
+  CHECK(fixture.Input(kC, Control(Type::kHeartbeat, c.token)).size() == 1);
+  CHECK(fixture.Join({2, 1001}).type == Type::kReject);
+  const auto b = fixture.Join(kB);
+  REQUIRE(b.type == Type::kWelcome);
+  CHECK(b.ipv4 == a.ipv4);
+  CHECK(fixture.core.counters().peers == 2);
+  CHECK(Drops(fixture.core, Drop::kIdle) == 1);
+  CHECK(fixture.Input(kA, Control(Type::kHeartbeat, a.token)).empty());
+}
+
 TEST_CASE("relay never enlarges a response to malformed traffic", "[relay]") {
   Fixture fixture;
   for (size_t size = 0; size <= kMaxDatagram + 1; ++size) {

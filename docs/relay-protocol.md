@@ -172,7 +172,10 @@ buckets refill continuously at those per-second rates. Excess traffic is
 silently dropped and counted. Authenticated BYE bypasses the buckets and frees
 the peer immediately. A peer expires after 60 seconds without an accepted DATA
 or HEARTBEAT. Malformed, spoofed, rate-limited and unroutable traffic does not
-refresh that deadline. A broadcast to an empty room counts as valid. The last
+refresh that deadline. An authenticated JOIN first removes every peer in its room
+with the same IPv4 and another port that has been silent for 6 seconds, as idle
+expiry would, so a client relaunched after a crash does not wait for its old peer
+to expire. A broadcast to an empty room counts as valid. The last
 peer's departure removes the room and its fingerprint.
 
 Directory limits are fixed. A peer hosts at most 2 sessions and a room holds at

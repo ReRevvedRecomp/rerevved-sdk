@@ -456,6 +456,14 @@ std::vector<Datagram> Core::Receive(Endpoint source, std::span<const uint8_t> by
       failed_join(Reason::kAuth);
       return output;
     }
+    for (auto it = peers_.begin(); it != peers_.end();) {
+      if (it->first != source && it->first.ipv4 == source.ipv4 && it->second.room == room_name &&
+          now_ - it->second.last_seen >= kReplaceSilentMs) {
+        Remove(it++);
+        Count(Drop::kIdle);
+      } else
+        ++it;
+    }
     auto room = rooms_.find(room_name);
     const auto members = std::count_if(peers_.begin(), peers_.end(), [&](const auto& entry) {
       return entry.first != source && entry.second.room == room_name;
