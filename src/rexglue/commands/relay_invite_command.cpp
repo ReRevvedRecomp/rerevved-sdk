@@ -13,12 +13,14 @@ void RegisterRelayInvite(CLI::App& parent, DeferredAction& pending) {
     bool create_secret = false;
   };
   auto options = std::make_shared<Options>();
-  auto* command = parent.add_subcommand("relay-invite", "Create a private System Link invite code");
-  command->add_option("--address", options->address, "Relay IPv4 or DNS host:port")->required();
-  command->add_option("--secret-file", options->secret_file, "Shared-secret file")->required();
+  auto* command =
+      parent.add_subcommand("online-invite", "Create a private System Link invite code");
+  command->add_option("--address", options->address, "Online server IPv4 or DNS host:port")
+      ->required();
+  command->add_option("--password-file", options->secret_file, "Server password file")->required();
   command->add_option("--room", options->room, "Room name (default: testers)");
-  command->add_flag("--create-secret", options->create_secret,
-                    "Create a missing secret file; read an existing file unchanged");
+  command->add_flag("--create-password", options->create_secret,
+                    "Create a missing password file; read an existing file unchanged");
   command->callback([options, &pending] {
     pending = [options]() -> rex::VoidResult {
       auto code = rex::relay::MakeInvite(options->address, options->secret_file, options->room,

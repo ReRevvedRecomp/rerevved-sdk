@@ -183,8 +183,8 @@ TEST_CASE("relay session record codec round trips at the size limits", "[relay][
   for (const auto& record : {Record(1), Largest(0xffffffffffffffff)}) {
     auto bytes = EncodeRecord(record);
     REQUIRE(bytes);
-    CHECK(bytes->size() == kRecordFixedSize + record.properties.size() +
-                               record.contexts.size() + record.qos.size());
+    CHECK(bytes->size() ==
+          kRecordFixedSize + record.properties.size() + record.contexts.size() + record.qos.size());
     auto decoded = DecodeRecord(*bytes);
     REQUIRE(decoded);
     CHECK(*decoded == record);
@@ -560,8 +560,7 @@ TEST_CASE("relay directory enforces session ownership", "[relay][directory]") {
   CHECK(Drops(fixture.core, Drop::kTokenDenied) == 1);
 }
 
-TEST_CASE("relay directory enforces per-peer and per-room session limits",
-          "[relay][directory]") {
+TEST_CASE("relay directory enforces per-peer and per-room session limits", "[relay][directory]") {
   Fixture fixture(Config{1, kMaxMembers});
   const auto a = fixture.Join(kA);
   REQUIRE(fixture.Publish(kA, a.token, Record(1)) == Status::kOk);
@@ -639,9 +638,9 @@ TEST_CASE("relay sessions end on remove, BYE, idle expiry and empty room", "[rel
     CHECK(fixture.Lookup(kB, b.token, 1).empty());
   }
   SECTION("idle expiry") {
-    fixture.now = 14000;
+    fixture.now = 59000;
     fixture.Input(kB, Control(Type::kHeartbeat, b.token));
-    fixture.core.Tick(15000);
+    fixture.core.Tick(60000);
     CHECK(fixture.core.counters().peers == 1);
     CHECK(fixture.core.counters().sessions == 1);
   }

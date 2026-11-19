@@ -147,19 +147,19 @@ std::optional<relay::Digest> FromHex(std::string_view text) {
 const char* Rejection(relay::Reason reason) {
   switch (reason) {
     case relay::Reason::kVersion:
-      return "protocol version";
+      return "different ReRevved version";
     case relay::Reason::kMalformed:
-      return "malformed handshake";
+      return "unreadable reply from the online server";
     case relay::Reason::kAuth:
-      return "wrong secret";
+      return "invite code does not match this server";
     case relay::Reason::kRoomFull:
-      return "room full";
+      return "the game is full";
     case relay::Reason::kTooManyRooms:
-      return "too many rooms";
+      return "the online server has too many games open";
     case relay::Reason::kFingerprintMismatch:
       return "different game build";
     case relay::Reason::kRateLimited:
-      return "rate limited";
+      return "too many attempts; wait and try again";
   }
   return "unknown rejection";
 }
@@ -263,6 +263,20 @@ std::optional<std::string> CounterLog::Line(const Stats& stats) {
   return line;
 }
 
+std::optional<Clock::duration> SilenceClock::Run(Clock::time_point now) {
+  const auto gap = now - ran_;
+  ran_ = std::max(ran_, now);
+  if (gap < kStall)
+    return std::nullopt;
+  received_ += gap;
+  return gap;
+}
+
+void SilenceClock::Received(Clock::time_point now) {
+  received_ = std::max(received_, now);
+  ran_ = std::max(ran_, now);
+}
+
 bool TokenBucket::Take(Clock::time_point now) {
   if (!started_) {
     started_ = true;
@@ -357,13 +371,13 @@ std::optional<relay::Datagram> Unwrap(uint64_t token, std::span<const uint8_t> b
 Result<relay::InviteAddress> ParseAddress(std::string_view address) {
   const auto colon = address.rfind(':');
   if (colon == std::string_view::npos || !colon || colon + 1 == address.size())
-    return std::unexpected(Error{ErrorCategory::Config, "Relay address requires host:port"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server address requires host:port"});
   const auto number = address.substr(colon + 1);
   unsigned port = 0;
   const auto parsed = std::from_chars(number.data(), number.data() + number.size(), port);
   if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || !port ||
       port > 65535)
-    return std::unexpected(Error{ErrorCategory::Config, "Relay port must be 1-65535"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server port must be 1-65535"});
   return relay::InviteAddress{std::string(address.substr(0, colon)), static_cast<uint16_t>(port)};
 }
 Result<relay::Endpoint> Resolve(std::string_view address) {
@@ -372,13 +386,13 @@ Result<relay::Endpoint> Resolve(std::string_view address) {
     return std::unexpected(parsed.error());
   Winsock winsock;
   if (!winsock.ready)
-    return std::unexpected(Error{ErrorCategory::IO, "Relay WSAStartup failed"});
+    return std::unexpected(Error{ErrorCategory::IO, "WSAStartup failed"});
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
   addrinfo* resolved = nullptr;
   if (getaddrinfo(parsed->host.c_str(), nullptr, &hints, &resolved))
-    return std::unexpected(Error{ErrorCategory::IO, "Cannot resolve relay IPv4 host"});
+    return std::unexpected(Error{ErrorCategory::IO, "Cannot resolve server IPv4 host"});
   relay::Endpoint result{reinterpret_cast<sockaddr_in*>(resolved->ai_addr)->sin_addr.s_addr,
                          parsed->port};
   freeaddrinfo(resolved);
@@ -414,7 +428,7 @@ Result<Secret> ReadSecret(std::string_view path) {
   secret.size_ = *size;
   auto first = secret.view().find_first_not_of(" \t\r\n\f\v");
   if (first == std::string::npos)
-    return std::unexpected(Error{ErrorCategory::Config, "Relay secret is empty"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server password is empty"});
   secret.size_ = secret.view().find_last_not_of(" \t\r\n\f\v") - first + 1;
   secret.offset_ = first;
   return secret;
@@ -431,19 +445,19 @@ Result<relay::Digest> HostFingerprint() {
     std::array<wchar_t, 32768> path{};
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (!length || length == path.size())
-      return std::unexpected(Error{ErrorCategory::IO, "Cannot locate relay host executable"});
+      return std::unexpected(Error{ErrorCategory::IO, "Cannot locate the game executable"});
     const std::filesystem::path executable_path(std::wstring_view(path.data(), length));
 #else
     const auto executable_path = filesystem::GetExecutablePath();
 #endif
     auto executable = FromHex(crypto::sha256_file(executable_path));
     if (!executable)
-      return std::unexpected(Error{ErrorCategory::IO, "Cannot hash relay host executable"});
+      return std::unexpected(Error{ErrorCategory::IO, "Cannot hash the game executable"});
     std::string input = REXGLUE_VERSION_STRING;
     input.append(reinterpret_cast<const char*>(executable->data()), executable->size());
     auto hash = FromHex(crypto::sha256(input));
     if (!hash)
-      return std::unexpected(Error{ErrorCategory::Crypto, "Cannot compute relay fingerprint"});
+      return std::unexpected(Error{ErrorCategory::Crypto, "Cannot compute the game fingerprint"});
     return *hash;
   }();
   if (fingerprint)
@@ -546,6 +560,7 @@ struct Client::Impl {
   bool probe_replies = false;
   SideChannelHandler side_channel;
   DirectOptions direct_options;  // copied by each association at its WELCOME
+  std::chrono::milliseconds loss_timeout = kRelayLossTimeout;
 
   // Direct paths of one association. Only the worker thread touches this state;
   // counters publish into stats under mutex, which callers must not hold.
@@ -1289,7 +1304,7 @@ struct Client::Impl {
     const bool local = (ntohl(server.ipv4) >> 24) == 127;
     if (!winsock.ready || !transport.Open(local ? htonl(INADDR_LOOPBACK) : 0) ||
         !injection.Open(htonl(INADDR_LOOPBACK)) || !signal.Open(htonl(INADDR_LOOPBACK))) {
-      Fail("Cannot open relay UDP sockets");
+      Fail("cannot open a network port");
       return;
     }
     auto random = relay::RandomSeed();
@@ -1306,11 +1321,13 @@ struct Client::Impl {
     }
     hello.fingerprint = fingerprint;
     std::copy_n(random->begin(), hello.nonce.size(), hello.nonce.begin());
+    std::chrono::milliseconds lose_after;
     {
       std::lock_guard lock(mutex);
       std::memcpy(&envelope_token, random->data() + 16, sizeof(envelope_token));
       injector = injection.endpoint;
       wake = &signal;
+      lose_after = loss_timeout;
     }
     auto transmit = [&](const relay::Message& message) {
       auto bytes = relay::Encode(message);
@@ -1323,7 +1340,7 @@ struct Client::Impl {
     auto started = Clock::now();
     auto next_handshake = started;
     auto next_heartbeat = started;
-    auto last_received = started;
+    SilenceClock silence(started);
     auto next_counter_log = started + CounterLog::kInterval;
     CounterLog counter_log;
     bool joined = false;
@@ -1344,7 +1361,7 @@ struct Client::Impl {
       auto now = Clock::now();
       if (!joined) {
         if (now - started >= 5s) {
-          Fail("relay not reachable (handshake timeout)");
+          Fail("the host's online server is not responding");
           break;
         }
         if (now >= next_handshake) {
@@ -1359,13 +1376,22 @@ struct Client::Impl {
             next_handshake = now + 500ms;
         }
       } else {
-        if (now - last_received >= 10s) {
+        // A pause as long as the loss timeout has outlasted the relay's idle expiry too.
+        auto silent = now - silence.received();
+        if (const auto paused = silence.Run(now); paused && silent < lose_after) {
+          REXKRNL_WARN("System Link relay worker paused for {} ms; checking the relay",
+                       std::chrono::duration_cast<std::chrono::milliseconds>(*paused).count());
+          next_heartbeat = now;
+          silent = now - silence.received();
+        }
+        if (silent >= lose_after) {
           std::lock_guard lock(mutex);
           stats.state = Association::kLost;
           stats.discarded_pending += queue.size();
           queue.clear();
           FailDirectoryLocked();
-          REXKRNL_ERROR("System Link relay association lost: no relay datagram for 10 seconds");
+          REXKRNL_ERROR("System Link relay association lost: no relay datagram for {} seconds",
+                        std::chrono::duration_cast<std::chrono::seconds>(lose_after).count());
           break;
         }
         if (now >= next_heartbeat) {
@@ -1420,7 +1446,7 @@ struct Client::Impl {
           transmit(outgoing);
         }
       }
-      auto deadline = joined ? std::min(next_heartbeat, last_received + 10s)
+      auto deadline = joined ? std::min(next_heartbeat, silence.received() + lose_after)
                              : std::min(next_handshake, started + 5s);
       if (direct)
         deadline = direct->Next(deadline);
@@ -1442,7 +1468,7 @@ struct Client::Impl {
       const auto ready = select(static_cast<int>(std::max(transport.handle, signal.handle) + 1),
                                 &readable, nullptr, nullptr, &timeout);
       if (ready < 0) {
-        Fail("Relay socket select failed");
+        Fail("network error");
         break;
       }
       if (FD_ISSET(signal.handle, &readable))
@@ -1478,8 +1504,9 @@ struct Client::Impl {
         ++stats.invalid_wire;
         continue;
       }
-      last_received = Clock::now();
-      counter_log.Arrival(last_received);
+      const auto arrived = Clock::now();
+      silence.Received(arrived);
+      counter_log.Arrival(arrived);
       const std::span<uint8_t> received{bytes.data(), static_cast<size_t>(count)};
       auto message = relay::Decode(received);
       if (message && message->type == relay::Type::kTokenGrant && !joined) {
@@ -1643,9 +1670,9 @@ VoidResult Client::Associate(relay::Endpoint server, std::string room,
   if (!server.ipv4 || !server.port || !credentials) {
     impl_->stats.started = true;
     impl_->stats.state = Association::kFailed;
-    impl_->stats.last_failure = "bad relay settings";
-    return std::unexpected(
-        Error{ErrorCategory::Config, "Relay requires host:port, a 1-32 byte room, and a secret"});
+    impl_->stats.last_failure = "invalid online settings";
+    return std::unexpected(Error{
+        ErrorCategory::Config, "Online server needs host:port, a 1-32 byte room, and a password"});
   }
   impl_->stop = false;
   impl_->server = server;
@@ -1954,6 +1981,10 @@ void Client::SetProbeReplies(bool enabled) {
 void Client::SetDirect(DirectOptions options) {
   std::lock_guard lock(impl_->mutex);
   impl_->direct_options = options;
+}
+void Client::SetLossTimeout(std::chrono::milliseconds timeout) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->loss_timeout = timeout;
 }
 void Client::SetSideChannelHandler(SideChannelHandler handler) {
   std::lock_guard lock(impl_->mutex);

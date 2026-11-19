@@ -36,6 +36,12 @@ constexpr uint32_t kUpdatesPerSecond = 10;  // PUBLISH, REMOVE and TOKEN_REQUEST
 constexpr size_t kMaxTokensPerSession = 4;
 constexpr uint32_t kConnectsPerSecond = 4;  // CANDIDATES and CONNECT_REQUEST
 constexpr uint64_t kAttemptReuseMs = 10000;
+// A silent peer keeps its id, token and address this long, so a client that
+// stalls or loses the network briefly resumes with the same identity.
+constexpr uint64_t kIdleMs = 60000;
+// An authenticated join replaces a peer in its room from the same IPv4 that has
+// been silent this long (three missed heartbeats), so a relaunch need not wait.
+constexpr uint64_t kReplaceSilentMs = 6000;
 constexpr size_t kMaxAttempts = 4096;
 enum class Drop : size_t {
   kVersion,

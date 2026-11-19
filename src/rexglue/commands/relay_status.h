@@ -77,9 +77,9 @@ class RelayStatus {
                              uint64_t connection_resets, uint64_t now) {
     RelayStatusMessages messages;
     if (c.peers != peers_ || c.rooms != rooms_) {
-      messages.status = "Relay: " + std::to_string(c.peers) +
+      messages.status = "Online server: " + std::to_string(c.peers) +
                         (c.peers == 1 ? " player in " : " players in ") + std::to_string(c.rooms) +
-                        (c.rooms == 1 ? " room" : " rooms");
+                        (c.rooms == 1 ? " game" : " games");
       peers_ = c.peers;
       rooms_ = c.rooms;
     }
@@ -94,7 +94,7 @@ class RelayStatus {
                                      true);
       }
       if (!messages.warning.empty()) {
-        messages.warning.insert(0, "Relay problems: ");
+        messages.warning.insert(0, "Online server problems: ");
         // Keep the last emitted baseline so suppressed increases are included next time.
         for (size_t i = 0; i < counters.size(); ++i)
           warned_[i] = counters[i].value;
@@ -105,7 +105,7 @@ class RelayStatus {
       for (const auto& counter : counters)
         detail::AppendRelayCounter(messages.debug, counter.name, counter.value);
       if (!messages.debug.empty())
-        messages.debug.insert(0, "Relay counters: ");
+        messages.debug.insert(0, "Online server counters: ");
       next_debug_ = now + kLogIntervalMs;
     }
     return messages;
@@ -120,7 +120,7 @@ class RelayStatus {
     }
     for (const auto count : c.connect_drops)
       rejected += count;
-    return "Relay stopped: packets_in=" + std::to_string(c.packets_in) +
+    return "Online server stopped: packets_in=" + std::to_string(c.packets_in) +
            " bytes_in=" + std::to_string(c.bytes_in) +
            " packets_out=" + std::to_string(c.packets_out) +
            " bytes_out=" + std::to_string(c.bytes_out) + " rejected=" + std::to_string(rejected) +

@@ -1610,7 +1610,7 @@ rex::live_invite::JoinStatus InviteJoin::Finish(rex::live_invite::JoinResult res
 rex::live_invite::JoinStatus InviteJoin::Accept() {
   if (!service_->AcceptInvite(session_id_))
     return Finish(rex::live_invite::JoinResult::kUnavailable,
-                  "The relay could not look up the session");
+                  "The online server could not find that game");
   accepting_ = true;
   status_ = {rex::live_invite::JoinResult::kPending, {}};
   return status_;
@@ -1634,11 +1634,11 @@ rex::live_invite::JoinStatus InviteJoin::Begin(std::string_view code, Environmen
   if (!config.error.empty() || config.mode != system_link::Mode::kRelay)
     return Finish(JoinResult::kRestartRequired, config.mode == system_link::Mode::kLan
                                                     ? "LAN System Link is on"
-                                                    : "System Link is not using a relay");
+                                                    : "You are not using an online server");
   if (!config.live_sessions)
     return Finish(JoinResult::kRestartRequired, "Live sessions are off");
   if (!environment.live || !environment.service)
-    return Finish(JoinResult::kRestartRequired, "Not connected to the relay");
+    return Finish(JoinResult::kRestartRequired, "Not connected to the online server");
   session_id_ = invite->session_id;
   server_ = environment.server;
   service_ = std::move(environment.service);
@@ -1647,7 +1647,7 @@ rex::live_invite::JoinStatus InviteJoin::Begin(std::string_view code, Environmen
       SameHost(configured->host, invite->address.host))
     return Accept();
   if (!environment.resolve)
-    return Finish(JoinResult::kUnavailable, "Cannot resolve the invite's relay");
+    return Finish(JoinResult::kUnavailable, "Cannot find the invite's online server");
   const std::string address = invite->address.host + ":" + std::to_string(invite->address.port);
   resolving_ = std::make_shared<Resolution>();
   std::thread([resolution = resolving_, resolve = std::move(environment.resolve), address] {
@@ -1673,9 +1673,9 @@ rex::live_invite::JoinStatus InviteJoin::Poll() {
       return status_;
     resolving_.reset();
     if (!*endpoint)
-      return Finish(JoinResult::kUnavailable, "Cannot resolve the invite's relay");
+      return Finish(JoinResult::kUnavailable, "Cannot find the invite's online server");
     if (**endpoint != server_)
-      return Finish(JoinResult::kRestartRequired, "The invite is for another relay");
+      return Finish(JoinResult::kRestartRequired, "The invite is for a different online server");
     return Accept();
   }
   if (!accepting_ || !service_)
@@ -1684,11 +1684,11 @@ rex::live_invite::JoinStatus InviteJoin::Poll() {
     case AcceptState::kFound:
       return Finish(JoinResult::kAccepted, {});
     case AcceptState::kMissing:
-      return Finish(JoinResult::kRestartRequired, "The session is not in this relay room");
+      return Finish(JoinResult::kRestartRequired, "That game is not on your online server");
     case AcceptState::kPending:
       return status_;
     default:
-      return Finish(JoinResult::kUnavailable, "The relay could not look up the session");
+      return Finish(JoinResult::kUnavailable, "The online server could not find that game");
   }
 }
 

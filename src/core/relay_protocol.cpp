@@ -17,11 +17,11 @@ Result<Digest> RandomSeed() {
 #if defined(_WIN32)
   if (BCryptGenRandom(nullptr, seed.data(), static_cast<ULONG>(seed.size()),
                       BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
-    return std::unexpected(Error{ErrorCategory::Crypto, "Relay random seed failed"});
+    return std::unexpected(Error{ErrorCategory::Crypto, "Random seed failed"});
 #else
   std::ifstream random("/dev/urandom", std::ios::binary);
   if (!random.read(reinterpret_cast<char*>(seed.data()), seed.size()))
-    return std::unexpected(Error{ErrorCategory::Crypto, "Relay random seed failed"});
+    return std::unexpected(Error{ErrorCategory::Crypto, "Random seed failed"});
 #endif
   return seed;
 }
@@ -132,10 +132,9 @@ std::expected<SessionRecord, Reason> ReadRecord(Reader& in) {
   r.open_private = static_cast<uint16_t>(in.Get(2));
   r.host_peer_id = static_cast<uint32_t>(in.Get(4));
   r.host_ipv4 = in.Ip();
-  const std::array<std::pair<Bytes*, size_t>, 3> blobs{
-      {{&r.properties, kMaxRecordProperties},
-       {&r.contexts, kMaxRecordContexts},
-       {&r.qos, kMaxRecordQos}}};
+  const std::array<std::pair<Bytes*, size_t>, 3> blobs{{{&r.properties, kMaxRecordProperties},
+                                                        {&r.contexts, kMaxRecordContexts},
+                                                        {&r.qos, kMaxRecordQos}}};
   for (size_t i = 0; i < blobs.size(); ++i) {
     // The fixed-size check above already covered the first length field.
     if (i && !in.Has(2))
@@ -669,9 +668,8 @@ Digest JoinAuth(std::string_view secret, const Nonce& client, const Nonce& serve
 
 Digest TokenJoinAuth(std::span<const uint8_t> token_secret, const Nonce& client,
                      const Nonce& server, const TokenId& token, const Digest& fingerprint) {
-  return JoinAuth({reinterpret_cast<const char*>(token_secret.data()), token_secret.size()},
-                  client, server, {reinterpret_cast<const char*>(token.data()), token.size()},
-                  fingerprint);
+  return JoinAuth({reinterpret_cast<const char*>(token_secret.data()), token_secret.size()}, client,
+                  server, {reinterpret_cast<const char*>(token.data()), token.size()}, fingerprint);
 }
 
 bool ConstantTimeEqual(const Digest& left, const Digest& right) {

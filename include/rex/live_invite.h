@@ -5,7 +5,7 @@
  * A Live invite code lets a player join a friend's Live-mode session from
  * outside the guest, for example from a chat client's join button or the
  * `live_invite` startup option. Codes are ASCII, at most 128 characters, and
- * carry a relay-issued join token; see docs/SYSTEM_LINK_RELAY.md, "Live
+ * carry a relay-issued join token; see docs/SYSTEM_LINK_ONLINE_SERVER.md, "Live
  * invites". These calls never block and are safe from any host thread.
  *
  * @license     BSD 3-Clause License

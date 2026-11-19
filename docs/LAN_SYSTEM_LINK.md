@@ -7,7 +7,8 @@ It does not supply a public matchmaking service or establish compatibility with
 other titles.
 
 For the separate client transport, which is off by default, see
-[System Link relay](SYSTEM_LINK_RELAY.md). The two modes are mutually exclusive.
+[System Link online server](SYSTEM_LINK_ONLINE_SERVER.md). The two modes are
+mutually exclusive.
 ReRevved remaps Settings to F1 and Mods to F2; its player guide owns
 title-specific controls.
 

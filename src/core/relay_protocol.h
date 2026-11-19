@@ -30,7 +30,7 @@ constexpr size_t kMaxRecordProperties = 384;
 constexpr size_t kMaxRecordContexts = 128;
 constexpr size_t kMaxRecordQos = 256;
 constexpr size_t kMaxSearchResults = 200;
-// Fixed record fields before the three variable blobs; see docs/SYSTEM_LINK_RELAY.md.
+// Fixed record fields before the three variable blobs; see docs/SYSTEM_LINK_ONLINE_SERVER.md.
 constexpr size_t kRecordFixedSize = 50;
 constexpr size_t kMaxRecordSize =
     kRecordFixedSize + kMaxRecordProperties + kMaxRecordContexts + kMaxRecordQos;
@@ -182,7 +182,7 @@ bool ConstantTimeEqual(const Digest& left, const Digest& right);
 bool ConstantTimeEqual(std::span<const uint8_t> left, std::span<const uint8_t> right);
 Result<Digest> RandomSeed();
 
-// Direct paths; see "Direct paths" in docs/SYSTEM_LINK_RELAY.md.
+// Direct paths; see "Direct paths" in docs/SYSTEM_LINK_ONLINE_SERVER.md.
 constexpr std::string_view kAssociationLabel = "RRLY-ASSOC-v1";
 constexpr std::string_view kPairLabel = "RRLY-PAIR-v1";
 constexpr std::string_view kPairTagLabel = "RRLY-PAIR-TAG-v1";

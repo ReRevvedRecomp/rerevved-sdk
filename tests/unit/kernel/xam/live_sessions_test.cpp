@@ -264,8 +264,8 @@ bool InBounds(Scratch& scratch, uint32_t offset, uint32_t size) {
   return true;
 }
 
-void PutSearch(uint8_t* request, uint32_t num_results, uint16_t num_contexts,
-               uint32_t contexts_ptr, uint32_t buffer_size, uint32_t results_ptr) {
+void PutSearch(uint8_t* request, uint32_t num_results, uint16_t num_contexts, uint32_t contexts_ptr,
+               uint32_t buffer_size, uint32_t results_ptr) {
   std::memset(request, 0, 32);
   Store32(request + 8, num_results);
   memory::store_and_swap<uint16_t>(request + 14, num_contexts);
@@ -278,7 +278,8 @@ void PutSearch(uint8_t* request, uint32_t num_results, uint16_t num_contexts,
 struct ConfigFixture {
   std::filesystem::path directory =
       std::filesystem::temp_directory_path() /
-      ("live-sessions-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+      ("live-sessions-" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   std::filesystem::path path = directory / "fixture";
   ConfigFixture() {
     REQUIRE(std::filesystem::create_directory(directory));
@@ -299,9 +300,9 @@ struct ConfigFixture {
     REQUIRE(rex::cvar::SetFlagByName(key, value));
   }
   void Relay() {
-    Set("system_link_relay_address", "127.0.0.1:30100");
-    Set("system_link_relay_room", "room");
-    Set("system_link_relay_secret_file", "secret_file");
+    Set("system_link_server_address", "127.0.0.1:30100");
+    Set("system_link_server_room", "room");
+    Set("system_link_server_password_file", "secret_file");
   }
   void Freeze() {
     system_link::FreezeConfig(path, [] { return rex::relay::Digest{0xCD, 0xAB, 2, 3, 4, 5}; });
@@ -336,7 +337,7 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
   SECTION("off mode reports inactive") {
     f.Set("live_sessions", "true");
     f.Freeze();
-    CHECK(system_link::Status() == "Off (Live sessions inactive)");
+    CHECK(system_link::Status() == "Off (Online Player Match unavailable)");
     CHECK_FALSE(system_link::LiveSessionsActive());
     CHECK(ActiveService() == nullptr);
   }
@@ -345,15 +346,15 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
     f.Set("system_link_lan_enabled", "true");
     f.Set("system_link_local_address", "127.0.0.1");
     f.Freeze();
-    CHECK(system_link::Status() == "LAN (Live sessions inactive)");
+    CHECK(system_link::Status() == "LAN (Online Player Match unavailable)");
     CHECK_FALSE(system_link::LiveSessionsActive());
     CHECK(ActiveService() == nullptr);
   }
   SECTION("failed relay settings stay inactive") {
     f.Set("live_sessions", "true");
-    f.Set("system_link_relay_address", "127.0.0.1:30100");
+    f.Set("system_link_server_address", "127.0.0.1:30100");
     f.Freeze();
-    CHECK(system_link::Status().starts_with("Relay failed: "));
+    CHECK(system_link::Status().starts_with("Online failed: "));
     CHECK(ActiveService() == nullptr);
   }
   SECTION("relay without the option stays inactive") {
@@ -516,13 +517,12 @@ TEST_CASE("Live guest ranges must be committed and writable where written", "[li
 TEST_CASE("Live search results keep only terminated unicode properties", "[live_sessions]") {
   Scratch scratch(SearchBufferSize(1) + 4096);
   auto record = MakeRecord(1, kHostA, {});
-  const std::vector<Property> properties{
-      // Fills its storage without a terminator.
-      {kPropertyGamerHostName, {0, 'A', 0, 'b'}},
-      {0x40000002, {0, 'A', 0}},
-      {0x40000003, {0, 'A', 0, 0, 0, 'B', 0, 0}},
-      {0x40000004, {}},
-      {0x10000001, {0, 0, 0, 7}}};
+  const std::vector<Property> properties{// Fills its storage without a terminator.
+                                         {kPropertyGamerHostName, {0, 'A', 0, 'b'}},
+                                         {0x40000002, {0, 'A', 0}},
+                                         {0x40000003, {0, 'A', 0, 0, 0, 'B', 0, 0}},
+                                         {0x40000004, {}},
+                                         {0x10000001, {0, 0, 0, 7}}};
   record.properties = EncodeProperties(kEthernet, properties, nullptr);
   REQUIRE(WriteSearchResults(scratch.memory, scratch.addr(0), SearchBufferSize(1), {&record, 1}) ==
           1);
@@ -737,7 +737,8 @@ TEST_CASE("Live search writer lays out 92-byte results inside the buffer", "[liv
   std::memset(scratch.at(0), 0xA5, scratch.size);
   REQUIRE(WriteSearchResults(scratch.memory, scratch.addr(0), size, records) == 2);
   CHECK(InBounds(scratch, 0, size));
-  CHECK(std::all_of(scratch.at(size), scratch.at(scratch.size), [](uint8_t b) { return b == 0xA5; }));
+  CHECK(
+      std::all_of(scratch.at(size), scratch.at(scratch.size), [](uint8_t b) { return b == 0xA5; }));
   const auto* header = scratch.at(0);
   CHECK(Load32(header) == 2);
   const auto* result = scratch.at(8);
@@ -806,8 +807,8 @@ TEST_CASE("Live search writer fills 200 results and drops what does not fit", "[
   records = {MakeRecord(1, kHostA, {}), MakeRecord(2, kHostB, {})};
   CHECK(WriteSearchResults(scratch.memory, scratch.addr(0), 8 + 92 + 120, records) == 1);
   CHECK(InBounds(scratch, 0, 8 + 92 + 120));
-  CHECK(std::all_of(scratch.at(8 + 92 + 120), scratch.at(4096),
-                    [](uint8_t b) { return b == 0xA5; }));
+  CHECK(
+      std::all_of(scratch.at(8 + 92 + 120), scratch.at(4096), [](uint8_t b) { return b == 0xA5; }));
   CHECK(WriteSearchResults(scratch.memory, scratch.addr(0), 8, records) == 0);
   CHECK(Load32(scratch.at(0)) == 0);
   CHECK(Load32(scratch.at(4)) == 0);
@@ -862,17 +863,17 @@ struct SearchHarness {
 TEST_CASE("Live search completes its deferred overlapped", "[live_sessions]") {
   SearchHarness h;
   REQUIRE(h.Begin(3) == kErrorIoPending);
-  CHECK(h.directory.searches == std::vector<std::pair<uint16_t, uint32_t>>{{4, kCreateMatchmaking}});
+  CHECK(h.directory.searches ==
+        std::vector<std::pair<uint16_t, uint32_t>>{{4, kCreateMatchmaking}});
   CHECK(h.recorder.prepared == std::vector<uint32_t>{h.scratch.addr(SearchHarness::kOverlapped)});
   h.service.Pump(Clock::now());
   CHECK(h.recorder.completions() == 0);
   CHECK(h.count() == 0xA5A5A5A5);
 
   SECTION("results are filtered and written") {
-    h.directory.FinishSearch(
-        h.directory.last(),
-        {MakeRecord(1, kHostA, {{kContextGameType, 3}}), MakeRecord(2, kHostA, {{kContextGameType, 4}}),
-         MakeRecord(3, kHostB, {{kContextGameType, 3}})});
+    h.directory.FinishSearch(h.directory.last(), {MakeRecord(1, kHostA, {{kContextGameType, 3}}),
+                                                  MakeRecord(2, kHostA, {{kContextGameType, 4}}),
+                                                  MakeRecord(3, kHostB, {{kContextGameType, 3}})});
     h.service.Pump(Clock::now());
     REQUIRE(h.recorder.completed.size() == 1);
     CHECK(h.recorder.completed[0] ==
@@ -1019,7 +1020,8 @@ TEST_CASE("Live publication skips ranked and non-matchmaking sessions", "[live_s
   FakeDirectory directory;
   Service service(memory, directory, {}, false);
   const auto now = Clock::now();
-  service.SessionChanged(HostSession(1, kCreateHost | kCreateMatchmaking | kCreateArbitration), now);
+  service.SessionChanged(HostSession(1, kCreateHost | kCreateMatchmaking | kCreateArbitration),
+                         now);
   service.SessionChanged(HostSession(2, kCreateHost), now);
   service.SessionChanged(HostSession(3, kCreateMatchmaking), now);
   service.Pump(now + 1s);
@@ -1087,7 +1089,8 @@ TEST_CASE("Live joiner details report the host record's flags and open slots", "
   FakeDirectory directory;
   Recorder recorder;
   Service service(scratch.memory, directory, recorder.hooks(), false);
-  for (uint32_t host_flags : {kCreateHost | kCreateMatchmaking, kCreateHost | kCreateMatchmaking | 0x100u}) {
+  for (uint32_t host_flags :
+       {kCreateHost | kCreateMatchmaking, kCreateHost | kCreateMatchmaking | 0x100u}) {
     auto record = MakeRecord(0x0042, kHostA, {{kContextGameType, 3}});
     record.flags = host_flags;
     PutSearch(scratch.at(0), 1, 0, 0, SearchBufferSize(1), scratch.addr(2048));
@@ -1106,7 +1109,8 @@ TEST_CASE("Live joiner details report the host record's flags and open slots", "
                        0);
     AfterCreate(service, state, scratch.memory, scratch.addr(2048 + 8));
     Store32(scratch.at(512), lan::kSessionDetailsSize);
-    REQUIRE(lan::FillSessionDetails(state, scratch.memory, scratch.addr(512), scratch.addr(1024)) == 0);
+    REQUIRE(lan::FillSessionDetails(state, scratch.memory, scratch.addr(512), scratch.addr(1024)) ==
+            0);
     const auto* details = scratch.at(1024);
     CHECK(Load32(details + 12) == (host_flags & ~kCreateHost));
     CHECK(Load32(details + 16) == 4);
@@ -1421,7 +1425,8 @@ TEST_CASE("Two relay clients publish search measure join and talk",
     const size_t before = joiner_hooks.completions();
     {
       DispatchScope dispatch(scratch.addr(192));
-      REQUIRE(HandleSearch(joiner_service, scratch.memory, scratch.addr(96), 32) == kErrorIoPending);
+      REQUIRE(HandleSearch(joiner_service, scratch.memory, scratch.addr(96), 32) ==
+              kErrorIoPending);
     }
     const auto deadline = Clock::now() + 5s;
     while (joiner_hooks.completions() == before && Clock::now() < deadline)
@@ -1448,8 +1453,8 @@ TEST_CASE("Two relay clients publish search measure join and talk",
   // QoS through the relay returns round trips and the host's listen data.
   Store32(scratch.at(256), scratch.addr(kResults + 8 + 8));
   Store32(scratch.at(260), scratch.addr(kResults + 8));
-  REQUIRE(HandleQosLookup(joiner_service, scratch.memory, 1, scratch.addr(256), scratch.addr(260), 0,
-                          2, 0x77, scratch.addr(264)) == 0);
+  REQUIRE(HandleQosLookup(joiner_service, scratch.memory, 1, scratch.addr(256), scratch.addr(260),
+                          0, 2, 0x77, scratch.addr(264)) == 0);
   const uint32_t xnqos = Load32(scratch.at(264));
   const auto qos_deadline = Clock::now() + 5s;
   while (joiner_hooks.signals() == 0 && Clock::now() < qos_deadline)

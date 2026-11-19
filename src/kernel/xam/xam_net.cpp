@@ -65,15 +65,16 @@ REXCVAR_DEFINE_UINT64(system_link_xuid, 0, "Online",
                       "Local profile pseudonym used by direct LAN System Link")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_STRING(system_link_relay_address, "", "Online", "System Link relay IPv4 host:port")
+REXCVAR_DEFINE_STRING(system_link_server_address, "", "Online", "Online server IPv4 host:port")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(system_link_relay_room, "", "Online", "Private System Link relay room")
+REXCVAR_DEFINE_STRING(system_link_server_room, "", "Online", "Private online server room")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(system_link_relay_secret_file, "", "Online",
-                      "Path to the System Link relay shared-secret file")
+REXCVAR_DEFINE_STRING(system_link_server_password_file, "", "Online",
+                      "Path to the online server password file")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(system_link_advertised_address, "", "Online",
-                      "Relay host:port to put in host invites instead of the connect address")
+REXCVAR_DEFINE_STRING(
+    system_link_advertised_address, "", "Online",
+    "Online server host:port to put in host invites instead of the connect address")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {

@@ -1,8 +1,8 @@
 # Direct relay paths
 
 Direct paths are optional and require the [relay client](relay-client.md). Read
-the [relay security limits](SYSTEM_LINK_RELAY.md) and this page's [threat
-model](#threat-model) before enabling them.
+the [online server security limits](SYSTEM_LINK_ONLINE_SERVER.md) and this
+page's [threat model](#threat-model) before enabling them.
 
 With `system_link_direct` set in relay mode, two members of a room that exchange
 unicast guest traffic try a direct UDP path and move that pair's unicast

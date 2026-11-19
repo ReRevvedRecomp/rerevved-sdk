@@ -31,11 +31,11 @@ TEST_CASE("relay status reports player and room changes only", "[relay][relay_st
 
   c.peers = 1;
   c.rooms = 1;
-  CHECK(status.Update(c, t, 0, 5100).status == "Relay: 1 player in 1 room");
+  CHECK(status.Update(c, t, 0, 5100).status == "Online server: 1 player in 1 game");
   c.peers = 2;
-  CHECK(status.Update(c, t, 0, 5200).status == "Relay: 2 players in 1 room");
+  CHECK(status.Update(c, t, 0, 5200).status == "Online server: 2 players in 1 game");
   c.rooms = 2;
-  CHECK(status.Update(c, t, 0, 5300).status == "Relay: 2 players in 2 rooms");
+  CHECK(status.Update(c, t, 0, 5300).status == "Online server: 2 players in 2 games");
 
   c.pending = 2;
   c.sessions = 1;
@@ -49,7 +49,7 @@ TEST_CASE("relay status reports player and room changes only", "[relay][relay_st
   CHECK(status.Update(c, t, 0, 15000).status.empty());
   c.peers = 0;
   c.rooms = 0;
-  CHECK(status.Update(c, t, 0, 15100).status == "Relay: 0 players in 0 rooms");
+  CHECK(status.Update(c, t, 0, 15100).status == "Online server: 0 players in 0 games");
   CHECK(status.Update(c, t, 0, 20000).status.empty());
 }
 
@@ -58,22 +58,22 @@ TEST_CASE("relay status warnings aggregate increases without flooding", "[relay]
   Counters c;
   TransportCounters t;
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 2;
-  CHECK(status.Update(c, t, 0, 0).warning == "Relay problems: malformed=+2");
+  CHECK(status.Update(c, t, 0, 0).warning == "Online server problems: malformed=+2");
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 5;
   c.drops[static_cast<size_t>(Drop::kAuth)] = 3;
   t.send_errors = 1;
   c.peers = c.rooms = 1;
   auto messages = status.Update(c, t, 0, 100);
   CHECK(messages.warning.empty());
-  CHECK(messages.status == "Relay: 1 player in 1 room");
+  CHECK(messages.status == "Online server: 1 player in 1 game");
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 10;
   CHECK(status.Update(c, t, 0, 4999).warning.empty());
   CHECK(status.Update(c, t, 0, 5000).warning ==
-        "Relay problems: send_errors=+1 malformed=+8 auth=+3");
+        "Online server problems: send_errors=+1 malformed=+8 auth=+3");
   CHECK(status.Update(c, t, 0, 10000).warning.empty());
   CHECK(status.Update(c, t, 0, 15000).warning.empty());
   c.drops[static_cast<size_t>(Drop::kAuth)] = 4;
-  CHECK(status.Update(c, t, 0, 15100).warning == "Relay problems: auth=+1");
+  CHECK(status.Update(c, t, 0, 15100).warning == "Online server problems: auth=+1");
   CHECK(status.Update(c, t, 0, 20100).warning.empty());
 }
 
@@ -94,8 +94,8 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
     if (i == static_cast<size_t>(Drop::kIdle))
       CHECK(messages.warning.empty());
     else
-      CHECK(messages.warning == "Relay problems: " + std::string(kDrops[i]) + "=+7");
-    CHECK(messages.debug == "Relay counters: " + std::string(kDrops[i]) + "=7");
+      CHECK(messages.warning == "Online server problems: " + std::string(kDrops[i]) + "=+7");
+    CHECK(messages.debug == "Online server counters: " + std::string(kDrops[i]) + "=7");
   }
   for (size_t i = 0; i < kConnectDrops.size(); ++i) {
     CAPTURE(kConnectDrops[i]);
@@ -103,12 +103,12 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
     Counters c;
     c.connect_drops[i] = 9;
     const auto messages = status.Update(c, {}, 0, 0);
-    CHECK(messages.warning == "Relay problems: " + std::string(kConnectDrops[i]) + "=+9");
-    CHECK(messages.debug == "Relay counters: " + std::string(kConnectDrops[i]) + "=9");
+    CHECK(messages.warning == "Online server problems: " + std::string(kConnectDrops[i]) + "=+9");
+    CHECK(messages.debug == "Online server counters: " + std::string(kConnectDrops[i]) + "=9");
   }
   rexglue::cli::RelayStatus status;
   CHECK(status.Update({}, {2, 3}, 4, 0).warning ==
-        "Relay problems: receive_errors=+2 send_errors=+3 connection_resets=+4");
+        "Online server problems: receive_errors=+2 send_errors=+3 connection_resets=+4");
 }
 
 TEST_CASE("relay status debug dumps nonzero counters every five seconds", "[relay][relay_status]") {
@@ -127,14 +127,15 @@ TEST_CASE("relay status debug dumps nonzero counters every five seconds", "[rela
   c.bytes_out = 10;
   CHECK(status.Update(c, {}, 0, 4999).debug.empty());
   CHECK(status.Update(c, {11, 12}, 13, 5000).debug ==
-        "Relay counters: rooms=1 peers=2 pending=3 sessions=4 tokens=5 attempts=6 packets_in=7 "
+        "Online server counters: rooms=1 peers=2 pending=3 sessions=4 tokens=5 attempts=6 "
+        "packets_in=7 "
         "bytes_in=8 packets_out=9 bytes_out=10 receive_errors=11 send_errors=12 "
         "connection_resets=13");
   CHECK(status.Update(c, {}, 0, 9999).debug.empty());
   c = {};
   c.packets_in = 7;
-  CHECK(status.Update(c, {}, 0, 10000).debug == "Relay counters: packets_in=7");
-  CHECK(status.Update(c, {}, 0, 30000).debug == "Relay counters: packets_in=7");
+  CHECK(status.Update(c, {}, 0, 10000).debug == "Online server counters: packets_in=7");
+  CHECK(status.Update(c, {}, 0, 30000).debug == "Online server counters: packets_in=7");
   CHECK(status.Update(c, {}, 0, 30001).debug.empty());
 }
 
@@ -152,10 +153,11 @@ TEST_CASE("relay status shutdown summarizes totals", "[relay][relay_status]") {
   ++c.drops[static_cast<size_t>(Drop::kMalformed)];
   CHECK(status.Update(c, {}, 0, 100).warning.empty());
   CHECK(rexglue::cli::RelayStatus::Summary(c, {2, 3}, 4) ==
-        "Relay stopped: packets_in=50 bytes_in=5000 packets_out=40 bytes_out=4000 rejected=24 "
+        "Online server stopped: packets_in=50 bytes_in=5000 packets_out=40 bytes_out=4000 "
+        "rejected=24 "
         "receive_errors=2 send_errors=3 connection_resets=4");
   CHECK(rexglue::cli::RelayStatus::Summary({}, {}, 0) ==
-        "Relay stopped: packets_in=0 bytes_in=0 packets_out=0 bytes_out=0 rejected=0 "
+        "Online server stopped: packets_in=0 bytes_in=0 packets_out=0 bytes_out=0 rejected=0 "
         "receive_errors=0 send_errors=0 connection_resets=0");
 }
 
@@ -592,9 +594,9 @@ TEST_CASE("relay backward clocks cannot refill buckets or expire state", "[relay
   CHECK(fixture.core.counters().pending == 1);
   fixture.core.Tick(6000);
   CHECK(fixture.core.counters().pending == 0);
-  fixture.core.Tick(16999);
+  fixture.core.Tick(61999);
   CHECK(fixture.core.counters().peers == 1);
-  fixture.core.Tick(17000);
+  fixture.core.Tick(62000);
   CHECK(fixture.core.counters().peers == 0);
 }
 
@@ -636,13 +638,13 @@ TEST_CASE("relay invalid magic version and malformed messages stay silent", "[re
 TEST_CASE("relay options enable System Link profile identity", "[relay]") {
   rex::cvar::testing::ScopedLifecycleOverride lifecycle_override;
   REQUIRE(rex::cvar::SetFlagByName("system_link_lan_enabled", "false"));
-  const char* option = "system_link_relay_address";
+  const char* option = "system_link_server_address";
   SECTION("address only") {}
   SECTION("room only") {
-    option = "system_link_relay_room";
+    option = "system_link_server_room";
   }
   SECTION("secret file only") {
-    option = "system_link_relay_secret_file";
+    option = "system_link_server_password_file";
   }
   REQUIRE(rex::cvar::SetFlagByName(option, "test"));
   REQUIRE(rex::cvar::SetFlagByName("system_link_xuid", "12771645593269305345"));
@@ -682,9 +684,9 @@ TEST_CASE("relay drops spoofed endpoint and token", "[relay]") {
   CHECK(fixture.Input(kA, Data(b.token)).empty());
   CHECK(fixture.Input(kA, Data(0)).empty());
   CHECK(Drops(fixture.core, Drop::kAuth) == 3);
-  fixture.now = 14999;
+  fixture.now = 59999;
   CHECK(fixture.Input(kA, Control(Type::kHeartbeat, b.token)).empty());
-  fixture.core.Tick(15000);
+  fixture.core.Tick(60000);
   CHECK(fixture.core.counters().peers == 0);
 }
 
@@ -774,15 +776,15 @@ TEST_CASE("relay heartbeat refreshes idle deadline and BYE reuses addresses", "[
   Fixture fixture;
   const auto a = fixture.Join(kA);
   const auto b = fixture.Join(kB);
-  fixture.now = 14999;
+  fixture.now = 59999;
   const auto ack = fixture.Input(kA, Control(Type::kHeartbeat, a.token));
   REQUIRE(ack.size() == 1);
   CHECK(Read(ack[0].bytes).type == Type::kAck);
   CHECK(Read(ack[0].bytes).token == a.token);
-  fixture.core.Tick(15000);
+  fixture.core.Tick(60000);
   CHECK(fixture.core.counters().peers == 1);
   CHECK(Drops(fixture.core, Drop::kIdle) == 1);
-  fixture.now = 15000;
+  fixture.now = 60000;
   const auto c = fixture.Join(kC);
   CHECK(c.ipv4 == b.ipv4);
   CHECK(fixture.Input(kA, Control(Type::kBye, a.token)).empty());
@@ -793,6 +795,24 @@ TEST_CASE("relay heartbeat refreshes idle deadline and BYE reuses addresses", "[
   fixture.Input(kD, Control(Type::kBye, d.token));
   CHECK(fixture.core.counters().rooms == 0);
   CHECK(fixture.Join(kA, "room", Digest{99}).type == Type::kWelcome);
+}
+
+TEST_CASE("relay join replaces a silent peer from the same host", "[relay]") {
+  Fixture fixture(Config{16, 2});
+  const auto a = fixture.Join(kA);
+  const auto c = fixture.Join(kC);
+  fixture.now = 5999;
+  CHECK(fixture.Input(kC, Control(Type::kHeartbeat, c.token)).size() == 1);
+  CHECK(fixture.Join(kB).type == Type::kReject);
+  fixture.now = 6000;
+  CHECK(fixture.Input(kC, Control(Type::kHeartbeat, c.token)).size() == 1);
+  CHECK(fixture.Join({2, 1001}).type == Type::kReject);
+  const auto b = fixture.Join(kB);
+  REQUIRE(b.type == Type::kWelcome);
+  CHECK(b.ipv4 == a.ipv4);
+  CHECK(fixture.core.counters().peers == 2);
+  CHECK(Drops(fixture.core, Drop::kIdle) == 1);
+  CHECK(fixture.Input(kA, Control(Type::kHeartbeat, a.token)).empty());
 }
 
 TEST_CASE("relay never enlarges a response to malformed traffic", "[relay]") {

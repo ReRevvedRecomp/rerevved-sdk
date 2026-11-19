@@ -101,7 +101,7 @@ FlagRegistrar invite_flag(
     {.name = "system_link_invite",
      .type = FlagType::String,
      .category = "Online",
-     .description = "Paste the relay host's invite code, save settings, then restart",
+     .description = "Paste your host's invite code, save settings, then restart",
      .setter =
          [](std::string_view value) {
            const auto first = value.find_first_not_of(" \t\r\n\f\v");
@@ -168,24 +168,26 @@ FlagRegistrar live_sessions_flag(
     {.name = "live_sessions",
      .type = FlagType::Boolean,
      .category = "Online",
-     .description = "List and join Live-mode sessions through the relay (relay mode only)",
+     .description =
+         "Host and find Player Match games on your host's online server (invite code only)",
      .setter = [](std::string_view value) { return ParseBool(value, LiveSessions()); },
      .getter = [] { return LiveSessions() ? "true" : "false"; },
      .lifecycle = Lifecycle::kRequiresRestart,
      .default_value = "false",
      .audience = Audience::kPlayer,
      .persistence = Persistence::kConfig});
-FlagRegistrar direct_flag(
-    {.name = "system_link_direct",
-     .type = FlagType::Boolean,
-     .category = "Online",
-     .description = "Try direct UDP paths to other relay players, keeping the relay as fallback",
-     .setter = [](std::string_view value) { return ParseBool(value, Direct()); },
-     .getter = [] { return Direct() ? "true" : "false"; },
-     .lifecycle = Lifecycle::kRequiresRestart,
-     .default_value = "false",
-     .audience = Audience::kPlayer,
-     .persistence = Persistence::kConfig});
+FlagRegistrar direct_flag({.name = "system_link_direct",
+                           .type = FlagType::Boolean,
+                           .category = "Online",
+                           .description = "Connect directly to the other players when possible, "
+                                          "and use the online server if that fails",
+                           .setter =
+                               [](std::string_view value) { return ParseBool(value, Direct()); },
+                           .getter = [] { return Direct() ? "true" : "false"; },
+                           .lifecycle = Lifecycle::kRequiresRestart,
+                           .default_value = "false",
+                           .audience = Audience::kPlayer,
+                           .persistence = Persistence::kConfig});
 FlagRegistrar direct_drop_flag(
     {.name = "system_link_direct_drop_after",
      .type = FlagType::Int32,
@@ -233,9 +235,9 @@ bool ValidAdvertisedAddress(std::string_view address) {
 Config LiveConfig() {
   Config config;
   config.lan_enabled = Query<bool>("system_link_lan_enabled");
-  config.address = GetFlagByName("system_link_relay_address");
-  config.room = GetFlagByName("system_link_relay_room");
-  config.secret_file = GetFlagByName("system_link_relay_secret_file");
+  config.address = GetFlagByName("system_link_server_address");
+  config.room = GetFlagByName("system_link_server_room");
+  config.secret_file = GetFlagByName("system_link_server_password_file");
   config.advertised_address = GetFlagByName("system_link_advertised_address");
   if (!ValidAdvertisedAddress(config.advertised_address))
     config.advertised_address.clear();
@@ -301,11 +303,11 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
     if (!code.empty())
       ignored.push_back("system_link_invite");
     if (!config.address.empty())
-      ignored.push_back("system_link_relay_address");
+      ignored.push_back("system_link_server_address");
     if (!config.room.empty())
-      ignored.push_back("system_link_relay_room");
+      ignored.push_back("system_link_server_room");
     if (!config.secret_file.empty())
-      ignored.push_back("system_link_relay_secret_file");
+      ignored.push_back("system_link_server_password_file");
     if (config.lan_enabled)
       ignored.push_back("system_link_lan_enabled");
     if (!ignored.empty())
@@ -334,7 +336,7 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
     const bool explicit_relay = config.mode == Mode::kRelay;
     config.mode = Mode::kRelay;
     if (explicit_relay) {
-      config.error = "invite and explicit relay settings cannot be combined";
+      config.error = "invite code and server address both set";
     } else {
       auto invite = relay::DecodeInvite(code);
       if (!invite) {
@@ -348,11 +350,11 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
   }
   if (config.error.empty() && config.mode == Mode::kRelay) {
     if (config.lan_enabled)
-      config.error = "LAN and relay cannot be enabled together";
+      config.error = "turn off Direct LAN to use an invite code";
     else if (!relay_link::ParseAddress(config.address) ||
              (!config.join_token && (config.room.empty() || config.room.size() > 32 ||
                                      (!config.invite_secret && config.secret_file.empty()))))
-      config.error = "bad relay settings";
+      config.error = "invalid online settings";
   }
   if (config.mode != Mode::kOff && !config.xuid) {
     auto seed = random();
@@ -412,31 +414,31 @@ std::string RelayStatus(const relay_link::Stats& stats) {
   switch (stats.state) {
     case relay_link::Association::kLive: {
       const auto* octets = reinterpret_cast<const uint8_t*>(&stats.ipv4);
-      auto status = fmt::format("Relay: connected as {}.{}.{}.{}", octets[0], octets[1], octets[2],
+      auto status = fmt::format("Online: connected as {}.{}.{}.{}", octets[0], octets[1], octets[2],
                                 octets[3]);
       if (stats.direct_attempted_peers)
-        status += fmt::format(" (direct: {} of {} peers)", stats.direct_peers,
+        status += fmt::format(" (direct to {} of {} players)", stats.direct_peers,
                               stats.direct_attempted_peers);
       return status;
     }
     case relay_link::Association::kLost:
-      return "Relay: lost connection";
+      return "Online: lost connection";
     case relay_link::Association::kFailed:
-      return "Relay failed: " + stats.last_failure;
+      return "Online failed: " + stats.last_failure;
     case relay_link::Association::kJoining:
-      return "Relay: connecting";
+      return "Online: connecting";
     case relay_link::Association::kStopped:
       if (!stats.last_failure.empty())
-        return "Relay failed: " + stats.last_failure;
-      return stats.started ? "Relay: disconnected" : "Relay: waiting for System Link";
+        return "Online failed: " + stats.last_failure;
+      return stats.started ? "Online: disconnected" : "Online: waiting for System Link";
   }
-  return "Relay: disconnected";
+  return "Online: disconnected";
 }
 std::string Status() {
   const auto config = CurrentConfig();
   if (!config.error.empty())
-    return "Relay failed: " + config.error;
-  const char* live_inactive = config.live_sessions ? " (Live sessions inactive)" : "";
+    return "Online failed: " + config.error;
+  const char* live_inactive = config.live_sessions ? " (Online Player Match unavailable)" : "";
   if (config.mode == Mode::kOff)
     return std::string("Off") + live_inactive;
   if (config.mode == Mode::kLan)
@@ -444,7 +446,7 @@ std::string Status() {
   {
     std::lock_guard lock(status_mutex);
     if (!startup_failure.empty())
-      return "Relay failed: " + startup_failure;
+      return "Online failed: " + startup_failure;
   }
   auto& client = relay_link::SystemLinkClient();
   return RelayStatus(client.stats());
@@ -480,9 +482,9 @@ uint32_t RelayStartup::Start(const Config& config, relay_link::Client& client,
   auto fingerprint = relay_link::HostFingerprint();
   if (!server || !secret || !fingerprint) {
     const auto& error = !server ? server.error() : !secret ? secret.error() : fingerprint.error();
-    return disconnected(!server   ? "relay address not resolved"
-                        : !secret ? "bad relay settings"
-                                  : "executable unreadable",
+    return disconnected(!server   ? "server address not found; check your network"
+                        : !secret ? "invalid online settings"
+                                  : "cannot read the game executable",
                         error.message);
   }
   SetStartupFailure({});
@@ -495,7 +497,7 @@ uint32_t RelayStartup::Start(const Config& config, relay_link::Client& client,
   if (!started) {
     auto reason = client.stats().last_failure;
     // The relay rejects an unknown, expired or revoked token as a wrong secret.
-    if (config.join_token && reason == "wrong secret")
+    if (config.join_token && reason == "invite code does not match this server")
       reason = kInviteExpired;
     return disconnected(reason.empty() ? started.error().message : std::move(reason),
                         started.error().message);
@@ -509,7 +511,7 @@ uint32_t RelayStartup::Start(const Config& config, relay_link::Client& client,
     if (!lan.Configure(address, config.xuid)) {
       client.Stop();
       // MarkFailed then keeps guest sends failing rather than dropping.
-      return disconnected("invalid relay identity", "invalid relay identity");
+      return disconnected("invalid player ID", "invalid player ID");
     }
   }
   REXKRNL_DEBUG("XNetStartup: relay virtual address={} references={}", address, references_);

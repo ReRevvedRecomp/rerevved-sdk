@@ -660,7 +660,7 @@ TEST_CASE("Live running-game join needs a restart outside the invite's room",
     environment.config.mode = system_link::Mode::kLan;
   }
   SECTION("configuration error") {
-    environment.config.error = "bad relay settings";
+    environment.config.error = "invalid online settings";
   }
   SECTION("Live sessions off") {
     environment.config.live_sessions = false;
@@ -879,9 +879,9 @@ std::string TokenCode() {
 }
 
 std::string HostInviteCode(ConfigFixture& f, std::string_view advertised) {
-  f.Set("system_link_relay_address", "127.0.0.1:30100");
-  f.Set("system_link_relay_room", "room");
-  f.Set("system_link_relay_secret_file", "secret_file");
+  f.Set("system_link_server_address", "127.0.0.1:30100");
+  f.Set("system_link_server_room", "room");
+  f.Set("system_link_server_password_file", "secret_file");
   f.Set("live_sessions", "true");
   f.Set("system_link_advertised_address", advertised);
   f.Freeze();
@@ -1047,7 +1047,7 @@ TEST_CASE("live_invite alone joins the token's relay with Live sessions",
   CHECK(config.join_token->secret.view().size() == relay::TokenSecret::kSize);
   CHECK(system_link::LiveSessionsActive());
   CHECK(config.xuid != 0);
-  CHECK(system_link::Status() == "Relay: waiting for System Link");
+  CHECK(system_link::Status() == "Online: waiting for System Link");
 }
 
 TEST_CASE("live_invite takes precedence over saved System Link settings",
@@ -1078,18 +1078,18 @@ TEST_CASE("live_invite takes precedence over saved System Link settings",
     saved = {{"system_link_invite", *system_link_invite}};
   }
   SECTION("explicit relay settings") {
-    saved = {{"system_link_relay_address", "saved.example.net:30100"},
-             {"system_link_relay_room", "savedroom"},
-             {"system_link_relay_secret_file", "saved-secret.txt"}};
+    saved = {{"system_link_server_address", "saved.example.net:30100"},
+             {"system_link_server_room", "savedroom"},
+             {"system_link_server_password_file", "saved-secret.txt"}};
   }
   SECTION("LAN") {
     saved = {{"system_link_lan_enabled", "true"}};
   }
   SECTION("all of them") {
     saved = {{"system_link_invite", *system_link_invite},
-             {"system_link_relay_address", "saved.example.net:30100"},
-             {"system_link_relay_room", "savedroom"},
-             {"system_link_relay_secret_file", "saved-secret.txt"},
+             {"system_link_server_address", "saved.example.net:30100"},
+             {"system_link_server_room", "savedroom"},
+             {"system_link_server_password_file", "saved-secret.txt"},
              {"system_link_lan_enabled", "true"}};
   }
   for (const auto& [name, value] : saved)
@@ -1116,7 +1116,7 @@ TEST_CASE("live_invite takes precedence over saved System Link settings",
   CHECK(config.xuid == 12345);
   CHECK(config.profile_name == "Tester");
   CHECK(system_link::LiveSessionsActive());
-  CHECK(system_link::Status() == "Relay: waiting for System Link");
+  CHECK(system_link::Status() == "Online: waiting for System Link");
 
   // The overridden settings keep their values, and saving persists them but not the invite.
   for (const auto& [name, value] : saved)
@@ -1176,7 +1176,7 @@ TEST_CASE("live_invite with a bad code is a configuration error", "[system_link]
   CHECK_FALSE(config.join_token);
   CHECK_FALSE(config.invite_secret);
   CHECK_FALSE(system_link::LiveSessionsActive());
-  CHECK(system_link::Status().starts_with("Relay failed: "));
+  CHECK(system_link::Status().starts_with("Online failed: "));
 }
 
 TEST_CASE("an expired invite token asks for a new invite", "[system_link][live_invite][network]") {
@@ -1209,7 +1209,7 @@ TEST_CASE("an expired invite token asks for a new invite", "[system_link][live_i
   CHECK(startup.Start(config, client, lan) == 0);
   CHECK(client.stats().last_failure == system_link::kInviteExpired);
   CHECK(system_link::RelayStatus(client.stats()) ==
-        "Relay failed: invite expired; ask for a new invite");
+        "Online failed: invite expired; ask for a new invite");
   startup.Cleanup(client);
 }
 

@@ -1,8 +1,8 @@
 # Relay client
 
-This page is for SDK integrators. For relay operation and security limits, see
-[System Link relay](SYSTEM_LINK_RELAY.md). Wire formats are in [Relay
-protocol](relay-protocol.md).
+This page is for SDK integrators. For online server operation and security limits,
+see [System Link online server](SYSTEM_LINK_ONLINE_SERVER.md). Wire formats are
+in [Relay protocol](relay-protocol.md).
 
 - [Configuration](#configuration)
 - [Guest sockets and delivery](#guest-sockets-and-delivery)
@@ -23,9 +23,9 @@ The client is disabled by default. F4 exposes these settings in `Online`:
 | `system_link_lan_enabled` | Player | `false` | Direct LAN mode |
 | `system_link_xuid` | Advanced | `0` | Automatic identity or an explicit per-player XUID |
 | `system_link_local_address` | Advanced | Empty | Selected direct-LAN IPv4 address |
-| `system_link_relay_address` | Advanced | Empty | Explicit relay host:port |
-| `system_link_relay_room` | Advanced | Empty | Explicit relay room |
-| `system_link_relay_secret_file` | Advanced | Empty | Explicit path to the relay secret file |
+| `system_link_server_address` | Advanced | Empty | Explicit online server host:port |
+| `system_link_server_room` | Advanced | Empty | Explicit online server room |
+| `system_link_server_password_file` | Advanced | Empty | Explicit path to the online server password file |
 | `system_link_advertised_address` | Advanced | Empty | Relay host:port that host invites tell other players to use |
 | `live_sessions` | Player | `false` | List and join Live-mode sessions through the relay |
 | `live_invite` | Advanced | Empty | Join a Live session from an invite code, for this session only |
@@ -42,15 +42,15 @@ settings before restarting. The status is init-only, refuses writes, and is
 never persisted.
 
 A non-empty invite requests relay mode and supplies the endpoint, room and
-secret. Combining an invite with any explicit relay address, room or secret-file
+secret. Combining an invite with any explicit relay address, room or password-file
 setting fails configuration. LAN and relay are mutually exclusive. Setting any
 explicit relay option requests relay mode; all three must be supplied together.
 For explicit configuration:
 
 ```toml
-system_link_relay_address = "relay.example.net:30100"
-system_link_relay_room = "private-test"
-system_link_relay_secret_file = "relay-secret.txt"
+system_link_server_address = "server.example.net:30100"
+system_link_server_room = "private-test"
+system_link_server_password_file = "server-password.txt"
 system_link_lan_enabled = false
 ```
 
@@ -71,7 +71,7 @@ advertised address, local address, XUID, player name, `live_sessions`,
 reader uses that snapshot; F4 edits affect the next process start. The invite
 text remains in process memory, is shown in F4, and remains in the saved config.
 Decoded invite secrets use wiped storage; each handshake receives its own wiped
-copy. An explicit secret-file path is frozen, and the file is read for each new
+copy. An explicit password-file path is frozen, and the file is read for each new
 handshake.
 
 When System Link is requested and XUID is zero, startup generates
@@ -97,13 +97,13 @@ to read current cvar values, use explicit XUID configuration and retain the
 require snapshot initialization. Name validation still applies to the cvar
 setter.
 
-Status is `Off`, `LAN`, `Relay: waiting for System Link`, `Relay: connecting`,
-`Relay: disconnected`, `Relay: connected as 198.18.x.y`, `Relay: lost
-connection`, or `Relay failed: <reason>`. Once any direct attempt has run, the
-connected status ends with the direct peer count, for example `Relay: connected
-as 198.18.0.2 (direct: 1 of 1 peers)`. With `live_sessions` set, `Off` and `LAN`
-read `Off (Live sessions inactive)` and `LAN (Live sessions inactive)`, because
-the option needs relay mode. Failure reasons identify bad invites or settings,
+Status is `Off`, `LAN`, `Online: waiting for System Link`, `Online: connecting`,
+`Online: disconnected`, `Online: connected as 198.18.x.y`, `Online: lost
+connection`, or `Online failed: <reason>`. Once any direct attempt has run, the
+connected status ends with the direct peer count, for example `Online: connected
+as 198.18.0.2 (direct to 1 of 1 players)`. With `live_sessions` set, `Off` and
+`LAN` read `Off (Online Player Match unavailable)` and
+`LAN (Online Player Match unavailable)`, because the option needs relay mode. Failure reasons identify bad invites or settings,
 an unresolved relay address, an unreachable relay (handshake timeout), a wrong
 secret, a different game build, a full room, too many rooms, rate limiting, or
 an unreadable executable. Status contains neither codes nor secrets. Waiting is
@@ -191,9 +191,14 @@ Windows.
 The thread waits with `select` until relay traffic, a local send/stop wakeup, or
 the next handshake or heartbeat deadline. Windows UDP connection resets are
 disabled; residual resets are counted as no-ops. The thread sends a heartbeat
-every two seconds. Ten seconds without a datagram from the configured relay
+every two seconds. Sixty seconds without a datagram from the configured relay
 endpoint marks the association lost and logs once; guest sends then fail with
-`WSAENETDOWN`. Each successful `XNetStartup`, including the Ex form and a
+`WSAENETDOWN`. The relay keeps a silent peer for the same 60 seconds, so a
+shorter outage resumes with the same identity. A gap of five seconds or more
+between worker passes, such as a suspended process, logs once, sends a heartbeat
+at once and does not count toward the loss timeout, unless the relay silence
+including the gap has already reached the timeout. Each successful
+`XNetStartup`, including the Ex form and a
 startup that left the relay disconnected, takes a reference, and each
 `XNetCleanup` releases one. Titles may send on open sockets after a cleanup and
 may call startup more often than cleanup, in which case the association lasts
@@ -391,7 +396,7 @@ Token lifetime. A join token can be used repeatedly until it expires, 900
 seconds after the host requested it. The relay revokes it when the session is
 removed. A token join cannot rejoin after its token expires: a later
 `XNetStartup` that the relay rejects records
-`Relay failed: invite expired; ask for a new invite`. The player then needs a
+`Online failed: invite expired; ask for a new invite`. The player then needs a
 fresh invite and a restart.
 
 Delivery. One accepted invite is pending per process: the session's record, for
@@ -496,7 +501,7 @@ XNADDR state and socket errors. Relay startup follows that model. Only a
 configuration error, LAN combined with relay, or a zero XUID returns
 `X_ERROR_INVALID_PARAMETER`. When the relay address does not resolve, the secret
 or executable cannot be read, the handshake times out, or the relay rejects the
-join, startup logs the reason, records it in the status as `Relay failed:
+join, startup logs the reason, records it in the status as `Online failed:
 <reason>`, takes a reference and returns success. The title keeps running
 without a network. Each later startup while the association is not live retries
 the full handshake, with the same five-second deadline; a successful retry

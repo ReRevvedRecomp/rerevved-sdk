@@ -118,7 +118,7 @@ class TokenBucket {
   bool started_ = false;
 };
 
-// Direct UDP paths between room members; see "Direct paths" in docs/SYSTEM_LINK_RELAY.md.
+// Direct UDP paths between room members; see "Direct paths" in docs/SYSTEM_LINK_ONLINE_SERVER.md.
 constexpr uint32_t kDirectProbeIntervalMs = 200;
 constexpr uint32_t kDirectProbeWindowMs = 5000;
 // An up path sends KEEPALIVE at this interval and goes down when no KEEPALIVE_ACK
@@ -222,6 +222,27 @@ class CounterLog {
   std::chrono::milliseconds largest_gap_{0};
 };
 
+// Without a relay datagram for this long, a live association is lost.
+constexpr std::chrono::seconds kRelayLossTimeout{60};
+
+// Relay silence counted only while the worker runs. A gap of kStall or more between
+// worker passes is host sleep or suspension, not relay loss, and is not counted.
+class SilenceClock {
+ public:
+  using Clock = std::chrono::steady_clock;
+  static constexpr std::chrono::seconds kStall{5};
+
+  explicit SilenceClock(Clock::time_point now) : received_(now), ran_(now) {}
+  // Returns the gap when the worker did not run for kStall or more.
+  std::optional<Clock::duration> Run(Clock::time_point now);
+  void Received(Clock::time_point now);
+  Clock::time_point received() const { return received_; }
+
+ private:
+  Clock::time_point received_;
+  Clock::time_point ran_;
+};
+
 // Owns the relay and injector sockets on one thread. Guest handles remain owned
 // by XSocket. Start/Stop serialize lifecycle; I/O never waits on the relay socket.
 class Client {
@@ -274,6 +295,8 @@ class Client {
   void SetProbeReplies(bool enabled);
   // Applies to associations started afterwards.
   void SetDirect(DirectOptions options);
+  // Applies to associations started afterwards; the default is kRelayLossTimeout.
+  void SetLossTimeout(std::chrono::milliseconds timeout);
   // The handler runs on the client thread, outside the client lock, for every
   // DELIVER from guest port 0 to guest port 0 whose payload starts with
   // kSideChannelMagic. It may call SendSideChannel.

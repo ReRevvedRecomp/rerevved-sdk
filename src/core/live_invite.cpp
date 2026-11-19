@@ -32,7 +32,7 @@ Result<std::string> EncodeLiveInvite(const LiveInvite& invite) {
     return std::unexpected(Error{ErrorCategory::Config, "Live invite needs a session and address"});
   if (kFixedSize + address.size() > kMaxBytes)
     return std::unexpected(
-        Error{ErrorCategory::Config, "Relay address is too long for a Live invite code"});
+        Error{ErrorCategory::Config, "Server address is too long for a Live invite code"});
   Payload payload;
   auto put = [&](uint8_t byte) { payload.bytes[payload.size++] = byte; };
   put(kLiveInviteVersion);
@@ -60,7 +60,7 @@ Result<std::string> EncodeLiveInvite(const LiveInvite& invite) {
     code += kAlphabet[(bits << (6 - count)) & 63];
   if (code.size() > kMaxLiveInviteLength)
     return std::unexpected(
-        Error{ErrorCategory::Config, "Relay address is too long for a Live invite code"});
+        Error{ErrorCategory::Config, "Server address is too long for a Live invite code"});
   return code;
 }
 
@@ -110,7 +110,7 @@ Result<LiveInvite> DecodeLiveInvite(std::string_view code) {
     return std::unexpected(Damaged());
   auto parsed = ParseInviteAddress(address);
   if (address.empty() || !parsed)
-    return std::unexpected(Error{ErrorCategory::Config, "Live invite relay address is invalid"});
+    return std::unexpected(Error{ErrorCategory::Config, "Live invite server address is invalid"});
   invite.address = std::move(*parsed);
   return invite;
 }
