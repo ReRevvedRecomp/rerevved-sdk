@@ -69,11 +69,11 @@ its limit on file size. Codes and secrets are never logged.
 At startup the relay logs its bind address, UDP port, room limit and member
 limit once, for example `Relay listening on 0.0.0.0:30100 (up to 16 rooms, 4
 members per room)`. At the default info level, it then reports player or room
-count changes, such as `Relay: 2 players in 1 room`. Players are authenticated
+count changes, such as `Online server: 2 players in 1 game`. Players are authenticated
 relay members, not pending handshakes. An unchanged or empty relay stays quiet.
 
 Rejected requests and socket problems produce warnings naming only counter
-increases, for example `Relay problems: malformed=+3 auth=+1`. Warnings are
+increases, for example `Online server problems: malformed=+3 auth=+1`. Warnings are
 limited to one every five seconds; increases during that interval accumulate for
 the next warning, even if traffic stops. All drop reasons except normal idle
 expiry contribute warnings, including directory and direct-path rejections.

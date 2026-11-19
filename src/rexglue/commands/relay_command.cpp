@@ -38,12 +38,12 @@ rex::VoidResult Run(const Options& options) {
     return rex::Err(rex::ErrorCategory::Config, "Relay secret file exceeds 4 KiB or is unreadable");
   std::ifstream file(options.secret_file, std::ios::binary);
   if (!file)
-    return rex::Err(rex::ErrorCategory::IO, "Cannot read relay secret file");
+    return rex::Err(rex::ErrorCategory::IO, "cannot read the online server password file");
   std::string secret(kMaxSecretSize + 1, '\0');
   file.read(secret.data(), static_cast<std::streamsize>(secret.size()));
   secret.resize(static_cast<size_t>(file.gcount()));
   if (file.bad())
-    return rex::Err(rex::ErrorCategory::IO, "Cannot read relay secret file");
+    return rex::Err(rex::ErrorCategory::IO, "cannot read the online server password file");
   if (secret.size() > kMaxSecretSize)
     return rex::Err(rex::ErrorCategory::Config, "Relay secret file exceeds 4 KiB");
   const auto first = secret.find_first_not_of(" \t\r\n\f\v");

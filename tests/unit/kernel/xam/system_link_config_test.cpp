@@ -127,7 +127,7 @@ TEST_CASE("system_link settings expose player advanced and read-only policies", 
 TEST_CASE("system_link invite help names save and restart", "[system_link]") {
   const auto* flag = rex::cvar::GetFlagInfo("system_link_invite");
   REQUIRE(flag);
-  CHECK(flag->description == "Paste the relay host's invite code, save settings, then restart");
+  CHECK(flag->description == "Paste your host's invite code, save settings, then restart");
 }
 
 TEST_CASE("system_link generated XUID persists and preserves unrelated config", "[system_link]") {
@@ -238,7 +238,7 @@ TEST_CASE("system_link snapshot freezes invites identity and mode", "[system_lin
   CHECK(CurrentConfig().profile_name == initial.profile_name);
   CHECK(RelayRequested());
   CHECK(XamGetSystemVersion_entry() == 0x20449700);
-  CHECK(Status() == "Relay: waiting for System Link");
+  CHECK(Status() == "Online: waiting for System Link");
   rex::system::xam::UserProfile profile;
   CHECK(profile.name() == initial.profile_name);
   CHECK(profile.xuid() == initial.xuid);
@@ -276,7 +276,7 @@ TEST_CASE("system_link snapshot refuses conflicting and incomplete settings",
   }
   f.Freeze();
   CHECK_FALSE(CurrentConfig().error.empty());
-  CHECK(Status().starts_with("Relay failed: "));
+  CHECK(Status().starts_with("Online failed: "));
   CHECK(Status().find(*invite) == std::string::npos);
 }
 
@@ -295,9 +295,9 @@ TEST_CASE("system_link config error starts disconnected", "[system_link][invite]
     CHECK(startup.Start(config, client, lan) == 0);
     CHECK(startup.references() == references);
     CHECK(client.stats().state == relay_link::Association::kFailed);
-    CHECK(RelayStatus(client.stats()) == "Relay failed: not an invite code");
+    CHECK(RelayStatus(client.stats()) == "Online failed: not an invite code");
   }
-  CHECK(Status() == "Relay failed: not an invite code");
+  CHECK(Status() == "Online failed: not an invite code");
   CHECK_FALSE(lan.enabled());
   lan::XnAddrSnapshot address{};
   CHECK(RelayTitleXnAddr(client, lan, &address) == kXnAddrNone);
@@ -357,15 +357,15 @@ TEST_CASE("system_link relay status counts direct peers", "[system_link][direct]
   stats.state = relay_link::Association::kLive;
   const std::array<uint8_t, 4> address{198, 18, 0, 2};
   std::memcpy(&stats.ipv4, address.data(), address.size());
-  CHECK(RelayStatus(stats) == "Relay: connected as 198.18.0.2");
+  CHECK(RelayStatus(stats) == "Online: connected as 198.18.0.2");
   stats.direct_attempted_peers = 1;
   stats.direct_peers = 1;
-  CHECK(RelayStatus(stats) == "Relay: connected as 198.18.0.2 (direct: 1 of 1 peers)");
+  CHECK(RelayStatus(stats) == "Online: connected as 198.18.0.2 (direct to 1 of 1 players)");
   stats.direct_attempted_peers = 3;
   stats.direct_peers = 0;
-  CHECK(RelayStatus(stats) == "Relay: connected as 198.18.0.2 (direct: 0 of 3 peers)");
+  CHECK(RelayStatus(stats) == "Online: connected as 198.18.0.2 (direct to 0 of 3 players)");
   stats.state = relay_link::Association::kLost;
-  CHECK(RelayStatus(stats) == "Relay: lost connection");
+  CHECK(RelayStatus(stats) == "Online: lost connection");
 }
 
 TEST_CASE("system_link startup failures have plain status reasons", "[system_link]") {
@@ -374,10 +374,10 @@ TEST_CASE("system_link startup failures have plain status reasons", "[system_lin
   REQUIRE(invite);
   f.Set("system_link_invite", *invite);
   f.Freeze();
-  for (const char* reason :
-       {"relay address not resolved", "executable unreadable", "bad relay settings"}) {
+  for (const char* reason : {"server address not found; check your network",
+                             "cannot read the game executable", "invalid online settings"}) {
     SetStartupFailure(reason);
-    CHECK(Status() == std::string("Relay failed: ") + reason);
+    CHECK(Status() == std::string("Online failed: ") + reason);
   }
 }
 
@@ -621,8 +621,8 @@ TEST_CASE("system_link unreachable relay startup succeeds without a network",
   CHECK(startup.Start(unreadable, client, lan) == 0);
   CHECK(startup.references() == 1);
   CHECK(client.stats().state == relay_link::Association::kFailed);
-  CHECK(Status() == "Relay failed: bad relay settings");
-  CHECK(RelayStatus(client.stats()) == "Relay failed: bad relay settings");
+  CHECK(Status() == "Online failed: invalid online settings");
+  CHECK(RelayStatus(client.stats()) == "Online failed: invalid online settings");
   network_down();
   CHECK(RelayTitleXnAddr(client, lan, &address) == kXnAddrNone);
 
@@ -637,7 +637,7 @@ TEST_CASE("system_link unreachable relay startup succeeds without a network",
   CHECK(attempt.get() == 0);
   CHECK(startup.references() == 2);
   CHECK(client.stats().state == relay_link::Association::kFailed);
-  CHECK(Status() == "Relay failed: relay not reachable (handshake timeout)");
+  CHECK(Status() == "Online failed: the host's online server is not responding");
   CHECK_FALSE(lan.enabled());
   CHECK(RelayTitleXnAddr(client, lan, &address) == kXnAddrNone);
   CHECK(address.ipv4 == 0);
@@ -672,8 +672,8 @@ TEST_CASE("system_link unreachable relay startup succeeds without a network",
   CHECK(startup.Start(config, client, lan) == 0);
   CHECK(startup.references() == 3);
   REQUIRE(client.stats().state == relay_link::Association::kLive);
-  CHECK_FALSE(Status().starts_with("Relay failed: "));
-  CHECK(RelayStatus(client.stats()) == "Relay: connected as 198.18.0.1");
+  CHECK_FALSE(Status().starts_with("Online failed: "));
+  CHECK(RelayStatus(client.stats()) == "Online: connected as 198.18.0.1");
   CHECK(lan.enabled());
   CHECK(lan.local_ipv4() == client.ipv4());
   CHECK(RelayTitleXnAddr(client, lan, &address) == kXnAddrStatic);

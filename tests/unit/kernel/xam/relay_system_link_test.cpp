@@ -274,16 +274,19 @@ TEST_CASE("relay client loopback discovery and VDP use native select",
   REQUIRE(second.Start((*server)->endpoint(), "test", "secret", relay::Digest{1}));
   auto rejected = wrong.Start((*server)->endpoint(), "test", "wrong", relay::Digest{1});
   REQUIRE_FALSE(rejected);
-  CHECK(rejected.error().message == "wrong secret");
-  CHECK(system_link::RelayStatus(wrong.stats()) == "Relay failed: wrong secret");
+  CHECK(rejected.error().message == "invite code does not match this server");
+  CHECK(system_link::RelayStatus(wrong.stats()) ==
+        "Online failed: invite code does not match this server");
   CHECK(wrong.Stop().state == Association::kFailed);
-  CHECK(system_link::RelayStatus(wrong.stats()) == "Relay failed: wrong secret");
+  CHECK(system_link::RelayStatus(wrong.stats()) ==
+        "Online failed: invite code does not match this server");
   wrong.Stop();
-  CHECK(system_link::RelayStatus(wrong.stats()) == "Relay failed: wrong secret");
+  CHECK(system_link::RelayStatus(wrong.stats()) ==
+        "Online failed: invite code does not match this server");
   REQUIRE(wrong.Start((*server)->endpoint(), "test", "secret", relay::Digest{1}));
   CHECK(wrong.stats().last_failure.empty());
   CHECK(wrong.Stop().state == Association::kLive);
-  CHECK(system_link::RelayStatus(wrong.stats()) == "Relay: disconnected");
+  CHECK(system_link::RelayStatus(wrong.stats()) == "Online: disconnected");
   auto bye_deadline = std::chrono::steady_clock::now() + 2s;
   while (peers != 2 && std::chrono::steady_clock::now() < bye_deadline)
     std::this_thread::sleep_for(1ms);
@@ -402,7 +405,7 @@ TEST_CASE("relay client loopback discovery and VDP use native select",
          std::chrono::steady_clock::now() < loss_deadline)
     std::this_thread::sleep_for(5ms);
   CHECK(first.stats().state == Association::kLost);
-  CHECK(system_link::RelayStatus(first.stats()) == "Relay: lost connection");
+  CHECK(system_link::RelayStatus(first.stats()) == "Online: lost connection");
   CHECK(first.Send(sweep.native_handle(), {second.ipv4(), 1000}, query).error() == kNetworkDown);
   system::N_XSOCKADDR_IN original_binding{};
   address_size = sizeof(original_binding);
@@ -449,18 +452,18 @@ TEST_CASE("relay client handshake times out without a server", "[kernel][relay_c
     SKIP("Loopback UDP socket unavailable");
   Client client;
   const auto start = std::chrono::steady_clock::now();
-  CHECK(system_link::RelayStatus(client.stats()) == "Relay: waiting for System Link");
+  CHECK(system_link::RelayStatus(client.stats()) == "Online: waiting for System Link");
   client.Stop();
-  CHECK(system_link::RelayStatus(client.stats()) == "Relay: waiting for System Link");
+  CHECK(system_link::RelayStatus(client.stats()) == "Online: waiting for System Link");
   auto joined = client.Start((*sink)->endpoint(), "test", "secret", {});
   CHECK_FALSE(joined);
   CHECK(std::chrono::steady_clock::now() - start < 6s);
   CHECK(client.stats().state == Association::kFailed);
   CHECK(system_link::RelayStatus(client.stats()) ==
-        "Relay failed: relay not reachable (handshake timeout)");
+        "Online failed: the host's online server is not responding");
   client.Stop();
   CHECK(system_link::RelayStatus(client.stats()) ==
-        "Relay failed: relay not reachable (handshake timeout)");
+        "Online failed: the host's online server is not responding");
   unsigned hellos = 0;
   for (;;) {
     auto packet = (*sink)->Receive(0);
@@ -517,27 +520,29 @@ TEST_CASE("invite secret file authenticates a decoded client against the relay",
   });
   Client first, other;
   REQUIRE(first.Start((*server)->endpoint(), invite->room, Secret(invite->SecretView()), {}));
-  CHECK(system_link::RelayStatus(first.stats()) == "Relay: connected as 198.18.0.1");
+  CHECK(system_link::RelayStatus(first.stats()) == "Online: connected as 198.18.0.1");
   auto failed = other.Start((*server)->endpoint(), invite->room, Secret(invite->SecretView()), {});
   CHECK_FALSE(failed);
-  CHECK(system_link::RelayStatus(other.stats()) == "Relay failed: room full");
+  CHECK(system_link::RelayStatus(other.stats()) == "Online failed: the game is full");
   failed = other.Start((*server)->endpoint(), "different", Secret(invite->SecretView()), {});
   CHECK_FALSE(failed);
-  CHECK(system_link::RelayStatus(other.stats()) == "Relay failed: too many rooms");
+  CHECK(system_link::RelayStatus(other.stats()) ==
+        "Online failed: the online server has too many games open");
   failed = other.Start((*server)->endpoint(), invite->room, Secret(invite->SecretView()),
                        relay::Digest{1});
   CHECK_FALSE(failed);
-  CHECK(system_link::RelayStatus(other.stats()) == "Relay failed: different game build");
+  CHECK(system_link::RelayStatus(other.stats()) == "Online failed: different game build");
 }
 
 TEST_CASE("relay status records all wire REJECT reasons", "[kernel][relay_client][network]") {
-  for (const auto& [reason, text] : {std::pair{relay::Reason::kVersion, "protocol version"},
-                                     {relay::Reason::kMalformed, "malformed handshake"},
-                                     {relay::Reason::kAuth, "wrong secret"},
-                                     {relay::Reason::kRoomFull, "room full"},
-                                     {relay::Reason::kTooManyRooms, "too many rooms"},
-                                     {relay::Reason::kFingerprintMismatch, "different game build"},
-                                     {relay::Reason::kRateLimited, "rate limited"}}) {
+  for (const auto& [reason, text] :
+       {std::pair{relay::Reason::kVersion, "different ReRevved version"},
+        {relay::Reason::kMalformed, "unreadable reply from the online server"},
+        {relay::Reason::kAuth, "invite code does not match this server"},
+        {relay::Reason::kRoomFull, "the game is full"},
+        {relay::Reason::kTooManyRooms, "the online server has too many games open"},
+        {relay::Reason::kFingerprintMismatch, "different game build"},
+        {relay::Reason::kRateLimited, "too many attempts; wait and try again"}}) {
     auto server = relay::UdpSocket::Open("127.0.0.1", 0);
     REQUIRE(server);
     std::jthread pump([&](std::stop_token stop) {
@@ -555,7 +560,7 @@ TEST_CASE("relay status records all wire REJECT reasons", "[kernel][relay_client
     });
     Client client;
     CHECK_FALSE(client.Start((*server)->endpoint(), "test", "secret", {}));
-    CHECK(system_link::RelayStatus(client.stats()) == std::string("Relay failed: ") + text);
+    CHECK(system_link::RelayStatus(client.stats()) == std::string("Online failed: ") + text);
   }
 }
 

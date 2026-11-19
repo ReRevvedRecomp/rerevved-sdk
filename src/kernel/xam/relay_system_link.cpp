@@ -147,19 +147,19 @@ std::optional<relay::Digest> FromHex(std::string_view text) {
 const char* Rejection(relay::Reason reason) {
   switch (reason) {
     case relay::Reason::kVersion:
-      return "protocol version";
+      return "different ReRevved version";
     case relay::Reason::kMalformed:
-      return "malformed handshake";
+      return "unreadable reply from the online server";
     case relay::Reason::kAuth:
-      return "wrong secret";
+      return "invite code does not match this server";
     case relay::Reason::kRoomFull:
-      return "room full";
+      return "the game is full";
     case relay::Reason::kTooManyRooms:
-      return "too many rooms";
+      return "the online server has too many games open";
     case relay::Reason::kFingerprintMismatch:
       return "different game build";
     case relay::Reason::kRateLimited:
-      return "rate limited";
+      return "too many attempts; wait and try again";
   }
   return "unknown rejection";
 }
@@ -1304,7 +1304,7 @@ struct Client::Impl {
     const bool local = (ntohl(server.ipv4) >> 24) == 127;
     if (!winsock.ready || !transport.Open(local ? htonl(INADDR_LOOPBACK) : 0) ||
         !injection.Open(htonl(INADDR_LOOPBACK)) || !signal.Open(htonl(INADDR_LOOPBACK))) {
-      Fail("Cannot open relay UDP sockets");
+      Fail("cannot open a network port");
       return;
     }
     auto random = relay::RandomSeed();
@@ -1361,7 +1361,7 @@ struct Client::Impl {
       auto now = Clock::now();
       if (!joined) {
         if (now - started >= 5s) {
-          Fail("relay not reachable (handshake timeout)");
+          Fail("the host's online server is not responding");
           break;
         }
         if (now >= next_handshake) {
@@ -1468,7 +1468,7 @@ struct Client::Impl {
       const auto ready = select(static_cast<int>(std::max(transport.handle, signal.handle) + 1),
                                 &readable, nullptr, nullptr, &timeout);
       if (ready < 0) {
-        Fail("Relay socket select failed");
+        Fail("network error");
         break;
       }
       if (FD_ISSET(signal.handle, &readable))
@@ -1670,7 +1670,7 @@ VoidResult Client::Associate(relay::Endpoint server, std::string room,
   if (!server.ipv4 || !server.port || !credentials) {
     impl_->stats.started = true;
     impl_->stats.state = Association::kFailed;
-    impl_->stats.last_failure = "bad relay settings";
+    impl_->stats.last_failure = "invalid online settings";
     return std::unexpected(
         Error{ErrorCategory::Config, "Relay requires host:port, a 1-32 byte room, and a secret"});
   }

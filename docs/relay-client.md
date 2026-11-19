@@ -97,13 +97,13 @@ to read current cvar values, use explicit XUID configuration and retain the
 require snapshot initialization. Name validation still applies to the cvar
 setter.
 
-Status is `Off`, `LAN`, `Relay: waiting for System Link`, `Relay: connecting`,
-`Relay: disconnected`, `Relay: connected as 198.18.x.y`, `Relay: lost
-connection`, or `Relay failed: <reason>`. Once any direct attempt has run, the
-connected status ends with the direct peer count, for example `Relay: connected
-as 198.18.0.2 (direct: 1 of 1 peers)`. With `live_sessions` set, `Off` and `LAN`
-read `Off (Live sessions inactive)` and `LAN (Live sessions inactive)`, because
-the option needs relay mode. Failure reasons identify bad invites or settings,
+Status is `Off`, `LAN`, `Online: waiting for System Link`, `Online: connecting`,
+`Online: disconnected`, `Online: connected as 198.18.x.y`, `Online: lost
+connection`, or `Online failed: <reason>`. Once any direct attempt has run, the
+connected status ends with the direct peer count, for example `Online: connected
+as 198.18.0.2 (direct to 1 of 1 players)`. With `live_sessions` set, `Off` and
+`LAN` read `Off (Online Player Match unavailable)` and
+`LAN (Online Player Match unavailable)`, because the option needs relay mode. Failure reasons identify bad invites or settings,
 an unresolved relay address, an unreachable relay (handshake timeout), a wrong
 secret, a different game build, a full room, too many rooms, rate limiting, or
 an unreadable executable. Status contains neither codes nor secrets. Waiting is
@@ -396,7 +396,7 @@ Token lifetime. A join token can be used repeatedly until it expires, 900
 seconds after the host requested it. The relay revokes it when the session is
 removed. A token join cannot rejoin after its token expires: a later
 `XNetStartup` that the relay rejects records
-`Relay failed: invite expired; ask for a new invite`. The player then needs a
+`Online failed: invite expired; ask for a new invite`. The player then needs a
 fresh invite and a restart.
 
 Delivery. One accepted invite is pending per process: the session's record, for
@@ -501,7 +501,7 @@ XNADDR state and socket errors. Relay startup follows that model. Only a
 configuration error, LAN combined with relay, or a zero XUID returns
 `X_ERROR_INVALID_PARAMETER`. When the relay address does not resolve, the secret
 or executable cannot be read, the handshake times out, or the relay rejects the
-join, startup logs the reason, records it in the status as `Relay failed:
+join, startup logs the reason, records it in the status as `Online failed:
 <reason>`, takes a reference and returns success. The title keeps running
 without a network. Each later startup while the association is not live retries
 the full handshake, with the same five-second deadline; a successful retry

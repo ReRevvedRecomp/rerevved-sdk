@@ -187,14 +187,14 @@ Result<size_t> ReadSecretFile(const std::filesystem::path& path, std::span<char>
   const auto file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE)
-    return std::unexpected(Error{ErrorCategory::IO, "Cannot read relay secret file"});
+    return std::unexpected(Error{ErrorCategory::IO, "cannot read the online server password file"});
   BY_HANDLE_FILE_INFORMATION info{};
   bool failed = GetFileType(file) != FILE_TYPE_DISK || !GetFileInformationByHandle(file, &info) ||
                 (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
 #else
   const auto file = open(path.c_str(), O_RDONLY | O_NONBLOCK);
   if (file < 0)
-    return std::unexpected(Error{ErrorCategory::IO, "Cannot read relay secret file"});
+    return std::unexpected(Error{ErrorCategory::IO, "cannot read the online server password file"});
   struct stat info{};
   bool failed = fstat(file, &info) != 0 || !S_ISREG(info.st_mode);
 #endif

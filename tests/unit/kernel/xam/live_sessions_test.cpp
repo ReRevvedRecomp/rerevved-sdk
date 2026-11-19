@@ -336,7 +336,7 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
   SECTION("off mode reports inactive") {
     f.Set("live_sessions", "true");
     f.Freeze();
-    CHECK(system_link::Status() == "Off (Live sessions inactive)");
+    CHECK(system_link::Status() == "Off (Online Player Match unavailable)");
     CHECK_FALSE(system_link::LiveSessionsActive());
     CHECK(ActiveService() == nullptr);
   }
@@ -345,7 +345,7 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
     f.Set("system_link_lan_enabled", "true");
     f.Set("system_link_local_address", "127.0.0.1");
     f.Freeze();
-    CHECK(system_link::Status() == "LAN (Live sessions inactive)");
+    CHECK(system_link::Status() == "LAN (Online Player Match unavailable)");
     CHECK_FALSE(system_link::LiveSessionsActive());
     CHECK(ActiveService() == nullptr);
   }
@@ -353,7 +353,7 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
     f.Set("live_sessions", "true");
     f.Set("system_link_relay_address", "127.0.0.1:30100");
     f.Freeze();
-    CHECK(system_link::Status().starts_with("Relay failed: "));
+    CHECK(system_link::Status().starts_with("Online failed: "));
     CHECK(ActiveService() == nullptr);
   }
   SECTION("relay without the option stays inactive") {

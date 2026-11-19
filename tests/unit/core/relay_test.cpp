@@ -31,11 +31,11 @@ TEST_CASE("relay status reports player and room changes only", "[relay][relay_st
 
   c.peers = 1;
   c.rooms = 1;
-  CHECK(status.Update(c, t, 0, 5100).status == "Relay: 1 player in 1 room");
+  CHECK(status.Update(c, t, 0, 5100).status == "Online server: 1 player in 1 game");
   c.peers = 2;
-  CHECK(status.Update(c, t, 0, 5200).status == "Relay: 2 players in 1 room");
+  CHECK(status.Update(c, t, 0, 5200).status == "Online server: 2 players in 1 game");
   c.rooms = 2;
-  CHECK(status.Update(c, t, 0, 5300).status == "Relay: 2 players in 2 rooms");
+  CHECK(status.Update(c, t, 0, 5300).status == "Online server: 2 players in 2 games");
 
   c.pending = 2;
   c.sessions = 1;
@@ -49,7 +49,7 @@ TEST_CASE("relay status reports player and room changes only", "[relay][relay_st
   CHECK(status.Update(c, t, 0, 15000).status.empty());
   c.peers = 0;
   c.rooms = 0;
-  CHECK(status.Update(c, t, 0, 15100).status == "Relay: 0 players in 0 rooms");
+  CHECK(status.Update(c, t, 0, 15100).status == "Online server: 0 players in 0 games");
   CHECK(status.Update(c, t, 0, 20000).status.empty());
 }
 
@@ -58,22 +58,22 @@ TEST_CASE("relay status warnings aggregate increases without flooding", "[relay]
   Counters c;
   TransportCounters t;
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 2;
-  CHECK(status.Update(c, t, 0, 0).warning == "Relay problems: malformed=+2");
+  CHECK(status.Update(c, t, 0, 0).warning == "Online server problems: malformed=+2");
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 5;
   c.drops[static_cast<size_t>(Drop::kAuth)] = 3;
   t.send_errors = 1;
   c.peers = c.rooms = 1;
   auto messages = status.Update(c, t, 0, 100);
   CHECK(messages.warning.empty());
-  CHECK(messages.status == "Relay: 1 player in 1 room");
+  CHECK(messages.status == "Online server: 1 player in 1 game");
   c.drops[static_cast<size_t>(Drop::kMalformed)] = 10;
   CHECK(status.Update(c, t, 0, 4999).warning.empty());
   CHECK(status.Update(c, t, 0, 5000).warning ==
-        "Relay problems: send_errors=+1 malformed=+8 auth=+3");
+        "Online server problems: send_errors=+1 malformed=+8 auth=+3");
   CHECK(status.Update(c, t, 0, 10000).warning.empty());
   CHECK(status.Update(c, t, 0, 15000).warning.empty());
   c.drops[static_cast<size_t>(Drop::kAuth)] = 4;
-  CHECK(status.Update(c, t, 0, 15100).warning == "Relay problems: auth=+1");
+  CHECK(status.Update(c, t, 0, 15100).warning == "Online server problems: auth=+1");
   CHECK(status.Update(c, t, 0, 20100).warning.empty());
 }
 
@@ -94,7 +94,7 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
     if (i == static_cast<size_t>(Drop::kIdle))
       CHECK(messages.warning.empty());
     else
-      CHECK(messages.warning == "Relay problems: " + std::string(kDrops[i]) + "=+7");
+      CHECK(messages.warning == "Online server problems: " + std::string(kDrops[i]) + "=+7");
     CHECK(messages.debug == "Relay counters: " + std::string(kDrops[i]) + "=7");
   }
   for (size_t i = 0; i < kConnectDrops.size(); ++i) {
@@ -103,12 +103,12 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
     Counters c;
     c.connect_drops[i] = 9;
     const auto messages = status.Update(c, {}, 0, 0);
-    CHECK(messages.warning == "Relay problems: " + std::string(kConnectDrops[i]) + "=+9");
+    CHECK(messages.warning == "Online server problems: " + std::string(kConnectDrops[i]) + "=+9");
     CHECK(messages.debug == "Relay counters: " + std::string(kConnectDrops[i]) + "=9");
   }
   rexglue::cli::RelayStatus status;
   CHECK(status.Update({}, {2, 3}, 4, 0).warning ==
-        "Relay problems: receive_errors=+2 send_errors=+3 connection_resets=+4");
+        "Online server problems: receive_errors=+2 send_errors=+3 connection_resets=+4");
 }
 
 TEST_CASE("relay status debug dumps nonzero counters every five seconds", "[relay][relay_status]") {

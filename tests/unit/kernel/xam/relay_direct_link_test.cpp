@@ -201,7 +201,7 @@ TEST_CASE("relay clients move unicast onto an authenticated direct path",
   auto without_direct = a.stats();
   without_direct.direct_attempted_peers = 0;
   CHECK(system_link::RelayStatus(a.stats()) ==
-        system_link::RelayStatus(without_direct) + " (direct: 1 of 1 peers)");
+        system_link::RelayStatus(without_direct) + " (direct to 1 of 1 players)");
 
   // Broadcast keeps using the relay.
   ga.Send({0xffffffffu, 1000}, Payload(9));
@@ -293,7 +293,7 @@ TEST_CASE("relay clients stay on the relay when direct candidates never answer",
   CHECK(stats.direct_attempts >= 1);
   CHECK(stats.direct_probe_failures >= 1);
   CHECK(stats.direct_established == 0);
-  CHECK(system_link::RelayStatus(stats).ends_with(" (direct: 0 of 1 peers)"));
+  CHECK(system_link::RelayStatus(stats).ends_with(" (direct to 0 of 1 players)"));
   // After the first failure, the next request waits for the first backoff.
   const auto requests = relay.Locked([&] { return relay.requests; });
   bool spaced = false;
@@ -886,7 +886,7 @@ TEST_CASE("relay clients keep relay transport without direct support",
     CHECK(system_link::RelayStatus(a.stats()).find("direct") == std::string::npos);
   } else {
     CHECK(a.stats().direct_connect_timeouts >= 1);
-    CHECK(system_link::RelayStatus(a.stats()).ends_with(" (direct: 0 of 1 peers)"));
+    CHECK(system_link::RelayStatus(a.stats()).ends_with(" (direct to 0 of 1 players)"));
     if (!b_direct)
       CHECK(counters.connect_drops[static_cast<size_t>(relay::ConnectDrop::kUnavailable)] >= 1);
   }
