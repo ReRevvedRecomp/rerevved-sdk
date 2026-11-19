@@ -49,8 +49,8 @@ requirements; the SDK is not a playable release.
   swap contracts and their resource, lifetime, and completion limits.
 - [Direct LAN System Link](LAN_SYSTEM_LINK.md) explains local identity, socket
   behavior, session state, and LAN-only constraints.
-- [System Link relay](SYSTEM_LINK_RELAY.md) explains private relay setup,
-  credentials, server options, logs, and security limits.
+- [System Link online server](SYSTEM_LINK_ONLINE_SERVER.md) explains private
+  online server setup, credentials, server options, logs, and security limits.
 - [Relay client](relay-client.md) defines configuration, guest delivery, session
   discovery, Live invites, and disconnected behavior.
 - [Relay protocol](relay-protocol.md) specifies wire messages and server limits.

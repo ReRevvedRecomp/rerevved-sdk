@@ -1,8 +1,8 @@
 # Relay client
 
-This page is for SDK integrators. For relay operation and security limits, see
-[System Link relay](SYSTEM_LINK_RELAY.md). Wire formats are in [Relay
-protocol](relay-protocol.md).
+This page is for SDK integrators. For online server operation and security limits,
+see [System Link online server](SYSTEM_LINK_ONLINE_SERVER.md). Wire formats are
+in [Relay protocol](relay-protocol.md).
 
 - [Configuration](#configuration)
 - [Guest sockets and delivery](#guest-sockets-and-delivery)
@@ -23,9 +23,9 @@ The client is disabled by default. F4 exposes these settings in `Online`:
 | `system_link_lan_enabled` | Player | `false` | Direct LAN mode |
 | `system_link_xuid` | Advanced | `0` | Automatic identity or an explicit per-player XUID |
 | `system_link_local_address` | Advanced | Empty | Selected direct-LAN IPv4 address |
-| `system_link_relay_address` | Advanced | Empty | Explicit relay host:port |
-| `system_link_relay_room` | Advanced | Empty | Explicit relay room |
-| `system_link_relay_secret_file` | Advanced | Empty | Explicit path to the relay secret file |
+| `system_link_server_address` | Advanced | Empty | Explicit online server host:port |
+| `system_link_server_room` | Advanced | Empty | Explicit online server room |
+| `system_link_server_password_file` | Advanced | Empty | Explicit path to the online server password file |
 | `system_link_advertised_address` | Advanced | Empty | Relay host:port that host invites tell other players to use |
 | `live_sessions` | Player | `false` | List and join Live-mode sessions through the relay |
 | `live_invite` | Advanced | Empty | Join a Live session from an invite code, for this session only |
@@ -42,15 +42,15 @@ settings before restarting. The status is init-only, refuses writes, and is
 never persisted.
 
 A non-empty invite requests relay mode and supplies the endpoint, room and
-secret. Combining an invite with any explicit relay address, room or secret-file
+secret. Combining an invite with any explicit relay address, room or password-file
 setting fails configuration. LAN and relay are mutually exclusive. Setting any
 explicit relay option requests relay mode; all three must be supplied together.
 For explicit configuration:
 
 ```toml
-system_link_relay_address = "relay.example.net:30100"
-system_link_relay_room = "private-test"
-system_link_relay_secret_file = "relay-secret.txt"
+system_link_server_address = "server.example.net:30100"
+system_link_server_room = "private-test"
+system_link_server_password_file = "server-password.txt"
 system_link_lan_enabled = false
 ```
 
@@ -71,7 +71,7 @@ advertised address, local address, XUID, player name, `live_sessions`,
 reader uses that snapshot; F4 edits affect the next process start. The invite
 text remains in process memory, is shown in F4, and remains in the saved config.
 Decoded invite secrets use wiped storage; each handshake receives its own wiped
-copy. An explicit secret-file path is frozen, and the file is read for each new
+copy. An explicit password-file path is frozen, and the file is read for each new
 handshake.
 
 When System Link is requested and XUID is zero, startup generates

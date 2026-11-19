@@ -105,7 +105,7 @@ class RelayStatus {
       for (const auto& counter : counters)
         detail::AppendRelayCounter(messages.debug, counter.name, counter.value);
       if (!messages.debug.empty())
-        messages.debug.insert(0, "Relay counters: ");
+        messages.debug.insert(0, "Online server counters: ");
       next_debug_ = now + kLogIntervalMs;
     }
     return messages;
@@ -120,7 +120,7 @@ class RelayStatus {
     }
     for (const auto count : c.connect_drops)
       rejected += count;
-    return "Relay stopped: packets_in=" + std::to_string(c.packets_in) +
+    return "Online server stopped: packets_in=" + std::to_string(c.packets_in) +
            " bytes_in=" + std::to_string(c.bytes_in) +
            " packets_out=" + std::to_string(c.packets_out) +
            " bytes_out=" + std::to_string(c.bytes_out) + " rejected=" + std::to_string(rejected) +

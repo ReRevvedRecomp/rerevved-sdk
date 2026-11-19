@@ -299,9 +299,9 @@ struct ConfigFixture {
     REQUIRE(rex::cvar::SetFlagByName(key, value));
   }
   void Relay() {
-    Set("system_link_relay_address", "127.0.0.1:30100");
-    Set("system_link_relay_room", "room");
-    Set("system_link_relay_secret_file", "secret_file");
+    Set("system_link_server_address", "127.0.0.1:30100");
+    Set("system_link_server_room", "room");
+    Set("system_link_server_password_file", "secret_file");
   }
   void Freeze() {
     system_link::FreezeConfig(path, [] { return rex::relay::Digest{0xCD, 0xAB, 2, 3, 4, 5}; });
@@ -351,7 +351,7 @@ TEST_CASE("live_sessions is active only in a valid relay configuration", "[live_
   }
   SECTION("failed relay settings stay inactive") {
     f.Set("live_sessions", "true");
-    f.Set("system_link_relay_address", "127.0.0.1:30100");
+    f.Set("system_link_server_address", "127.0.0.1:30100");
     f.Freeze();
     CHECK(system_link::Status().starts_with("Online failed: "));
     CHECK(ActiveService() == nullptr);

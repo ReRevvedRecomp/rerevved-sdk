@@ -879,9 +879,9 @@ std::string TokenCode() {
 }
 
 std::string HostInviteCode(ConfigFixture& f, std::string_view advertised) {
-  f.Set("system_link_relay_address", "127.0.0.1:30100");
-  f.Set("system_link_relay_room", "room");
-  f.Set("system_link_relay_secret_file", "secret_file");
+  f.Set("system_link_server_address", "127.0.0.1:30100");
+  f.Set("system_link_server_room", "room");
+  f.Set("system_link_server_password_file", "secret_file");
   f.Set("live_sessions", "true");
   f.Set("system_link_advertised_address", advertised);
   f.Freeze();
@@ -1078,18 +1078,18 @@ TEST_CASE("live_invite takes precedence over saved System Link settings",
     saved = {{"system_link_invite", *system_link_invite}};
   }
   SECTION("explicit relay settings") {
-    saved = {{"system_link_relay_address", "saved.example.net:30100"},
-             {"system_link_relay_room", "savedroom"},
-             {"system_link_relay_secret_file", "saved-secret.txt"}};
+    saved = {{"system_link_server_address", "saved.example.net:30100"},
+             {"system_link_server_room", "savedroom"},
+             {"system_link_server_password_file", "saved-secret.txt"}};
   }
   SECTION("LAN") {
     saved = {{"system_link_lan_enabled", "true"}};
   }
   SECTION("all of them") {
     saved = {{"system_link_invite", *system_link_invite},
-             {"system_link_relay_address", "saved.example.net:30100"},
-             {"system_link_relay_room", "savedroom"},
-             {"system_link_relay_secret_file", "saved-secret.txt"},
+             {"system_link_server_address", "saved.example.net:30100"},
+             {"system_link_server_room", "savedroom"},
+             {"system_link_server_password_file", "saved-secret.txt"},
              {"system_link_lan_enabled", "true"}};
   }
   for (const auto& [name, value] : saved)

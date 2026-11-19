@@ -371,13 +371,13 @@ std::optional<relay::Datagram> Unwrap(uint64_t token, std::span<const uint8_t> b
 Result<relay::InviteAddress> ParseAddress(std::string_view address) {
   const auto colon = address.rfind(':');
   if (colon == std::string_view::npos || !colon || colon + 1 == address.size())
-    return std::unexpected(Error{ErrorCategory::Config, "Relay address requires host:port"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server address requires host:port"});
   const auto number = address.substr(colon + 1);
   unsigned port = 0;
   const auto parsed = std::from_chars(number.data(), number.data() + number.size(), port);
   if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || !port ||
       port > 65535)
-    return std::unexpected(Error{ErrorCategory::Config, "Relay port must be 1-65535"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server port must be 1-65535"});
   return relay::InviteAddress{std::string(address.substr(0, colon)), static_cast<uint16_t>(port)};
 }
 Result<relay::Endpoint> Resolve(std::string_view address) {
@@ -386,13 +386,13 @@ Result<relay::Endpoint> Resolve(std::string_view address) {
     return std::unexpected(parsed.error());
   Winsock winsock;
   if (!winsock.ready)
-    return std::unexpected(Error{ErrorCategory::IO, "Relay WSAStartup failed"});
+    return std::unexpected(Error{ErrorCategory::IO, "WSAStartup failed"});
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
   addrinfo* resolved = nullptr;
   if (getaddrinfo(parsed->host.c_str(), nullptr, &hints, &resolved))
-    return std::unexpected(Error{ErrorCategory::IO, "Cannot resolve relay IPv4 host"});
+    return std::unexpected(Error{ErrorCategory::IO, "Cannot resolve server IPv4 host"});
   relay::Endpoint result{reinterpret_cast<sockaddr_in*>(resolved->ai_addr)->sin_addr.s_addr,
                          parsed->port};
   freeaddrinfo(resolved);
@@ -428,7 +428,7 @@ Result<Secret> ReadSecret(std::string_view path) {
   secret.size_ = *size;
   auto first = secret.view().find_first_not_of(" \t\r\n\f\v");
   if (first == std::string::npos)
-    return std::unexpected(Error{ErrorCategory::Config, "Relay secret is empty"});
+    return std::unexpected(Error{ErrorCategory::Config, "Server password is empty"});
   secret.size_ = secret.view().find_last_not_of(" \t\r\n\f\v") - first + 1;
   secret.offset_ = first;
   return secret;
@@ -445,19 +445,19 @@ Result<relay::Digest> HostFingerprint() {
     std::array<wchar_t, 32768> path{};
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (!length || length == path.size())
-      return std::unexpected(Error{ErrorCategory::IO, "Cannot locate relay host executable"});
+      return std::unexpected(Error{ErrorCategory::IO, "Cannot locate the game executable"});
     const std::filesystem::path executable_path(std::wstring_view(path.data(), length));
 #else
     const auto executable_path = filesystem::GetExecutablePath();
 #endif
     auto executable = FromHex(crypto::sha256_file(executable_path));
     if (!executable)
-      return std::unexpected(Error{ErrorCategory::IO, "Cannot hash relay host executable"});
+      return std::unexpected(Error{ErrorCategory::IO, "Cannot hash the game executable"});
     std::string input = REXGLUE_VERSION_STRING;
     input.append(reinterpret_cast<const char*>(executable->data()), executable->size());
     auto hash = FromHex(crypto::sha256(input));
     if (!hash)
-      return std::unexpected(Error{ErrorCategory::Crypto, "Cannot compute relay fingerprint"});
+      return std::unexpected(Error{ErrorCategory::Crypto, "Cannot compute the game fingerprint"});
     return *hash;
   }();
   if (fingerprint)
@@ -1671,8 +1671,8 @@ VoidResult Client::Associate(relay::Endpoint server, std::string room,
     impl_->stats.started = true;
     impl_->stats.state = Association::kFailed;
     impl_->stats.last_failure = "invalid online settings";
-    return std::unexpected(
-        Error{ErrorCategory::Config, "Relay requires host:port, a 1-32 byte room, and a secret"});
+    return std::unexpected(Error{
+        ErrorCategory::Config, "Online server needs host:port, a 1-32 byte room, and a password"});
   }
   impl_->stop = false;
   impl_->server = server;

@@ -235,9 +235,9 @@ bool ValidAdvertisedAddress(std::string_view address) {
 Config LiveConfig() {
   Config config;
   config.lan_enabled = Query<bool>("system_link_lan_enabled");
-  config.address = GetFlagByName("system_link_relay_address");
-  config.room = GetFlagByName("system_link_relay_room");
-  config.secret_file = GetFlagByName("system_link_relay_secret_file");
+  config.address = GetFlagByName("system_link_server_address");
+  config.room = GetFlagByName("system_link_server_room");
+  config.secret_file = GetFlagByName("system_link_server_password_file");
   config.advertised_address = GetFlagByName("system_link_advertised_address");
   if (!ValidAdvertisedAddress(config.advertised_address))
     config.advertised_address.clear();
@@ -303,11 +303,11 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
     if (!code.empty())
       ignored.push_back("system_link_invite");
     if (!config.address.empty())
-      ignored.push_back("system_link_relay_address");
+      ignored.push_back("system_link_server_address");
     if (!config.room.empty())
-      ignored.push_back("system_link_relay_room");
+      ignored.push_back("system_link_server_room");
     if (!config.secret_file.empty())
-      ignored.push_back("system_link_relay_secret_file");
+      ignored.push_back("system_link_server_password_file");
     if (config.lan_enabled)
       ignored.push_back("system_link_lan_enabled");
     if (!ignored.empty())

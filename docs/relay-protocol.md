@@ -1,9 +1,9 @@
 # Relay protocol
 
-This is the wire reference for the private [System Link
-relay](SYSTEM_LINK_RELAY.md). See [Relay client](relay-client.md) for guest
-behavior and [Direct relay paths](relay-direct-paths.md) for authenticated peer
-traffic.
+This is the wire reference for the private [System Link online
+server](SYSTEM_LINK_ONLINE_SERVER.md). See [Relay client](relay-client.md) for
+guest behavior and [Direct relay paths](relay-direct-paths.md) for
+authenticated peer traffic.
 
 ## Protocol v2
 

@@ -100,8 +100,8 @@ TEST_CASE("system_link settings expose player advanced and read-only policies", 
   StateFixture f;
   for (const char* key :
        {"system_link_invite", "system_link_profile_name", "system_link_lan_enabled",
-        "system_link_xuid", "system_link_local_address", "system_link_relay_address",
-        "system_link_relay_room", "system_link_relay_secret_file",
+        "system_link_xuid", "system_link_local_address", "system_link_server_address",
+        "system_link_server_room", "system_link_server_password_file",
         "system_link_advertised_address"}) {
     const auto* flag = rex::cvar::GetFlagInfo(key);
     REQUIRE(flag);
@@ -231,7 +231,7 @@ TEST_CASE("system_link snapshot freezes invites identity and mode", "[system_lin
   f.Set("system_link_lan_enabled", "true");
   f.Set("system_link_profile_name", "Changed");
   f.Set("system_link_xuid", "9");
-  f.Set("system_link_relay_address", "different:1");
+  f.Set("system_link_server_address", "different:1");
   f.Freeze();
   CHECK(CurrentConfig().address == initial.address);
   CHECK(CurrentConfig().xuid == initial.xuid);
@@ -251,13 +251,13 @@ TEST_CASE("system_link snapshot refuses conflicting and incomplete settings",
   REQUIRE(invite);
   f.Set("system_link_invite", *invite);
   SECTION("explicit address") {
-    f.Set("system_link_relay_address", "a:1");
+    f.Set("system_link_server_address", "a:1");
   }
   SECTION("explicit room") {
-    f.Set("system_link_relay_room", "r");
+    f.Set("system_link_server_room", "r");
   }
   SECTION("explicit file") {
-    f.Set("system_link_relay_secret_file", "secret");
+    f.Set("system_link_server_password_file", "secret");
   }
   SECTION("LAN with invite") {
     f.Lan();
@@ -265,11 +265,11 @@ TEST_CASE("system_link snapshot refuses conflicting and incomplete settings",
   SECTION("LAN with explicit relay") {
     f.Set("system_link_invite", "");
     f.Lan();
-    f.Set("system_link_relay_address", "a:1");
+    f.Set("system_link_server_address", "a:1");
   }
   SECTION("incomplete explicit settings") {
     f.Set("system_link_invite", "");
-    f.Set("system_link_relay_address", "a:1");
+    f.Set("system_link_server_address", "a:1");
   }
   SECTION("bad invite") {
     f.Set("system_link_invite", "RXR1-00");
@@ -311,7 +311,7 @@ TEST_CASE("system_link off snapshot ignores later settings", "[system_link]") {
   Fixture f;
   f.Freeze();
   f.Lan();
-  f.Set("system_link_relay_address", "a:1");
+  f.Set("system_link_server_address", "a:1");
   CHECK(Status() == "Off");
   CHECK_FALSE(RelayRequested());
   CHECK(XamGetSystemVersion_entry() == 0);
@@ -398,9 +398,9 @@ TEST_CASE("system_link invite setter normalizes pasted credentials", "[system_li
 
 TEST_CASE("system_link explicit hosts retain resolver syntax", "[system_link][relay]") {
   Fixture f;
-  f.Set("system_link_relay_address", "relay_test.example:30100");
-  f.Set("system_link_relay_room", "testers");
-  f.Set("system_link_relay_secret_file", "secret");
+  f.Set("system_link_server_address", "relay_test.example:30100");
+  f.Set("system_link_server_room", "testers");
+  f.Set("system_link_server_password_file", "secret");
   f.Freeze();
   CHECK(CurrentConfig().error.empty());
   CHECK(relay_link::ParseAddress("relay_test.example:30100"));
@@ -419,9 +419,9 @@ TEST_CASE("system_link advertised address replaces only the address given to oth
     std::shared_ptr<spdlog::logger> logger;
     ~Restore() { logger->sinks().pop_back(); }
   } restore{logger};
-  f.Set("system_link_relay_address", "127.0.0.1:30100");
-  f.Set("system_link_relay_room", "testers");
-  f.Set("system_link_relay_secret_file", "secret");
+  f.Set("system_link_server_address", "127.0.0.1:30100");
+  f.Set("system_link_server_room", "testers");
+  f.Set("system_link_server_password_file", "secret");
   const auto* flag = rex::cvar::GetFlagInfo("system_link_advertised_address");
   REQUIRE(flag);
   CHECK(flag->default_value.empty());
@@ -500,7 +500,7 @@ multiline = """
 TEST_CASE("system_link config strings round trip quotes and backslashes", "[system_link][cvar]") {
   Fixture f;
   const std::string value = "path\\with\"quotes\"\n\t\b\f";
-  f.Set("system_link_relay_secret_file", value);
+  f.Set("system_link_server_password_file", value);
   SECTION("full save") {
     rex::cvar::SaveConfig(f.path);
   }
@@ -510,7 +510,7 @@ TEST_CASE("system_link config strings round trip quotes and backslashes", "[syst
   }
   rex::cvar::testing::ResetAllForTesting();
   rex::cvar::LoadConfig(f.path);
-  CHECK(rex::cvar::GetFlagByName("system_link_relay_secret_file") == value);
+  CHECK(rex::cvar::GetFlagByName("system_link_server_password_file") == value);
 }
 
 TEST_CASE("cvar parse errors keep descriptions without source excerpts", "[cvar][system_link]") {

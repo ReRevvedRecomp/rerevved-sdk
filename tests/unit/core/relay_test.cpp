@@ -95,7 +95,7 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
       CHECK(messages.warning.empty());
     else
       CHECK(messages.warning == "Online server problems: " + std::string(kDrops[i]) + "=+7");
-    CHECK(messages.debug == "Relay counters: " + std::string(kDrops[i]) + "=7");
+    CHECK(messages.debug == "Online server counters: " + std::string(kDrops[i]) + "=7");
   }
   for (size_t i = 0; i < kConnectDrops.size(); ++i) {
     CAPTURE(kConnectDrops[i]);
@@ -104,7 +104,7 @@ TEST_CASE("relay status names every problem counter", "[relay][relay_status]") {
     c.connect_drops[i] = 9;
     const auto messages = status.Update(c, {}, 0, 0);
     CHECK(messages.warning == "Online server problems: " + std::string(kConnectDrops[i]) + "=+9");
-    CHECK(messages.debug == "Relay counters: " + std::string(kConnectDrops[i]) + "=9");
+    CHECK(messages.debug == "Online server counters: " + std::string(kConnectDrops[i]) + "=9");
   }
   rexglue::cli::RelayStatus status;
   CHECK(status.Update({}, {2, 3}, 4, 0).warning ==
@@ -127,14 +127,15 @@ TEST_CASE("relay status debug dumps nonzero counters every five seconds", "[rela
   c.bytes_out = 10;
   CHECK(status.Update(c, {}, 0, 4999).debug.empty());
   CHECK(status.Update(c, {11, 12}, 13, 5000).debug ==
-        "Relay counters: rooms=1 peers=2 pending=3 sessions=4 tokens=5 attempts=6 packets_in=7 "
+        "Online server counters: rooms=1 peers=2 pending=3 sessions=4 tokens=5 attempts=6 "
+        "packets_in=7 "
         "bytes_in=8 packets_out=9 bytes_out=10 receive_errors=11 send_errors=12 "
         "connection_resets=13");
   CHECK(status.Update(c, {}, 0, 9999).debug.empty());
   c = {};
   c.packets_in = 7;
-  CHECK(status.Update(c, {}, 0, 10000).debug == "Relay counters: packets_in=7");
-  CHECK(status.Update(c, {}, 0, 30000).debug == "Relay counters: packets_in=7");
+  CHECK(status.Update(c, {}, 0, 10000).debug == "Online server counters: packets_in=7");
+  CHECK(status.Update(c, {}, 0, 30000).debug == "Online server counters: packets_in=7");
   CHECK(status.Update(c, {}, 0, 30001).debug.empty());
 }
 
@@ -152,10 +153,11 @@ TEST_CASE("relay status shutdown summarizes totals", "[relay][relay_status]") {
   ++c.drops[static_cast<size_t>(Drop::kMalformed)];
   CHECK(status.Update(c, {}, 0, 100).warning.empty());
   CHECK(rexglue::cli::RelayStatus::Summary(c, {2, 3}, 4) ==
-        "Relay stopped: packets_in=50 bytes_in=5000 packets_out=40 bytes_out=4000 rejected=24 "
+        "Online server stopped: packets_in=50 bytes_in=5000 packets_out=40 bytes_out=4000 "
+        "rejected=24 "
         "receive_errors=2 send_errors=3 connection_resets=4");
   CHECK(rexglue::cli::RelayStatus::Summary({}, {}, 0) ==
-        "Relay stopped: packets_in=0 bytes_in=0 packets_out=0 bytes_out=0 rejected=0 "
+        "Online server stopped: packets_in=0 bytes_in=0 packets_out=0 bytes_out=0 rejected=0 "
         "receive_errors=0 send_errors=0 connection_resets=0");
 }
 
@@ -636,13 +638,13 @@ TEST_CASE("relay invalid magic version and malformed messages stay silent", "[re
 TEST_CASE("relay options enable System Link profile identity", "[relay]") {
   rex::cvar::testing::ScopedLifecycleOverride lifecycle_override;
   REQUIRE(rex::cvar::SetFlagByName("system_link_lan_enabled", "false"));
-  const char* option = "system_link_relay_address";
+  const char* option = "system_link_server_address";
   SECTION("address only") {}
   SECTION("room only") {
-    option = "system_link_relay_room";
+    option = "system_link_server_room";
   }
   SECTION("secret file only") {
-    option = "system_link_relay_secret_file";
+    option = "system_link_server_password_file";
   }
   REQUIRE(rex::cvar::SetFlagByName(option, "test"));
   REQUIRE(rex::cvar::SetFlagByName("system_link_xuid", "12771645593269305345"));

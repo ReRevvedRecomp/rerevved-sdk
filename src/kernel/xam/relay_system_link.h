@@ -118,7 +118,7 @@ class TokenBucket {
   bool started_ = false;
 };
 
-// Direct UDP paths between room members; see "Direct paths" in docs/SYSTEM_LINK_RELAY.md.
+// Direct UDP paths between room members; see "Direct paths" in docs/SYSTEM_LINK_ONLINE_SERVER.md.
 constexpr uint32_t kDirectProbeIntervalMs = 200;
 constexpr uint32_t kDirectProbeWindowMs = 5000;
 // An up path sends KEEPALIVE at this interval and goes down when no KEEPALIVE_ACK

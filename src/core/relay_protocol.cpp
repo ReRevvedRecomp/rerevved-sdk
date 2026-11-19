@@ -17,11 +17,11 @@ Result<Digest> RandomSeed() {
 #if defined(_WIN32)
   if (BCryptGenRandom(nullptr, seed.data(), static_cast<ULONG>(seed.size()),
                       BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
-    return std::unexpected(Error{ErrorCategory::Crypto, "Relay random seed failed"});
+    return std::unexpected(Error{ErrorCategory::Crypto, "Random seed failed"});
 #else
   std::ifstream random("/dev/urandom", std::ios::binary);
   if (!random.read(reinterpret_cast<char*>(seed.data()), seed.size()))
-    return std::unexpected(Error{ErrorCategory::Crypto, "Relay random seed failed"});
+    return std::unexpected(Error{ErrorCategory::Crypto, "Random seed failed"});
 #endif
   return seed;
 }
