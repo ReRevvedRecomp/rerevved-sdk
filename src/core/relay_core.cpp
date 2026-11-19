@@ -130,8 +130,8 @@ void Core::Directory(Endpoint source, Peer& peer, const Message& message,
       for (auto& page : *pages)
         emit(std::move(page));
   };
-  const SessionKey key{peer.room, message.type == Type::kPublish ? message.record.session_id
-                                                                 : message.session_id};
+  const SessionKey key{
+      peer.room, message.type == Type::kPublish ? message.record.session_id : message.session_id};
   const auto session = sessions_.find(key);
   const bool exists = session != sessions_.end();
   const bool owned = exists && session->second.record.host_peer_id == peer.id;
@@ -246,10 +246,10 @@ void Core::Directory(Endpoint source, Peer& peer, const Message& message,
       grant.token_secret = TokenSecret(random);
       SecureWipe(random);
       grant.expiry_seconds = config_.token_lifetime_seconds;
-      tokens_.emplace(grant.join_token,
-                      Token{key, grant.token_secret,
-                            now_ + uint64_t(config_.token_lifetime_seconds) * 1000, peer.id,
-                            message.request_id});
+      tokens_.emplace(
+          grant.join_token,
+          Token{key, grant.token_secret, now_ + uint64_t(config_.token_lifetime_seconds) * 1000,
+                peer.id, message.request_id});
       reply(grant);
       return;
     }
@@ -373,10 +373,11 @@ std::vector<Datagram> Core::Receive(Endpoint source, std::span<const uint8_t> by
     Count(decoded.error() == Reason::kVersion ? Drop::kVersion : Drop::kMalformed);
     // A well-formed v1 HELLO gets a v1 REJECT so an old client reports the version.
     if (decoded.error() == Reason::kVersion && bytes[4] == 1 &&
-        bytes[5] == static_cast<uint8_t>(Type::kHello) && bytes.size() >= 58 &&
-        bytes[24] >= 1 && bytes[24] <= 32 && bytes.size() == size_t(57 + bytes[24])) {
-      Bytes reject{'R', 'R', 'L', 'Y', 1, static_cast<uint8_t>(Type::kReject), 9, 0,
-                   static_cast<uint8_t>(Reason::kVersion)};
+        bytes[5] == static_cast<uint8_t>(Type::kHello) && bytes.size() >= 58 && bytes[24] >= 1 &&
+        bytes[24] <= 32 && bytes.size() == size_t(57 + bytes[24])) {
+      Bytes reject{'R', 'R', 'L',
+                   'Y', 1,   static_cast<uint8_t>(Type::kReject),
+                   9,   0,   static_cast<uint8_t>(Reason::kVersion)};
       ++counters_.packets_out;
       counters_.bytes_out += reject.size();
       output.push_back({source, std::move(reject)});
@@ -448,9 +449,8 @@ std::vector<Datagram> Core::Receive(Endpoint source, std::span<const uint8_t> by
                                         hello.join_token, hello.fingerprint));
       }
     } else {
-      authentic = ConstantTimeEqual(
-          message.auth,
-          JoinAuth(secret_, hello.nonce, pending.server, hello.room, hello.fingerprint));
+      authentic = ConstantTimeEqual(message.auth, JoinAuth(secret_, hello.nonce, pending.server,
+                                                           hello.room, hello.fingerprint));
     }
     if (!authentic) {
       failed_join(Reason::kAuth);
@@ -567,7 +567,7 @@ std::vector<Datagram> Core::Receive(Endpoint source, std::span<const uint8_t> by
   peer.bytes -= bytes.size();
   if (directory) {
     auto& bucket = message.type == Type::kSearch || message.type == Type::kLookup ? peer.queries
-                                                                                   : peer.updates;
+                                                                                  : peer.updates;
     if (bucket < 1) {
       Count(Drop::kDirectoryRateLimited);
       return output;
