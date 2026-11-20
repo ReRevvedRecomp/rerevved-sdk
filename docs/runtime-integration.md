@@ -149,6 +149,15 @@ folder or URL in the desktop shell. A command cvar named exactly by a
 arguments, so a title can offer "Open Log Folder"; category and prefix sources
 still skip commands, audience rules still apply, and commands are never saved.
 
+Repeated runtime conditions stay out of the default log: each export stub warns
+on its first call and logs later calls at debug, an unimplemented XLIVEBASE
+message errors once per message ID, an unhandled guest access violation logs
+its first 20 occurrences, the first at each of 256 addresses and then every
+10000th with its count, and System Link relay counters log within 30 seconds of
+a fault or direct-peer change but traffic alone at most every five minutes. Online server connection, Live session hosting and
+removal, invite acceptance and join results log at info without the server
+address, room or session ID.
+
 For asynchronous presentation shutdown, return false from
 `OnWindowCloseRequested()`, drain presentation work, then call
 `window()->RequestClose()` on the UI thread. A detached title closed without a

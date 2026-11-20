@@ -15,6 +15,7 @@
 #include <rex/thread.h>
 #include "xlivebase_request.h"
 #include "../live_sessions.h"
+#include "../../../core/first_seen.h"
 
 namespace rex {
 namespace kernel {
@@ -121,10 +122,18 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
   }
-  REXKRNL_ERROR(
-      "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
-      "arg2={:08X}",
-      app_id(), message, buffer_ptr, buffer_length);
+  // Titles repeat the same message every few seconds; each one errors once.
+  static FirstSeen reported;
+  if (reported.First(fmt::format("{:08X}", message))) {
+    REXKRNL_ERROR(
+        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+        "arg2={:08X}; repeats log at debug",
+        app_id(), message, buffer_ptr, buffer_length);
+  } else {
+    REXKRNL_DEBUG(
+        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, arg2={:08X}",
+        app_id(), message, buffer_ptr, buffer_length);
+  }
   return X_E_FAIL;
 }
 

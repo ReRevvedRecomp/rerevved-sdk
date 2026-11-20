@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include <cstring>
 #include <utility>
 
@@ -571,6 +573,12 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+namespace {
+constexpr uint64_t kAccessViolationsLogged = 20;
+constexpr uint64_t kAccessViolationPeriod = 10000;
+constexpr size_t kAccessViolationAddresses = 256;
+}  // namespace
+
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      void* host_address, bool is_write) {
   // Access via physical_membase_ is special, when need to bypass everything
@@ -583,10 +591,26 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
-    REXSYS_ERROR(
-        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
-        is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
-        rex::thread::current_thread_id());
+    // A faulting loop repeats this thousands of times a second. Past the first
+    // few, a new address or one line per kAccessViolationPeriod keeps the log's
+    // startup context.
+    static std::atomic<uint64_t> violations{0};
+    const uint64_t count = violations.fetch_add(1, std::memory_order_relaxed) + 1;
+    bool new_address = false;
+    {
+      static std::mutex mutex;
+      static std::unordered_set<uint32_t> addresses;
+      std::lock_guard lock(mutex);
+      if (addresses.size() < kAccessViolationAddresses)
+        new_address = addresses.insert(virtual_address).second;
+    }
+    if (count <= kAccessViolationsLogged || new_address || count % kAccessViolationPeriod == 0) {
+      REXSYS_ERROR(
+          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "
+          "0x{:X} (count {})",
+          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+          rex::thread::current_thread_id(), count);
+    }
     return false;
   }
 

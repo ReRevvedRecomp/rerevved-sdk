@@ -207,18 +207,22 @@ struct Stats {
   uint64_t direct_evicted = 0;      // peer entries evicted to make room for another peer
 };
 
-// Heartbeats print but never trigger a line, since they advance every interval.
+// A fault or direct-peer counter change prints at the next interval. Traffic
+// counters print at most every kQuietInterval, and heartbeats never trigger a
+// line, so a healthy game logs a few lines an hour.
 class CounterLog {
  public:
   using Clock = std::chrono::steady_clock;
   static constexpr std::chrono::seconds kInterval{30};
+  static constexpr std::chrono::seconds kQuietInterval{300};
 
   void Arrival(Clock::time_point now);
-  std::optional<std::string> Line(const Stats& stats);
+  std::optional<std::string> Line(const Stats& stats, Clock::time_point now);
 
  private:
   std::array<uint64_t, 24> last_{};
   std::optional<Clock::time_point> last_arrival_;
+  std::optional<Clock::time_point> last_line_;
   std::chrono::milliseconds largest_gap_{0};
 };
 
