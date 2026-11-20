@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <tuple>
 #include <type_traits>
@@ -48,24 +49,35 @@
 // Define a raw hook with direct ctx/base access.
 #define REX_HOOK_RAW(name) extern "C" REX_FUNC(name)
 
-// Stub: logs a warning when called.
-#define REX_STUB(subroutine)              \
-  extern "C" REX_FUNC(subroutine) {       \
-    (void)base;                           \
-    REXKRNL_WARN("{} STUB", #subroutine); \
+// Stubs warn on their first call and log later calls at debug, so a stub the
+// title calls every frame or turn cannot crowd the default log.
+#define REX_STUB_WARN_ONCE(...)                                      \
+  do {                                                               \
+    static std::atomic_flag rex_stub_warned_;                        \
+    if (!rex_stub_warned_.test_and_set(std::memory_order_relaxed)) { \
+      REXKRNL_WARN(__VA_ARGS__);                                     \
+    } else {                                                         \
+      REXKRNL_DEBUG(__VA_ARGS__);                                    \
+    }                                                                \
+  } while (0)
+
+#define REX_STUB(subroutine)                    \
+  extern "C" REX_FUNC(subroutine) {             \
+    (void)base;                                 \
+    REX_STUB_WARN_ONCE("{} STUB", #subroutine); \
   }
 
-#define REX_STUB_LOG(subroutine, msg)               \
-  extern "C" REX_FUNC(subroutine) {                 \
-    (void)base;                                     \
-    REXKRNL_WARN("{} STUB - {}", #subroutine, msg); \
+#define REX_STUB_LOG(subroutine, msg)                     \
+  extern "C" REX_FUNC(subroutine) {                       \
+    (void)base;                                           \
+    REX_STUB_WARN_ONCE("{} STUB - {}", #subroutine, msg); \
   }
 
-#define REX_STUB_RETURN(subroutine, value)                                                \
-  extern "C" REX_FUNC(subroutine) {                                                       \
-    (void)base;                                                                           \
-    REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
-    ctx.r3.u64 = (value);                                                                 \
+#define REX_STUB_RETURN(subroutine, value)                                                      \
+  extern "C" REX_FUNC(subroutine) {                                                             \
+    (void)base;                                                                                 \
+    REX_STUB_WARN_ONCE("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
+    ctx.r3.u64 = (value);                                                                       \
   }
 
 // Export: hook + register in global registry for kernel ordinal lookup.

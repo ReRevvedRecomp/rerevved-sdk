@@ -12,6 +12,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string_view>
 #include <vector>
 
 #include <spdlog/common.h>
@@ -23,6 +24,9 @@ namespace rex::detail {
 // never takes the logging lock.
 void InstallCrashReport(const std::filesystem::path& log_path,
                         std::vector<spdlog::sink_ptr> flush_sinks);
+
+// Publishes the text logged as "Crash context: ..." before a crash line.
+void SetCrashContextText(std::string_view text);
 
 // Drops the published dump path and sinks, so shutdown can close the log file.
 void ClearCrashReportTargets();

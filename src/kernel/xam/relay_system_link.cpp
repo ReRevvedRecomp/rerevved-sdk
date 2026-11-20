@@ -240,16 +240,28 @@ void CounterLog::Arrival(Clock::time_point now) {
   last_arrival_ = now;
 }
 
-std::optional<std::string> CounterLog::Line(const Stats& stats) {
+std::optional<std::string> CounterLog::Line(const Stats& stats, Clock::time_point now) {
   const auto fields = CounterFields(stats);
-  bool changed = false;
+  bool fault = false;
+  bool traffic = false;
   for (size_t i = 0; i < fields.size(); ++i) {
-    // Index 1 is heartbeats, which never triggers a line.
-    changed = changed || (i != 1 && fields[i].value != last_[i]);
+    if (fields[i].value == last_[i]) {
+      continue;
+    }
+    const std::string_view name = fields[i].name;
+    if (name == "heartbeats") {
+      continue;
+    }
+    const bool is_traffic = name == "delivered" || name == "side_channel_in" ||
+                            name == "side_channel_out" || name == "direct_in" ||
+                            name == "direct_out";
+    (is_traffic ? traffic : fault) = true;
   }
-  if (!changed) {
+  const bool quiet_due = !last_line_ || now - *last_line_ >= kQuietInterval;
+  if (!fault && !(traffic && quiet_due)) {
     return std::nullopt;
   }
+  last_line_ = now;
   std::string line = "System Link relay counters:";
   for (size_t i = 0; i < fields.size(); ++i) {
     line += ' ';
@@ -1410,7 +1422,7 @@ struct Client::Impl {
             std::lock_guard lock(mutex);
             snapshot = stats;
           }
-          if (auto line = counter_log.Line(snapshot))
+          if (auto line = counter_log.Line(snapshot, now))
             REXKRNL_INFO("{}", *line);
         }
         // Limit each drain so receive and heartbeat deadlines are serviced under load.

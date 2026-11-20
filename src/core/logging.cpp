@@ -23,11 +23,13 @@
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
 
 #include "crash_report.h"
+#include "log_redact.h"
 
 #if REX_PLATFORM_WIN32
 #include <spdlog/sinks/msvc_sink.h>
@@ -54,6 +56,11 @@ REXCVAR_DEFINE_INT32(log_max_file_size_mb, 5, "Log", "Max log file size in MB be
     .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(
+    log_redact_user_folder, false, "Log",
+    "Write the user's home folder as %USERPROFILE% (~ outside Windows) in the log file")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files to keep")
     .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -61,6 +68,64 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files 
 namespace rex {
 
 namespace {
+
+// Rewrites the user's home folder in each message before the wrapped sink
+// formats it, so a posted log file does not show the account name.
+class RedactingSink final : public spdlog::sinks::sink {
+ public:
+  RedactingSink(spdlog::sink_ptr inner, std::vector<std::string> folders, std::string replacement)
+      : inner_(std::move(inner)),
+        folders_(std::move(folders)),
+        replacement_(std::move(replacement)) {}
+
+  void log(const spdlog::details::log_msg& msg) override {
+    const std::string_view payload(msg.payload.data(), msg.payload.size());
+    std::string redacted(payload);
+    for (const auto& folder : folders_)
+      redacted = detail::RedactFolder(redacted, folder, replacement_);
+    if (redacted.size() == payload.size() && redacted == payload) {
+      inner_->log(msg);
+      return;
+    }
+    spdlog::details::log_msg copy = msg;
+    copy.payload = spdlog::string_view_t(redacted.data(), redacted.size());
+    inner_->log(copy);
+  }
+  void flush() override { inner_->flush(); }
+  void set_pattern(const std::string& pattern) override { inner_->set_pattern(pattern); }
+  void set_formatter(std::unique_ptr<spdlog::formatter> formatter) override {
+    inner_->set_formatter(std::move(formatter));
+  }
+
+ private:
+  spdlog::sink_ptr inner_;
+  std::vector<std::string> folders_;
+  std::string replacement_;
+};
+
+spdlog::sink_ptr RedactUserFolder(spdlog::sink_ptr sink) {
+#if REX_PLATFORM_WIN32
+  const auto home = rex::platform::env::get("USERPROFILE");
+  const char* replacement = "%USERPROFILE%";
+#else
+  const auto home = rex::platform::env::get("HOME");
+  const char* replacement = "~";
+#endif
+  // A root or drive-only home would rewrite every path.
+  if (!home || home->size() < 4)
+    return sink;
+  // Paths printed with path::string() use the system code page, which differs
+  // from UTF-8 for a non-ASCII account name.
+  std::vector<std::string> folders{*home};
+  try {
+    std::string native = rex::to_path(*home).string();
+    if (native != *home)
+      folders.push_back(std::move(native));
+  } catch (...) {}
+  auto wrapped = std::make_shared<RedactingSink>(std::move(sink), std::move(folders), replacement);
+  wrapped->set_level(spdlog::level::trace);
+  return wrapped;
+}
 
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
@@ -235,7 +300,7 @@ void InitLogging(const LogConfig& config) {
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+    g_file_sink = REXCVAR_GET(log_redact_user_folder) ? RedactUserFolder(sink) : sink;
     std::error_code ec;
     g_file_path = std::filesystem::absolute(resolved_path, ec);
     if (ec) {
@@ -310,6 +375,10 @@ void FlushLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+}
+
+void SetCrashContext(std::string_view text) {
+  detail::SetCrashContextText(text);
 }
 
 std::filesystem::path GetLogFilePath() {

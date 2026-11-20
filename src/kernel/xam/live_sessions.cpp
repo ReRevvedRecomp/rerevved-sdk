@@ -567,7 +567,7 @@ struct Service::Impl {
       lookup.next = now + std::chrono::seconds(1);
       return;
     }
-    REXKRNL_DEBUG("Live invites: lookup failed session={:016X}", lookup.session_id);
+    REXKRNL_INFO("Live invites: the invited session was not found");
     if (!lookup.startup)
       accept = AcceptState::kFailed;
     invite_lookup.reset();
@@ -622,7 +622,7 @@ struct Service::Impl {
     DeliverInviteLocked(now);
     if (invite && invite->delivered &&
         now - invite->since >= std::chrono::milliseconds(kInviteHoldMs)) {
-      REXKRNL_DEBUG("Live invites: pending invite expired unsearched");
+      REXKRNL_INFO("Live invites: pending invite expired unsearched");
       invite.reset();
     }
   }
@@ -664,7 +664,7 @@ struct Service::Impl {
     ++counters.association_losses;
     hosted.reset();
     ResetTokenLocked();
-    REXKRNL_DEBUG("Live sessions: association lost; the relay removed the hosted session");
+    REXKRNL_INFO("Live sessions: association lost; the relay removed the hosted session");
   }
 
   void PublishDueLocked(Clock::time_point now) {
@@ -955,8 +955,10 @@ void Service::SessionChanged(const lan::SessionSnapshot& session, Clock::time_po
     impl_->RemoveHostedLocked();
   if (!host)
     return;
-  if (!impl_->hosted)
+  if (!impl_->hosted) {
     impl_->hosted = Impl::Hosted{session, id, true, false, now};
+    REXKRNL_INFO("Live sessions: hosting a session");
+  }
   impl_->hosted->session = session;
   impl_->hosted->dirty = true;
   impl_->PublishDueLocked(now);
@@ -998,7 +1000,7 @@ void Service::EndSession(Clock::time_point) {
     return;
   impl_->retired = impl_->hosted->id;
   impl_->RemoveHostedLocked();
-  REXKRNL_DEBUG("Live sessions: hosted session removed");
+  REXKRNL_INFO("Live sessions: hosted session removed");
 }
 
 void Service::Cleanup() {
@@ -1224,6 +1226,7 @@ bool Service::AcceptInvite(uint64_t session_id) {
   const auto handle = impl_->directory.BeginLookup(session_id);
   if (!handle)
     return false;
+  REXKRNL_INFO("Live invites: accepting an invite");
   REXKRNL_DEBUG("Live invites: accepting session={:016X}", session_id);
   impl_->invite_lookup.emplace();
   impl_->invite_lookup->session_id = session_id;
@@ -1602,8 +1605,8 @@ rex::live_invite::JoinStatus InviteJoin::Finish(rex::live_invite::JoinResult res
   status_ = {result, std::move(reason)};
   service_.reset();
   accepting_ = false;
-  REXKRNL_DEBUG("Live invites: join finished result={} reason={}", static_cast<int>(result),
-                status_.reason);
+  REXKRNL_INFO("Live invites: join finished result={} reason={}", static_cast<int>(result),
+               status_.reason);
   return status_;
 }
 
@@ -1741,8 +1744,8 @@ void HandleLeave(Service& service, lan::LanSystemLinkState& state, rex::memory::
   // Unknown members were counted by the host's record before this client joined;
   // their slot kind is unknown, so public counts go first.
   const auto uncounted = state.ConsumeFilled(0, 0, removed.unknown);
-  REXKRNL_DEBUG("XGISessionLeave: public={} private={} unknown={}", removed.public_members,
-                removed.private_members, removed.unknown);
+  REXKRNL_INFO("Live sessions: players left public={} private={} unknown={}",
+               removed.public_members, removed.private_members, removed.unknown);
   state.LeaveSession(removed.public_members + uncounted.first,
                      removed.private_members + uncounted.second);
   service.SessionChanged(state.session_snapshot(), Clock::now());

@@ -1024,14 +1024,14 @@ TEST_CASE("relay silence excludes worker pauses", "[kernel][relay_client]") {
   CHECK(silence.received() == t0 + 45s);
 }
 
-TEST_CASE("relay counter line logs only on a counter change and reports the largest gap",
+TEST_CASE("relay counter line logs faults at once and traffic every quiet interval",
           "[kernel][relay_client]") {
   using std::chrono::milliseconds;
   const auto t0 = CounterLog::Clock::time_point{} + 1000s;
   CounterLog log;
   Stats stats;
 
-  CHECK_FALSE(log.Line(stats));
+  CHECK_FALSE(log.Line(stats, t0));
 
   log.Arrival(t0);
   log.Arrival(t0 + milliseconds(40));
@@ -1039,7 +1039,7 @@ TEST_CASE("relay counter line logs only on a counter change and reports the larg
   log.Arrival(t0 + milliseconds(1300));
   stats.delivered = 7;
   stats.heartbeats = 15;
-  const auto first = log.Line(stats);
+  const auto first = log.Line(stats, t0 + 30s);
   REQUIRE(first);
   CHECK(
       first->starts_with("System Link relay counters: delivered=7 heartbeats=15 unknown_port=0 "));
@@ -1047,19 +1047,35 @@ TEST_CASE("relay counter line logs only on a counter change and reports the larg
 
   stats.heartbeats = 30;
   log.Arrival(t0 + milliseconds(4300));
-  CHECK_FALSE(log.Line(stats));
+  CHECK_FALSE(log.Line(stats, t0 + 60s));
 
+  // Traffic alone waits for the quiet interval after the last line.
+  stats.delivered = 90;
+  stats.direct_in = 4;
+  CHECK_FALSE(log.Line(stats, t0 + 90s));
+  CHECK_FALSE(log.Line(stats, t0 + 30s + CounterLog::kQuietInterval - 1s));
+  const auto quiet = log.Line(stats, t0 + 30s + CounterLog::kQuietInterval);
+  REQUIRE(quiet);
+  CHECK(quiet->find(" delivered=90 ") != std::string::npos);
+  CHECK(quiet->find(" direct_in=4 ") != std::string::npos);
+  CHECK(quiet->ends_with(" max_arrival_gap_ms=3000"));
+  CHECK_FALSE(log.Line(stats, t0 + 30s + 2 * CounterLog::kQuietInterval));
+
+  // A fault prints at the next interval, with the traffic that accrued since.
+  const auto fault_time = t0 + 60s + CounterLog::kQuietInterval;
+  stats.delivered = 95;
   stats.invalid_wire = 2;
   log.Arrival(t0 + milliseconds(4400));
-  const auto second = log.Line(stats);
+  const auto second = log.Line(stats, fault_time);
   REQUIRE(second);
+  CHECK(second->find(" delivered=95 ") != std::string::npos);
   CHECK(second->find(" invalid_wire=2 ") != std::string::npos);
   CHECK(second->find(" heartbeats=30 ") != std::string::npos);
-  CHECK(second->ends_with(" max_arrival_gap_ms=3000"));
+  CHECK(second->ends_with(" max_arrival_gap_ms=100"));
 
-  CHECK_FALSE(log.Line(stats));
+  CHECK_FALSE(log.Line(stats, fault_time + 30s));
   stats.socket_errors = 1;
-  const auto third = log.Line(stats);
+  const auto third = log.Line(stats, fault_time + 30s);
   REQUIRE(third);
   CHECK(third->ends_with(" max_arrival_gap_ms=0"));
 }

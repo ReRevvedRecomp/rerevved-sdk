@@ -514,6 +514,11 @@ uint32_t RelayStartup::Start(const Config& config, relay_link::Client& client,
       return disconnected("invalid player ID", "invalid player ID");
     }
   }
+  // The server address and room stay out of the default log; logs get posted publicly.
+  REXKRNL_INFO("Online: connected to the online server using {}",
+               config.join_token      ? "a Live invite"
+               : config.invite_secret ? "an invite code"
+                                      : "the server settings");
   REXKRNL_DEBUG("XNetStartup: relay virtual address={} references={}", address, references_);
   return 0;
 }
