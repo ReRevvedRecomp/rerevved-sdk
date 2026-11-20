@@ -15,6 +15,7 @@
 
 #include <filesystem>
 #include <span>
+#include <string_view>
 
 #include <rex/cvar.h>
 
@@ -26,6 +27,7 @@ REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
 REXCVAR_DECLARE(int32_t, log_max_file_size_mb);
 REXCVAR_DECLARE(int32_t, log_max_files);
+REXCVAR_DECLARE(bool, log_redact_user_folder);
 
 namespace rex {
 
@@ -55,6 +57,14 @@ namespace rex {
  * @param config  Logging configuration.
  */
 void InitLogging(const LogConfig& config);
+
+/**
+ * Set the text the crash report logs as "Crash context: <text>" before the
+ * exception, terminate or abort line, such as the build and the current phase.
+ * Text past 511 bytes is cut. Empty text logs no context line. Safe to call
+ * from any thread at any time, including before InitLogging.
+ */
+void SetCrashContext(std::string_view text);
 
 /**
  * Initialize logging with simple parameters (convenience overload).

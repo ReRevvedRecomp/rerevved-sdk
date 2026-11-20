@@ -138,6 +138,11 @@ debugger is attached, then logs its code, access address, faulting
 terminate on another Windows thread is logged only as an abort with its thread
 ID. Crash logging waits a bounded time, so a lock held by the failing thread or
 exhausted memory can lose the line but never hangs the exit.
+`rex::SetCrashContext(text)` sets a line, such as the build and current phase,
+that the crash report logs as `Crash context: <text>` before the failure line;
+it is safe from any thread and keeps the first 511 bytes. With
+`log_redact_user_folder` (default false, read at startup) the log file writes
+the user's home folder as `%USERPROFILE%`, or `~` outside Windows.
 `rex::LaunchFileExplorer` and `rex::LaunchWebBrowser` (`rex/system.h`) open the
 folder or URL in the desktop shell. A command cvar named exactly by a
 `SettingsLayout` tab source shows as a settings button that invokes it with no

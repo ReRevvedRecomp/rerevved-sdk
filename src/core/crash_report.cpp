@@ -11,10 +11,12 @@
 
 #include "crash_report.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <future>
 #include <memory>
@@ -56,6 +58,21 @@ struct CrashTargets {
 };
 std::atomic<const CrashTargets*> g_targets{nullptr};
 
+// Two buffers so a reader copies a complete text while a writer fills the other;
+// only a second write during that copy can tear it, and the last byte stays NUL.
+constexpr size_t kContextBytes = 512;
+char g_context[2][kContextBytes];
+std::atomic<int> g_context_active{-1};
+std::mutex g_context_writer;
+
+std::string CrashContextLine() {
+  const int active = g_context_active.load(std::memory_order_acquire);
+  if (active < 0) {
+    return {};
+  }
+  return std::string("Crash context: ") + g_context[active];
+}
+
 // Writes straight to the published sinks, so the crash path never reads the
 // logger registry. Only helper and reporter threads call this.
 void EmitCrashLine(std::string_view text) {
@@ -76,6 +93,14 @@ void EmitCrashLine(std::string_view text) {
   }
 }
 
+// Context goes first so the build and phase precede the failure line.
+void EmitCrashLines(std::string_view context, std::string_view text) {
+  if (!context.empty()) {
+    EmitCrashLine(context);
+  }
+  EmitCrashLine(text);
+}
+
 std::string CurrentExceptionText() {
   if (const auto exception = std::current_exception()) {
     try {
@@ -92,16 +117,18 @@ std::string CurrentExceptionText() {
 // Static so a detached helper that outlives the wait still reads live text.
 // Written once, by the first report, before its helper starts.
 std::string g_message;
+std::string g_context_message;
 
 // The failing thread may hold a sink mutex, so the line is written on a helper
 // thread with a bounded wait; a lost line is better than a hung exit.
 void EmitOnHelperThread(std::string message) {
+  g_context_message = CrashContextLine();
   g_message = std::move(message);
   try {
     auto done = std::make_shared<std::promise<void>>();
     std::future<void> finished = done->get_future();
     std::thread helper([done] {
-      EmitCrashLine(g_message);
+      EmitCrashLines(g_context_message, g_message);
       done->set_value();
     });
     finished.wait_for(std::chrono::seconds(5));
@@ -261,7 +288,7 @@ std::string WriteDumpIfWanted(const CrashReport& report) {
 void WriteReport(const CrashReport& report) {
   try {
     const std::string outcome = WriteDumpIfWanted(report);
-    EmitCrashLine(CrashLine(report));
+    EmitCrashLines(CrashContextLine(), CrashLine(report));
     if (!outcome.empty()) {
       EmitCrashLine(outcome);
     }
@@ -336,6 +363,19 @@ void InstallCrashReport(const std::filesystem::path& log_path,
     std::signal(SIGABRT, OnAbortSignal);
 #endif
   });
+}
+
+void SetCrashContextText(std::string_view text) {
+  std::lock_guard lock(g_context_writer);
+  if (text.empty()) {
+    g_context_active.store(-1, std::memory_order_release);
+    return;
+  }
+  const int next = g_context_active.load(std::memory_order_relaxed) == 0 ? 1 : 0;
+  const size_t size = std::min(text.size(), kContextBytes - 1);
+  std::memcpy(g_context[next], text.data(), size);
+  g_context[next][size] = ' ';
+  g_context_active.store(next, std::memory_order_release);
 }
 
 void ClearCrashReportTargets() {
