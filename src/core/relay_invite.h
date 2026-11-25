@@ -35,7 +35,6 @@ Result<Invite> DecodeInvite(std::string_view code);
 // detects overflow, so storage must be one byte larger than the accepted limit.
 Result<size_t> ReadSecretFile(const std::filesystem::path& path, std::span<char> storage);
 
-// Creates an invite without resolving its host.
 Result<std::string> MakeInvite(std::string_view address, const std::filesystem::path& secret_file,
                                std::string_view room = "testers", bool create_secret = false,
                                Result<Digest> (*random_source)() = RandomSeed);

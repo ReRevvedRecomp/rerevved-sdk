@@ -17,8 +17,7 @@ struct Config {
   std::string address;
   std::string room;
   std::string secret_file;
-  // Valid system_link_advertised_address, or empty. Only invites sent to other
-  // players use it; this instance always connects to `address`.
+  // Only invites to other players use it; this instance connects to `address`.
   std::string advertised_address;
   std::shared_ptr<const relay_link::Secret> invite_secret;
   // From live_invite: joins the token's room instead of a room and secret.
@@ -43,18 +42,15 @@ bool ValidProfileName(std::string_view name);
 std::string InviteRelayAddress(const Config& config);
 Config CurrentConfig();
 Mode CurrentMode();
-// True when live_sessions is set in a valid relay configuration.
 bool LiveSessionsActive();
-// Called before guest threads start. Repeated calls retain the first snapshot.
+// Called before guest threads start; repeated calls keep the first snapshot.
 void FreezeConfig(const std::filesystem::path& config_path, RandomSource random);
 void Initialize(const std::filesystem::path& config_path);
 std::string Status();
 std::string RelayStatus(const relay_link::Stats& stats);
 void SetStartupFailure(std::string reason);
 Result<relay_link::Secret> ReadSecret(const Config& config);
-// A fresh copy of the configured join token, or nullopt without one.
 std::optional<relay_link::JoinToken> CopyJoinToken(const Config& config);
-// Status reason for a token join the relay rejected.
 inline constexpr std::string_view kInviteExpired = "invite expired; ask for a new invite";
 
 // XNetStartup and XNetCleanup references in relay mode. Callers serialize.

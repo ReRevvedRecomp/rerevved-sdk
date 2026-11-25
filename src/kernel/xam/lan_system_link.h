@@ -175,7 +175,6 @@ class LanSystemLinkState {
 // broadcasts there. Returns true only when this call performed the bind.
 bool BindUnboundToLocalAddress(rex::system::XSocket& socket, uint32_t local_ipv4);
 
-// The process-wide LAN state used by the XNet exports.
 LanSystemLinkState& SystemLinkState();
 
 // Enabled LAN host creates with local address, kSessionCreateHost, and

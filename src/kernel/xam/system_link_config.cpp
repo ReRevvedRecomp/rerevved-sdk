@@ -59,7 +59,6 @@ int32_t& DirectDropAfter() {
   static int32_t seconds = 0;
   return seconds;
 }
-// Trims ASCII whitespace and one pair of matching quotes from pasted text.
 std::string_view TrimPasted(std::string_view value) {
   const auto first = value.find_first_not_of(" \t\r\n\f\v");
   value = first == std::string_view::npos
