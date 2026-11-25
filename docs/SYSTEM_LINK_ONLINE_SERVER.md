@@ -82,6 +82,36 @@ sleeps on its socket for up to 100 ms between packets. It logs one line when
 it starts listening and one when it stops; the status and problem lines below
 belong to the command.
 
+## Router port
+
+`rex/port_mapping.h` asks the home router to forward an outside UDP port to
+the server, so a host needs no router setup. `Open` starts a host thread and
+returns at once; `Current` reports the state, and while the port is open the
+public IPv4 address and outside port to put in an invite. `Close` removes
+the mapping and can wait a few seconds for the router. Nothing is sent before
+`Open`.
+
+The thread tries UPnP first, on Windows only, through the system's
+`IUPnPNAT`. It takes the first of ten outside ports from the server's port
+that no other mapping holds; a mapping with the same label that points at
+this computer counts as its own. It then tries NAT-PMP (RFC 6886) on the
+default gateway, UDP port 5351, with a lifetime of one hour renewed at half
+that; a failed renewal is asked again until the lifetime runs out. On Linux
+the gateway comes from `/proc/net/route`; on macOS no gateway is looked up,
+so the port is never opened there.
+
+| Failure | Meaning |
+|---|---|
+| `kNoNetwork` | No network connection with a default gateway. |
+| `kNoDiscovery` | The Windows service SSDP Discovery is disabled. |
+| `kNoRouter` | Nothing answered UPnP or NAT-PMP. `public_network` is set when a connected Windows network is Public, which hides the router from UPnP. |
+| `kPortsTaken` | Other mappings hold all ten outside ports. |
+| `kSharedAddress` | The router's outside address is private or shared by the provider, so a mapping cannot be reached; the mapping is removed. |
+| `kRefused` | The router answered and refused, or stopped renewing. |
+
+The log names the method, the ports and the failure, never the outside
+address.
+
 ## Server logs
 
 At startup the server logs its bind address, UDP port, room limit and member
