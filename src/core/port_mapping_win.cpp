@@ -77,7 +77,7 @@ void FindMappings(Com<IStaticPortMappingCollection>& mappings, const std::atomic
     if (SUCCEEDED(nat->get_StaticPortMappingCollection(&mappings.object)) && mappings)
       return;
     mappings.object = nullptr;
-    if (!stop || attempt == 2)
+    if (attempt == 2)
       return;
     for (int slice = 0; slice < 20; ++slice) {
       if (stop->load())
@@ -114,8 +114,12 @@ UpnpResult UpnpOpen(const Route& route, const Options& options, const std::atomi
   for (;;) {
     VARIANT item;
     VariantInit(&item);
-    if (items->Next(1, &item, nullptr) != S_OK)
+    const HRESULT next = items->Next(1, &item, nullptr);
+    if (next == S_FALSE)
       break;
+    // An incomplete list could hide a port that is taken.
+    if (next != S_OK)
+      return result;
     Com<IStaticPortMapping> mapping;
     if (item.vt == VT_DISPATCH && item.pdispVal)
       item.pdispVal->QueryInterface(__uuidof(IStaticPortMapping),
@@ -171,7 +175,8 @@ void UpnpClose(uint16_t outside_port) {
   if (!apartment.entered)
     return;
   Com<IStaticPortMappingCollection> mappings;
-  FindMappings(mappings, nullptr);
+  const std::atomic<bool> never{false};
+  FindMappings(mappings, &never);
   if (mappings)
     mappings->Remove(outside_port, Text(L"UDP").text);
 }

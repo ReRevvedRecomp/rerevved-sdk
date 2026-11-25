@@ -7,10 +7,12 @@
 #include <future>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include <spdlog/sinks/ostream_sink.h>
 #include <toml++/toml.hpp>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/online_host.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xtypes.h>
@@ -704,4 +706,220 @@ TEST_CASE("system_link unreachable relay startup succeeds without a network",
   CHECK(client.stats().dropped_after_cleanup == 1);
   CHECK(startup.Cleanup(client).has_value());
   CHECK(startup.references() == 0);
+}
+
+namespace {
+// Records what online_host starts instead of opening a socket or asking a router.
+struct HostFixture : Fixture {
+  std::vector<rex::online_server::Options> servers;
+  std::vector<rex::port_mapping::Options> mappings;
+  rex::VoidResult start_result;
+  int stops = 0;
+  rex::relay::Digest seed{0xCD, 0xAB, 2, 3, 4, 5};
+  bool random_fails = false;
+  std::filesystem::path password_file = directory / "online-server" / "server-password.txt";
+  ~HostFixture() {
+    std::error_code error;
+    std::filesystem::remove(password_file, error);
+    std::filesystem::remove(password_file.parent_path(), error);
+  }
+  void FreezeHosting() {
+    HostServices services;
+    services.start_server = [this](const rex::online_server::Options& options) {
+      servers.push_back(options);
+      return start_result;
+    };
+    services.stop_server = [this] { ++stops; };
+    services.open_port = [this](const rex::port_mapping::Options& options) {
+      mappings.push_back(options);
+      return rex::VoidResult{};
+    };
+    FreezeConfig(
+        path,
+        [this]() -> rex::Result<rex::relay::Digest> {
+          if (random_fails)
+            return std::unexpected(rex::Error{rex::ErrorCategory::Runtime, "no random"});
+          return seed;
+        },
+        services);
+  }
+};
+}  // namespace
+
+TEST_CASE("online_host starts the server, joins it and advertises the router port",
+          "[system_link][online_host]") {
+  HostFixture f;
+  CHECK_FALSE(SetAdvertisedAddress("203.0.113.7:41234"));  // nothing is frozen yet
+  f.Set("online_host", "true");
+  f.Set("online_host_port", "30555");
+  f.Set("system_link_invite", "RXR1-ABCDEFGH");  // ignored for this launch
+  f.Lan();
+  f.FreezeHosting();
+
+  auto config = CurrentConfig();
+  CHECK(config.error.empty());
+  CHECK(config.mode == Mode::kRelay);
+  CHECK(config.hosting);
+  CHECK_FALSE(config.lan_enabled);
+  CHECK(config.address == "127.0.0.1:30555");
+  CHECK(config.room == "testers");
+  CHECK(config.xuid != 0);
+  const auto password = rex::relay::ReadPassword(f.password_file);
+  REQUIRE(password);
+  CHECK(password->size() == 32);
+  REQUIRE(config.invite_secret);
+  CHECK(config.invite_secret->view() == *password);
+  REQUIRE(f.servers.size() == 1);
+  CHECK(f.servers[0].port == 30555);
+  CHECK(f.servers[0].password_file == f.password_file);
+  REQUIRE(f.mappings.size() == 1);
+  CHECK(f.mappings[0].port == 30555);
+  REQUIRE(f.mappings[0].changed);
+
+  // No address for friends until the router answers.
+  CHECK(InviteRelayAddress(config).empty());
+  auto status = rex::online_host::Current();
+  CHECK(status.hosting);
+  CHECK(status.error.empty());
+  CHECK(status.address.empty());
+  CHECK(status.friends_code.empty());
+
+  using rex::port_mapping::Failure;
+  using rex::port_mapping::State;
+  f.mappings[0].changed({State::kOpen, Failure::kNone, "203.0.113.7", 41234, false});
+  CHECK(InviteRelayAddress(CurrentConfig()) == "203.0.113.7:41234");
+  CHECK(CurrentConfig().address == "127.0.0.1:30555");
+  status = rex::online_host::Current();
+  CHECK(status.address == "203.0.113.7:41234");
+  const auto invite = rex::relay::DecodeInvite(status.friends_code);
+  REQUIRE(invite);
+  CHECK(invite->address.host == "203.0.113.7");
+  CHECK(invite->address.port == 41234);
+  CHECK(invite->room == "testers");
+  CHECK(invite->SecretView() == *password);
+
+  f.mappings[0].changed({State::kFailed, Failure::kRefused, {}, 0, false});
+  CHECK(InviteRelayAddress(CurrentConfig()).empty());
+  CHECK(rex::online_host::Current().friends_code.empty());
+
+  CHECK_FALSE(SetAdvertisedAddress("not an address"));
+  CHECK(SetAdvertisedAddress("example.net:30100"));
+  CHECK(InviteRelayAddress(CurrentConfig()) == "example.net:30100");
+}
+
+TEST_CASE("online_host keeps the same password on the next launch", "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  f.FreezeHosting();
+  const auto first = rex::relay::ReadPassword(f.password_file);
+  REQUIRE(first);
+  testing::ResetSnapshot();
+  f.FreezeHosting();
+  const auto second = rex::relay::ReadPassword(f.password_file);
+  REQUIRE(second);
+  CHECK(*first == *second);
+  REQUIRE(f.servers.size() == 2);
+  CHECK(f.servers[1].port == 30100);
+}
+
+TEST_CASE("online_host reports a server that cannot start", "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  f.start_result = rex::Err(rex::ErrorCategory::IO, "UDP bind failed");
+  f.FreezeHosting();
+  const auto config = CurrentConfig();
+  CHECK(config.hosting);
+  CHECK(config.error == "could not start the online server: UDP bind failed");
+  CHECK(f.mappings.empty());
+  CHECK(f.stops == 0);
+  CHECK(Status() == "Online failed: could not start the online server: UDP bind failed");
+  const auto status = rex::online_host::Current();
+  CHECK(status.hosting);
+  CHECK(status.error == config.error);
+  CHECK(status.friends_code.empty());
+}
+
+TEST_CASE("online_host leaves the router alone with a configured advertised address",
+          "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  f.Set("system_link_advertised_address", "example.net:41000");
+  f.FreezeHosting();
+  CHECK(CurrentConfig().error.empty());
+  CHECK(f.servers.size() == 1);
+  CHECK(f.mappings.empty());
+  CHECK(InviteRelayAddress(CurrentConfig()) == "example.net:41000");
+  CHECK(rex::online_host::Current().address == "example.net:41000");
+}
+
+TEST_CASE("nothing is hosted without online_host", "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host_port", "30555");
+  SECTION("off") {}
+  SECTION("lan") {
+    f.Lan();
+  }
+  f.FreezeHosting();
+  CHECK(f.servers.empty());
+  CHECK(f.mappings.empty());
+  CHECK_FALSE(CurrentConfig().hosting);
+  CHECK_FALSE(std::filesystem::exists(f.password_file.parent_path()));
+  CHECK_FALSE(rex::online_host::Current().hosting);
+  StopHosting();  // does nothing
+  CHECK_FALSE(rex::cvar::SetFlagByName("online_host_port", "0"));
+  CHECK_FALSE(rex::cvar::SetFlagByName("online_host_port", "65536"));
+}
+
+TEST_CASE("online_host stops its server when the configuration is rejected",
+          "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  f.random_fails = true;  // no player identity can be created
+  f.FreezeHosting();
+  CHECK(CurrentConfig().error == "could not create player identity");
+  CHECK(f.servers.size() == 1);
+  CHECK(f.stops == 1);
+  CHECK(f.mappings.empty());
+  CHECK(rex::online_host::Current().friends_code.empty());
+}
+
+TEST_CASE("online_host leaves the router alone with a rejected advertised address",
+          "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  // Valid in an invite code, too long for a Live invite.
+  f.Set("system_link_advertised_address", "a-rather-long-host-name.example.net:41000");
+  f.FreezeHosting();
+  CHECK(CurrentConfig().error.empty());
+  CHECK(f.servers.size() == 1);
+  CHECK(f.stops == 0);
+  CHECK(f.mappings.empty());
+  CHECK(InviteRelayAddress(CurrentConfig()).empty());
+}
+
+TEST_CASE("a configuration file cannot turn hosting on", "[system_link][online_host]") {
+  HostFixture f;
+  {
+    std::ofstream config(f.path);
+    config << "online_host = true\n";
+  }
+  rex::cvar::LoadConfig(f.path);
+  f.FreezeHosting();
+  CHECK_FALSE(CurrentConfig().hosting);
+  CHECK(f.servers.empty());
+}
+
+TEST_CASE("the friends' code comes from the password the server started with",
+          "[system_link][online_host]") {
+  HostFixture f;
+  f.Set("online_host", "true");
+  f.Set("system_link_advertised_address", "example.net:41000");
+  f.FreezeHosting();
+  const auto password = rex::relay::ReadPassword(f.password_file);
+  REQUIRE(password);
+  std::filesystem::remove(f.password_file);
+  const auto invite = rex::relay::DecodeInvite(rex::online_host::Current().friends_code);
+  REQUIRE(invite);
+  CHECK(invite->SecretView() == *password);
+  CHECK_FALSE(std::filesystem::exists(f.password_file));
 }

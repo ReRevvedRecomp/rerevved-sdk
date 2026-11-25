@@ -8,6 +8,9 @@
 #include <optional>
 #include <span>
 
+#include <rex/online_server.h>
+#include <rex/port_mapping.h>
+
 namespace rex::kernel::xam::system_link {
 
 enum class Mode { kOff, kLan, kRelay };
@@ -33,18 +36,36 @@ struct Config {
   bool direct = false;
   // Developer fault injection, never persisted; see relay_link::DirectOptions.
   uint32_t direct_drop_after = 0;
+  // From online_host: this process runs the server `address` names.
+  bool hosting = false;
+  std::filesystem::path host_password_file;
   std::string error;
+};
+// What online_host starts. Tests replace it.
+struct HostServices {
+  std::function<VoidResult(const online_server::Options&)> start_server = online_server::Start;
+  std::function<void()> stop_server = online_server::Stop;
+  std::function<VoidResult(const port_mapping::Options&)> open_port = port_mapping::Open;
 };
 using RandomSource = std::function<Result<relay::Digest>()>;
 
 bool ValidProfileName(std::string_view name);
-// The relay address to tell other players: the advertised one when set.
+// The relay address to tell other players: the advertised one when set. A
+// host has none until its router port is open or an address was configured.
 std::string InviteRelayAddress(const Config& config);
+// Replaces the advertised address after the freeze; empty clears it. False,
+// changing nothing, before the freeze or for an address that
+// system_link_advertised_address would not accept.
+bool SetAdvertisedAddress(std::string_view address);
 Config CurrentConfig();
 Mode CurrentMode();
 bool LiveSessionsActive();
 // Called before guest threads start; repeated calls keep the first snapshot.
-void FreezeConfig(const std::filesystem::path& config_path, RandomSource random);
+// With online_host set it also starts hosting.
+void FreezeConfig(const std::filesystem::path& config_path, RandomSource random,
+                  const HostServices& host = {});
+void StopHosting();
+bool HostAskedForPort();
 void Initialize(const std::filesystem::path& config_path);
 std::string Status();
 std::string RelayStatus(const relay_link::Stats& stats);

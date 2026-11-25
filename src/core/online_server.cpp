@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -51,7 +52,7 @@ std::unique_ptr<Server> server;  // guarded by mutex
 
 Result<std::string> MakeInvite(std::string_view address,
                                const std::filesystem::path& password_file) {
-  return relay::MakeInvite(address, password_file, "testers", true);
+  return relay::MakeInvite(address, password_file, kRoom, true);
 }
 
 VoidResult Start(const Options& options) {
@@ -77,7 +78,11 @@ VoidResult Start(const Options& options) {
   }
   starting->socket = std::move(*socket);
   const auto port = starting->socket->endpoint().port;
-  starting->worker = std::thread([state = starting.get()] { state->Serve(); });
+  try {
+    starting->worker = std::thread([state = starting.get()] { state->Serve(); });
+  } catch (const std::system_error&) {
+    return Err(ErrorCategory::Runtime, "The online server thread could not start");
+  }
   server = std::move(starting);
   REXLOG_INFO("Online server listening on {}:{} (up to {} players)", options.bind_address, port,
               options.max_members);
@@ -85,14 +90,12 @@ VoidResult Start(const Options& options) {
 }
 
 void Stop() {
-  std::unique_ptr<Server> stopping;
-  {
-    std::lock_guard lock(mutex);
-    stopping = std::move(server);
-  }
-  if (!stopping)
+  // Held until the thread has ended and the port is closed, so a Start on
+  // another thread cannot run a second server meanwhile.
+  std::lock_guard lock(mutex);
+  if (!server)
     return;
-  stopping.reset();
+  server.reset();
   REXLOG_INFO("Online server stopped");
 }
 

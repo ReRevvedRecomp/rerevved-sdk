@@ -9,6 +9,7 @@
 #include <rex/online_server.h>
 
 #include "core/relay_invite.h"
+#include "core/relay_transport.h"
 #include "kernel/xam/relay_system_link.h"
 
 #if defined(_WIN32)
@@ -48,6 +49,14 @@ online_server::Options LoopbackOptions(const std::filesystem::path& password_fil
   options.password_file = password_file;
   return options;
 }
+// A start may fail only because this machine has no loopback UDP.
+bool LoopbackAvailable() {
+  return rex::relay::UdpSocket::Open("127.0.0.1", 0).has_value();
+}
+// Stops the server when a test case ends, also after a failed REQUIRE.
+struct StopAtExit {
+  ~StopAtExit() { online_server::Stop(); }
+};
 uint32_t WaitForPlayers(uint32_t expected) {
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (online_server::Current().players != expected &&
@@ -64,13 +73,14 @@ TEST_CASE("the in-process online server admits a player, stops and starts again"
     std::ofstream out(password.file, std::ios::binary);
     out << "  a-password-of-twenty\r\n";
   }
+  if (!LoopbackAvailable())
+    SKIP("Loopback UDP socket unavailable");
+  StopAtExit stop;
   CHECK_FALSE(online_server::Current().running);
   online_server::Stop();  // Stopping with nothing running does nothing.
 
   for (int round = 0; round < 2; ++round) {
-    const auto started = online_server::Start(LoopbackOptions(password.file));
-    if (!started)
-      SKIP("Loopback UDP socket unavailable");
+    REQUIRE(online_server::Start(LoopbackOptions(password.file)));
     const auto status = online_server::Current();
     REQUIRE(status.running);
     REQUIRE(status.port != 0);
@@ -117,9 +127,10 @@ TEST_CASE("an invite code made in process joins the in-process server",
   CHECK(local->address.port == 30101);
   CHECK(local->SecretView() == decoded->SecretView());
 
-  const auto started = online_server::Start(LoopbackOptions(password.file));
-  if (!started)
+  if (!LoopbackAvailable())
     SKIP("Loopback UDP socket unavailable");
+  StopAtExit stop;
+  REQUIRE(online_server::Start(LoopbackOptions(password.file)));
   const rex::relay::Endpoint endpoint{htonl(INADDR_LOOPBACK), online_server::Current().port};
   relay_link::Client player;
   CHECK(player.Start(endpoint, decoded->room, relay_link::Secret(decoded->SecretView()), {}));

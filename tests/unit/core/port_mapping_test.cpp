@@ -30,8 +30,10 @@ uint32_t Address(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 struct FakeGateway {
   struct Behavior {
     std::array<uint8_t, 4> address{203, 0, 113, 7};
-    uint16_t result = 0;        // NAT-PMP result code; 0 is success
-    uint16_t granted_port = 0;  // 0 grants the port asked for
+    uint16_t result = 0;             // NAT-PMP result code; 0 is success
+    uint16_t granted_port = 0;       // 0 grants the port asked for
+    uint8_t granted_lifetime = 0;    // seconds; 0 grants the lifetime asked for
+    bool silent_to_mapping = false;  // answers the address request only
     bool silent = false;
   };
   explicit FakeGateway(Behavior behavior) : behavior_(behavior) {
@@ -86,6 +88,8 @@ struct FakeGateway {
                          1};
       if (request[1] == 0) {
         reply.insert(reply.end(), behavior_.address.begin(), behavior_.address.end());
+      } else if (request.size() == 12 && behavior_.silent_to_mapping) {
+        continue;
       } else if (request.size() == 12) {
         const bool removal = !request[8] && !request[9] && !request[10] && !request[11];
         const uint16_t asked = static_cast<uint16_t>((request[6] << 8) | request[7]);
@@ -94,6 +98,10 @@ struct FakeGateway {
         reply.insert(reply.end(), {request[4], request[5], static_cast<uint8_t>(outside >> 8),
                                    static_cast<uint8_t>(outside), request[8], request[9],
                                    request[10], request[11]});
+        if (!removal && behavior_.granted_lifetime) {
+          reply[12] = reply[13] = reply[14] = 0;
+          reply[15] = behavior_.granted_lifetime;
+        }
       }
       (void)socket_->Send({(*received)->endpoint, reply});
     }
@@ -113,6 +121,12 @@ internal::Environment EnvironmentFor(const FakeGateway& gateway) {
   environment.find_route = [route = gateway.route()] { return std::optional(route); };
   environment.nat_pmp_port = gateway.endpoint().port;
   return environment;
+}
+
+port_mapping::Options Port(uint16_t port) {
+  port_mapping::Options options;
+  options.port = port;
+  return options;
 }
 
 port_mapping::Status WaitWhileOpening() {
@@ -153,10 +167,11 @@ TEST_CASE("NAT-PMP opens the port the router grants", "[port_mapping][network]")
     FakeGateway gateway({.granted_port = 41234});
     if (!gateway.ready())
       SKIP("Loopback UDP socket unavailable");
-    const auto grant = internal::NatPmpOpen(gateway.endpoint(), 30100, 30100, 3600, stop);
-    REQUIRE(grant);
-    CHECK(grant->address == Address(203, 0, 113, 7));
-    CHECK(grant->port == 41234);
+    const auto result = internal::NatPmpOpen(gateway.endpoint(), 30100, 30100, 3600, stop);
+    REQUIRE(result.outcome == internal::NatPmpOutcome::kGranted);
+    CHECK(result.grant.address == Address(203, 0, 113, 7));
+    CHECK(result.grant.port == 41234);
+    CHECK(result.grant.lifetime == 3600);
     CHECK(gateway.Count(false) == 1);
     internal::NatPmpClose(gateway.endpoint(), 30100);
     CHECK(gateway.Count(true) == 1);
@@ -165,13 +180,17 @@ TEST_CASE("NAT-PMP opens the port the router grants", "[port_mapping][network]")
     // Result code 2: not authorized.
     FakeGateway refusing({.result = 2});
     REQUIRE(refusing.ready());
-    CHECK_FALSE(internal::NatPmpOpen(refusing.endpoint(), 30100, 30100, 3600, stop));
+    const auto result = internal::NatPmpOpen(refusing.endpoint(), 30100, 30100, 3600, stop);
+    CHECK(result.outcome == internal::NatPmpOutcome::kRefused);
+    CHECK_FALSE(result.port_asked);
   }
   {
     // A router without NAT-PMP does not answer.
     FakeGateway silent({.silent = true});
     REQUIRE(silent.ready());
-    CHECK_FALSE(internal::NatPmpOpen(silent.endpoint(), 30100, 30100, 3600, stop));
+    const auto result = internal::NatPmpOpen(silent.endpoint(), 30100, 30100, 3600, stop);
+    CHECK(result.outcome == internal::NatPmpOutcome::kSilent);
+    CHECK_FALSE(result.port_asked);
   }
 }
 
@@ -179,15 +198,15 @@ TEST_CASE("a router port opens, renews and is removed on close", "[port_mapping]
   CHECK(port_mapping::Current().state == port_mapping::State::kClosed);
   port_mapping::Close();  // Closing with nothing open does nothing.
 
-  FakeGateway gateway({.granted_port = 41234});
+  // The router grants two seconds of the hour asked for: renewed after one.
+  FakeGateway gateway({.granted_port = 41234, .granted_lifetime = 2});
   if (!gateway.ready())
     SKIP("Loopback UDP socket unavailable");
   auto environment = EnvironmentFor(gateway);
-  environment.nat_pmp_lifetime = 2;  // renewed after one second
-  CHECK_FALSE(internal::OpenWith(environment, {.port = 0}));
-  REQUIRE(internal::OpenWith(environment, {.port = 30100}));
+  CHECK_FALSE(internal::OpenWith(environment, Port(0)));
+  REQUIRE(internal::OpenWith(environment, Port(30100)));
   // One mapping per process.
-  CHECK_FALSE(internal::OpenWith(environment, {.port = 30101}));
+  CHECK_FALSE(internal::OpenWith(environment, Port(30101)));
 
   const auto status = WaitWhileOpening();
   CHECK(status.state == port_mapping::State::kOpen);
@@ -212,17 +231,17 @@ TEST_CASE("a router port reports why it could not be opened", "[port_mapping][ne
   none.find_route = [] { return std::optional<internal::Route>(); };
   CHECK(FailWith(none).failure == Failure::kNoNetwork);
 
-  // A refusal fails at once; a silent router would cost two seconds a case.
   FakeGateway refusing({.result = 2});
   if (!refusing.ready())
     SKIP("Loopback UDP socket unavailable");
-  auto environment = EnvironmentFor(refusing);
-  auto status = FailWith(environment);
-  CHECK(status.failure == Failure::kNoRouter);
-  CHECK_FALSE(status.public_network);
+  CHECK(FailWith(EnvironmentFor(refusing)).failure == Failure::kRefused);
 
+  // A router without NAT-PMP stays silent, which takes about two seconds a case.
+  FakeGateway silent({.silent = true});
+  REQUIRE(silent.ready());
+  auto environment = EnvironmentFor(silent);
   environment.public_network = [] { return true; };
-  status = FailWith(environment);
+  auto status = FailWith(environment);
   CHECK(status.failure == Failure::kNoRouter);
   CHECK(status.public_network);
 
@@ -230,6 +249,13 @@ TEST_CASE("a router port reports why it could not be opened", "[port_mapping][ne
   status = FailWith(environment);
   CHECK(status.failure == Failure::kNoDiscovery);
   CHECK_FALSE(status.public_network);
+
+  // A lost reply may have left a mapping, so it is removed.
+  FakeGateway lossy({.silent_to_mapping = true});
+  REQUIRE(lossy.ready());
+  CHECK(FailWith(EnvironmentFor(lossy)).failure == Failure::kNoRouter);
+  CHECK(lossy.Count(false) >= 1);
+  CHECK(lossy.Count(true) >= 1);
 
   // UPnP names the cause when it found the router.
   environment = EnvironmentFor(refusing);
@@ -260,7 +286,7 @@ TEST_CASE("a UPnP mapping wins over NAT-PMP and is removed on close", "[port_map
         {Address(198, 51, 100, 9), static_cast<uint16_t>(options.port + 1)}};
   };
   environment.upnp_close = [&closed_port](uint16_t port) { closed_port.store(port); };
-  REQUIRE(internal::OpenWith(environment, {.port = 30100}));
+  REQUIRE(internal::OpenWith(environment, Port(30100)));
   const auto status = WaitWhileOpening();
   CHECK(status.state == port_mapping::State::kOpen);
   CHECK(status.address == "198.51.100.9");
@@ -294,4 +320,21 @@ TEST_CASE("the system lookups behind a router port answer without touching the r
   const bool public_network = environment.public_network && environment.public_network();
   CAPTURE(found, has_local, gateway_private, discovery_disabled, public_network);
   SUCCEED();
+}
+
+TEST_CASE("a router port can be asked for again after a failure", "[port_mapping][network]") {
+  internal::Environment none;
+  none.find_route = [] { return std::optional<internal::Route>(); };
+  REQUIRE(internal::OpenWith(none, Port(30100)));
+  CHECK(WaitWhileOpening().state == port_mapping::State::kFailed);
+
+  FakeGateway gateway;
+  if (!gateway.ready()) {
+    port_mapping::Close();
+    SKIP("Loopback UDP socket unavailable");
+  }
+  REQUIRE(internal::OpenWith(EnvironmentFor(gateway), Port(30100)));
+  CHECK(WaitWhileOpening().state == port_mapping::State::kOpen);
+  port_mapping::Close();
+  CHECK(gateway.Count(true) == 1);
 }

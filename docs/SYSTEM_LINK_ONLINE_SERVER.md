@@ -112,6 +112,36 @@ so the port is never opened there.
 The log names the method, the ports and the failure, never the outside
 address.
 
+## Hosting from the game
+
+`online_host` (Advanced, Boolean, restart required) makes one launch host,
+for example `--online_host=true` on the command line; a title relaunches
+itself with it. It is session-only: never written to configuration and not
+settable from it. As startup settings freeze, the game:
+
+1. Reads the password in `online-server/server-password.txt` beside the
+   configuration file, creating it on the first launch that hosts.
+2. Starts the in-process server on `online_host_port` (default 30100, saved in
+   configuration). A port in use becomes the `system_link_status` failure.
+3. Selects relay mode joined to `127.0.0.1` on that port with room `testers`
+   and that password. This takes precedence for the session over
+   `live_invite`, `system_link_invite`, explicit relay settings and LAN, whose
+   saved values stay.
+4. Asks the router for the port in the background. When it opens, the public
+   address and outside port become the advertised address that host invites
+   carry; until then, and after a failure, the game hands out no host invite.
+   With `system_link_advertised_address` set, that address is used and the
+   router is left alone.
+
+Any configuration error at the freeze stops the server again and skips the
+router.
+
+`rex/online_host.h` reports this to the title: whether the launch hosts, why
+the server did not start, the router port's state and failure, the address
+friends reach and the invite code for it. The application stops the server
+and removes the router port when it closes. Without `online_host` no server
+thread, socket or router request exists.
+
 ## Server logs
 
 At startup the server logs its bind address, UDP port, room limit and member

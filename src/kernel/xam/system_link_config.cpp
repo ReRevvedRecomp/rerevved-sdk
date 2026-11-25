@@ -6,6 +6,7 @@
 #include <charconv>
 #include <mutex>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -13,6 +14,7 @@
 #include <toml++/toml.hpp>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/online_host.h>
 #include <rex/system/xtypes.h>
 
 #include "../../core/live_invite.h"
@@ -25,6 +27,10 @@ std::shared_ptr<const Config> snapshot;
 // -1 retains live-cvar behavior for hosts that do not initialize a snapshot.
 std::atomic<int> frozen_mode{-1};
 std::mutex initialization;
+// True while the server that online_host started runs. Guarded by initialization.
+bool host_started = false;
+// True when online_host asked for the router port. Guarded by initialization.
+bool host_port_asked = false;
 // Writers hold both locks; readers take only this one, which never nests the
 // cvar registry mutex that status getters run under.
 std::mutex snapshot_mutex;
@@ -58,6 +64,14 @@ bool& Direct() {
 int32_t& DirectDropAfter() {
   static int32_t seconds = 0;
   return seconds;
+}
+bool& HostRequested() {
+  static bool requested = false;
+  return requested;
+}
+int32_t& HostPort() {
+  static int32_t port = 30100;
+  return port;
 }
 std::string_view TrimPasted(std::string_view value) {
   const auto first = value.find_first_not_of(" \t\r\n\f\v");
@@ -208,6 +222,38 @@ FlagRegistrar direct_drop_flag(
      .default_value = "0",
      .audience = Audience::kDeveloper,
      .persistence = Persistence::kSessionOnly});
+FlagRegistrar host_flag(
+    {.name = "online_host",
+     .type = FlagType::Boolean,
+     .category = "Online",
+     .description = "Host an online game on this computer, for this session only",
+     .setter = [](std::string_view value) { return ParseBool(value, HostRequested()); },
+     .getter = [] { return HostRequested() ? "true" : "false"; },
+     .lifecycle = Lifecycle::kRequiresRestart,
+     .default_value = "false",
+     .audience = Audience::kAdvanced,
+     // A configuration file cannot turn hosting on.
+     .persistence = Persistence::kSessionOnly});
+FlagRegistrar host_port_flag(
+    {.name = "online_host_port",
+     .type = FlagType::Int32,
+     .category = "Online",
+     .description = "UDP port the online server listens on when this computer hosts",
+     .setter =
+         [](std::string_view value) {
+           int32_t port = 0;
+           const auto parsed = std::from_chars(value.data(), value.data() + value.size(), port);
+           if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || port < 1 ||
+               port > 65535)
+             return false;
+           HostPort() = port;
+           return true;
+         },
+     .getter = [] { return std::to_string(HostPort()); },
+     .lifecycle = Lifecycle::kRequiresRestart,
+     .default_value = "30100",
+     .audience = Audience::kAdvanced,
+     .persistence = Persistence::kConfig});
 FlagRegistrar status_flag({.name = "system_link_status",
                            .type = FlagType::String,
                            .category = "Online",
@@ -263,7 +309,23 @@ bool ValidProfileName(std::string_view name) {
   });
 }
 std::string InviteRelayAddress(const Config& config) {
+  // A host connects to itself over loopback, which is no use to anyone else.
+  if (config.hosting && config.advertised_address.empty())
+    return {};
   return config.advertised_address.empty() ? config.address : config.advertised_address;
+}
+bool SetAdvertisedAddress(std::string_view address) {
+  if (!address.empty() && !ValidAdvertisedAddress(address))
+    return false;
+  std::lock_guard lock(initialization);
+  if (!snapshot)
+    return false;
+  Config changed = *snapshot;
+  changed.advertised_address = address;
+  auto next = std::make_shared<const Config>(std::move(changed));
+  std::lock_guard publish(snapshot_mutex);
+  snapshot = std::move(next);
+  return true;
 }
 Config CurrentConfig() {
   std::shared_ptr<const Config> frozen;
@@ -283,7 +345,8 @@ bool LiveSessionsActive() {
   return config.live_sessions && config.mode == Mode::kRelay && config.error.empty();
 }
 
-void FreezeConfig(const std::filesystem::path& config_path, RandomSource random) {
+void FreezeConfig(const std::filesystem::path& config_path, RandomSource random,
+                  const HostServices& host) {
   std::lock_guard lock(initialization);
   if (snapshot)
     return;
@@ -297,7 +360,51 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
   // A Live invite wins for this session: its relay and join token replace the
   // System Link invite, explicit relay settings and LAN, whose saved values stay.
   const auto& live_code = LiveInviteCode();
-  if (!live_code.empty()) {
+  if (HostRequested()) {
+    // Hosting wins for this session: this process runs the online server and
+    // joins it over loopback. The saved values of the settings it replaces stay.
+    std::vector<std::string_view> ignored;
+    if (!live_code.empty())
+      ignored.push_back("live_invite");
+    if (!code.empty())
+      ignored.push_back("system_link_invite");
+    if (!config.address.empty())
+      ignored.push_back("system_link_server_address");
+    if (!config.room.empty())
+      ignored.push_back("system_link_server_room");
+    if (!config.secret_file.empty())
+      ignored.push_back("system_link_server_password_file");
+    if (config.lan_enabled)
+      ignored.push_back("system_link_lan_enabled");
+    if (!ignored.empty())
+      REXLOG_INFO("System Link: online_host overrides {} for this session",
+                  fmt::join(ignored, ", "));
+    const auto port = static_cast<uint16_t>(HostPort());
+    config.mode = Mode::kRelay;
+    config.hosting = true;
+    config.lan_enabled = false;
+    config.address = fmt::format("127.0.0.1:{}", port);
+    config.room = online_server::kRoom;
+    config.secret_file.clear();
+    config.host_password_file = config_path.parent_path() / "online-server" / "server-password.txt";
+    std::error_code folder_error;
+    std::filesystem::create_directories(config.host_password_file.parent_path(), folder_error);
+    // Making a code creates the password on the first launch that hosts.
+    auto password = online_server::MakeInvite(config.address, config.host_password_file)
+                        .and_then([&](const std::string&) {
+                          return relay::ReadPassword(config.host_password_file);
+                        });
+    if (!password) {
+      config.error = "could not create the online server password";
+    } else if (auto started =
+                   host.start_server({.port = port, .password_file = config.host_password_file});
+               !started) {
+      config.error = "could not start the online server: " + started.error().message;
+    } else {
+      host_started = true;
+      config.invite_secret = std::make_shared<relay_link::Secret>(std::string_view(*password));
+    }
+  } else if (!live_code.empty()) {
     std::vector<std::string_view> ignored;
     if (!code.empty())
       ignored.push_back("system_link_invite");
@@ -385,6 +492,26 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
     if (!validation.Configure(config.local_address, config.xuid))
       config.error = "bad LAN settings";
   }
+  if (host_started && !config.error.empty()) {
+    host.stop_server();
+    host_started = false;
+  }
+  // A configured advertised address, such as a tunnel's, means the host made
+  // the server reachable, so the router is left alone, also when the address
+  // was rejected above. The callback waits for this function to finish.
+  if (host_started && GetFlagByName("system_link_advertised_address").empty()) {
+    port_mapping::Options mapping;
+    mapping.port = static_cast<uint16_t>(HostPort());
+    mapping.changed = [](const port_mapping::Status& status) {
+      SetAdvertisedAddress(status.state == port_mapping::State::kOpen
+                               ? fmt::format("{}:{}", status.address, status.port)
+                               : std::string());
+    };
+    if (auto opened = host.open_port(mapping))
+      host_port_asked = true;
+    else
+      REXLOG_WARN("System Link: the router port was not asked for: {}", opened.error().message);
+  }
   auto frozen = std::make_shared<const Config>(std::move(config));
   std::lock_guard publish(snapshot_mutex);
   snapshot = std::move(frozen);
@@ -392,6 +519,24 @@ void FreezeConfig(const std::filesystem::path& config_path, RandomSource random)
 }
 void Initialize(const std::filesystem::path& config_path) {
   FreezeConfig(config_path, relay::RandomSeed);
+}
+bool HostAskedForPort() {
+  std::lock_guard lock(initialization);
+  return host_port_asked;
+}
+void StopHosting() {
+  bool close_port = false;
+  {
+    std::lock_guard lock(initialization);
+    if (!host_started)
+      return;
+    host_started = false;
+    close_port = std::exchange(host_port_asked, false);
+  }
+  // Outside the lock: Close waits for the mapping thread, whose callback takes it.
+  if (close_port)
+    port_mapping::Close();
+  online_server::Stop();
 }
 Result<relay_link::Secret> ReadSecret(const Config& config) {
   if (config.invite_secret)
@@ -577,8 +722,35 @@ void ResetSnapshot() {
   std::lock_guard lock(initialization);
   std::lock_guard publish(snapshot_mutex);
   snapshot.reset();
+  host_started = false;
+  host_port_asked = false;
   frozen_mode.store(-1, std::memory_order_release);
   SetStartupFailure({});
 }
 }  // namespace testing
 }  // namespace rex::kernel::xam::system_link
+
+namespace rex::online_host {
+Status Current() {
+  const auto config = kernel::xam::system_link::CurrentConfig();
+  Status status;
+  if (!config.hosting)
+    return status;
+  status.hosting = true;
+  status.error = config.error;
+  if (!status.error.empty())
+    return status;
+  // With a configured address the router was not asked and has no say.
+  if (kernel::xam::system_link::HostAskedForPort())
+    status.router = port_mapping::Current();
+  // The two are read apart; a port that just failed must not leave its old address.
+  if (status.router.state != port_mapping::State::kFailed)
+    status.address = kernel::xam::system_link::InviteRelayAddress(config);
+  // From the password the server was started with, not the file as it is now.
+  if (auto address = relay::ParseInviteAddress(status.address); address && config.invite_secret) {
+    if (auto code = relay::EncodeInvite(*address, config.room, config.invite_secret->view()))
+      status.friends_code = std::move(*code);
+  }
+  return status;
+}
+}  // namespace rex::online_host

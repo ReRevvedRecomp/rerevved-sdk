@@ -29,14 +29,17 @@ The client is disabled by default. F4 exposes these settings in `Online`:
 | `system_link_advertised_address` | Advanced | Empty | Relay host:port that host invites tell other players to use |
 | `live_sessions` | Player | `false` | List and join Live-mode sessions through the relay |
 | `live_invite` | Advanced | Empty | Join a Live session from an invite code, for this session only |
+| `online_host` | Advanced | `false` | Host an online game on this computer, for this session only |
+| `online_host_port` | Advanced | `30100` | UDP port of the online server when this computer hosts |
 | `system_link_direct` | Player | `false` | Try [direct paths](relay-direct-paths.md) to other relay players |
 | `system_link_direct_drop_after` | Developer | `0` | Test only: drop received direct datagrams this many seconds into a direct path |
 | `system_link_status` | Player, read-only | `Off` | Current session connection status |
 
-All editable settings except `live_invite` and `system_link_direct_drop_after`
-persist in configuration, and all require a restart.
-`system_link_direct_drop_after` accepts 0-3600 and is session-only:
-configuration files cannot set it and it is never saved. Pasting or editing a
+All editable settings except `live_invite`, `online_host` and
+`system_link_direct_drop_after` persist in configuration, and all require a
+restart.
+`system_link_direct_drop_after` accepts 0-3600. It and `online_host` are
+session-only: configuration files cannot set them and they are never saved. Pasting or editing a
 string applies it when Enter is pressed or the edited field loses focus. Save
 settings before restarting. The status is init-only, refuses writes, and is
 never persisted.

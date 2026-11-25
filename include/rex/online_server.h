@@ -18,6 +18,8 @@
 
 namespace rex::online_server {
 
+inline constexpr std::string_view kRoom = "testers";
+
 struct Options {
   std::string bind_address = "0.0.0.0";
   uint16_t port = 30100;  // 0 lets the system choose

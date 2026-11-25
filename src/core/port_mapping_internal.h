@@ -25,11 +25,25 @@ struct Route {
 struct Grant {
   uint32_t address = 0;
   uint16_t port = 0;
+  uint32_t lifetime = 0;  // seconds until the router drops it; 0 for no limit
+};
+
+enum class NatPmpOutcome {
+  kGranted,
+  kSilent,
+  kRefused,
+};
+struct NatPmpResult {
+  NatPmpOutcome outcome = NatPmpOutcome::kSilent;
+  Grant grant;
+  // The mapping request was sent, so without a grant the router may still
+  // hold a mapping whose reply was lost.
+  bool port_asked = false;
 };
 
 // RFC 6886. `outside_port` and `lifetime` are only requests.
-std::optional<Grant> NatPmpOpen(relay::Endpoint gateway, uint16_t port, uint16_t outside_port,
-                                uint32_t lifetime, const std::atomic<bool>& stop);
+NatPmpResult NatPmpOpen(relay::Endpoint gateway, uint16_t port, uint16_t outside_port,
+                        uint32_t lifetime, const std::atomic<bool>& stop);
 void NatPmpClose(relay::Endpoint gateway, uint16_t port);
 
 struct UpnpResult {

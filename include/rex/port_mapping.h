@@ -10,16 +10,21 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include <rex/result.h>
 
 namespace rex::port_mapping {
 
+struct Status;
+
 struct Options {
   uint16_t port = 30100;
   // The label on the router. An earlier mapping with it is reused.
   std::string name = "Online game";
+  // Runs on the mapping thread; it must not call Open or Close.
+  std::function<void(const Status&)> changed;
 };
 
 enum class State {
