@@ -3392,6 +3392,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   texture_load_scratch_capture_submission_ = 0;
 }
 
+void D3D12CommandProcessor::PrepareForWait() {
+  CommandProcessor::PrepareForWait();
+  // Ending the submission would discard an open guest occlusion query.
+  if (submission_open_ && !active_occlusion_query_.valid && CanEndSubmissionImmediately()) {
+    if (!EndSubmission(false)) {
+      REXGPU_WARN("Pre-wait submission remains pending");
+    }
+  }
+}
+
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {

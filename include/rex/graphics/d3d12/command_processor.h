@@ -237,6 +237,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool SupportsPresentationAspect() const override { return true; }
 
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
 
   void PollDrawCaptureArmMarker();
   void PollLiveFrameCaptureRequest();
