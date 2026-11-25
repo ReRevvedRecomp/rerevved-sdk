@@ -229,6 +229,19 @@ Result<size_t> ReadSecretFile(const std::filesystem::path& path, std::span<char>
   return size;
 }
 
+Result<std::string> ReadPassword(const std::filesystem::path& path) {
+  Buffer<4097> bytes;
+  auto size =
+      ReadSecretFile(path, {reinterpret_cast<char*>(bytes.bytes.data()), bytes.bytes.size()});
+  if (!size)
+    return std::unexpected(size.error());
+  std::string_view secret(reinterpret_cast<const char*>(bytes.bytes.data()), *size);
+  const auto first = secret.find_first_not_of(" \t\r\n\f\v");
+  if (first == std::string_view::npos)
+    return std::unexpected(Error{ErrorCategory::Config, "Server password is empty after trimming"});
+  return std::string(secret.substr(first, secret.find_last_not_of(" \t\r\n\f\v") - first + 1));
+}
+
 Result<std::string> MakeInvite(std::string_view address, const std::filesystem::path& secret_file,
                                std::string_view room, bool create_secret,
                                Result<Digest> (*random_source)()) {

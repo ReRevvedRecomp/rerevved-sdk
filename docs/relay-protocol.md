@@ -200,8 +200,9 @@ The core uses injected monotonic milliseconds, clamps backward clock inputs, has
 no sockets, and returns at most 64 datagrams per input. Its internal headers
 live under `src/core` and are not installed SDK headers. The UDP transport uses
 Winsock on Windows and POSIX sockets on Unix. The same `Pump` iteration serves
-the CLI and the two-client loopback test. The server core and transport belong
-to the internal `rexrelay_server` static library, linked only by the CLI and
-tests. The kernel client uses its own sockets and links the protocol codec, HMAC
-and OS random-seed helper from `rexcore`, without the server implementation.
+the CLI, the in-process server behind `rex/online_server.h` and the two-client
+loopback test. The server core and transport are built into the runtime; the
+`rexrelay_server` interface target gives the CLI and tests their internal
+headers. The kernel client uses its own sockets and shares only the protocol
+codec, HMAC and OS random-seed helper with the server.
 Socket users declare `ws2_32` on Windows.

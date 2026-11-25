@@ -43,6 +43,7 @@ add_executable(unit_tests
     core/relay_directory_test.cpp
     core/relay_direct_test.cpp
     core/relay_invite_test.cpp
+    core/online_server_test.cpp
     core/live_invite_test.cpp
     discord/discord_rpc_test.cpp
     core/stream_test.cpp

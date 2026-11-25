@@ -65,6 +65,23 @@ never logged.
 | `--max-rooms` | 16 | 1-256 |
 | `--max-members` | 4 | 1-64 per room |
 
+## In-process server
+
+A title can run the same server on a host thread through
+`rex/online_server.h`, so one player hosts without starting `rexglue`.
+`MakeInvite` returns the invite code for an address and a password file, and
+creates the file with a random password when it is missing, as `rexglue
+online-invite --create-password` does with the room `testers`. `Start` takes
+the bind address, UDP port, the same password file and the member limit; it
+opens the port before it returns, so a port in use is reported to the caller.
+`Stop`
+closes the port and joins the thread. `Current` reports the port and the
+joined player and game counts. One server runs per process, with the default
+room limit of 16. No thread or socket exists before `Start`, and the thread
+sleeps on its socket for up to 100 ms between packets. It logs one line when
+it starts listening and one when it stops; the status and problem lines below
+belong to the command.
+
 ## Server logs
 
 At startup the server logs its bind address, UDP port, room limit and member
