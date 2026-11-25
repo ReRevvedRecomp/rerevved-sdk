@@ -63,7 +63,10 @@ jobs:
 
       - name: Install toolchain (Windows)
         if: inputs.platform == 'win-amd64'
-        run: choco install llvm cmake ninja -y
+        # The runner's MSVC STL rejects the preinstalled Clang 20.
+        run: |
+          choco upgrade llvm --version=22.1.8 -y
+          choco install cmake ninja -y
 
       - name: Install clang 22 (linux-amd64)
         if: inputs.platform == 'linux-amd64'
