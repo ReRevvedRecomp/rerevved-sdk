@@ -48,6 +48,11 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+REXCVAR_DEFINE_BOOL(d3d12_transfer_skip_unused_stencil_bits, true, "GPU/D3D12",
+                    "Skip render target transfer stencil bit passes for bits that no draw or "
+                    "clear could have set (GPUs without stencil reference output only)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -1071,6 +1076,8 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
       SetCommandListRenderTargets(depth_and_color_render_targets);
+      // After the transfers: they only copy bits written by earlier draws.
+      AccumulateStencilWriteBits(normalized_depth_control, depth_and_color_render_targets[0]);
     } break;
     case Path::kPixelShaderInterlock: {
       // For ROV, only the barrier is needed - already scheduled if required.
@@ -1088,6 +1095,95 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       return false;
   }
   return true;
+}
+
+namespace {
+uint32_t GetStencilOpSetBits(xenos::StencilOp op, uint32_t ref, uint32_t write_mask,
+                             bool value_known = false, uint32_t known_value = 0) {
+  ref &= 0xFF;
+  write_mask &= 0xFF;
+  switch (op) {
+    case xenos::StencilOp::kKeep:
+    case xenos::StencilOp::kZero:
+      return 0;
+    case xenos::StencilOp::kReplace:
+      return ref & write_mask;
+    default:
+      break;
+  }
+  if (!value_known) {
+    return write_mask;
+  }
+  uint32_t v = known_value & 0xFF;
+  uint32_t result;
+  switch (op) {
+    case xenos::StencilOp::kIncrementClamp:
+      result = std::min(v + 1, uint32_t(0xFF));
+      break;
+    case xenos::StencilOp::kDecrementClamp:
+      result = v ? v - 1 : 0;
+      break;
+    case xenos::StencilOp::kInvert:
+      result = ~v;
+      break;
+    case xenos::StencilOp::kIncrementWrap:
+      result = v + 1;
+      break;
+    case xenos::StencilOp::kDecrementWrap:
+      result = v - 1;
+      break;
+    default:
+      return write_mask;
+  }
+  return result & write_mask;
+}
+
+// Depth-pass and depth-fail see only pixels that passed the stencil test;
+// stencil-fail sees pixels of unknown value.
+uint32_t GetStencilFaceSetBits(xenos::CompareFunction func, uint32_t ref, uint32_t read_mask,
+                               uint32_t write_mask, xenos::StencilOp fail, xenos::StencilOp zpass,
+                               xenos::StencilOp zfail) {
+  uint32_t bits = 0;
+  if (func != xenos::CompareFunction::kAlways) {
+    bits |= GetStencilOpSetBits(fail, ref, write_mask);
+  }
+  if (func != xenos::CompareFunction::kNever) {
+    bool passing_value_known = func == xenos::CompareFunction::kEqual && (read_mask & 0xFF) == 0xFF;
+    bits |= GetStencilOpSetBits(zpass, ref, write_mask, passing_value_known, ref);
+    bits |= GetStencilOpSetBits(zfail, ref, write_mask, passing_value_known, ref);
+  }
+  return bits;
+}
+}  // namespace
+
+void D3D12RenderTargetCache::AccumulateStencilWriteBits(
+    reg::RB_DEPTHCONTROL normalized_depth_control, RenderTarget* depth_render_target) {
+  if (!normalized_depth_control.stencil_enable || !depth_render_target) {
+    return;
+  }
+  const RegisterFile& regs = register_file();
+  auto front = regs.Get<reg::RB_STENCILREFMASK>();
+  uint32_t bits = GetStencilFaceSetBits(
+      normalized_depth_control.stencilfunc, front.stencilref, front.stencilmask,
+      front.stencilwritemask, normalized_depth_control.stencilfail,
+      normalized_depth_control.stencilzpass, normalized_depth_control.stencilzfail);
+  if (normalized_depth_control.backface_enable) {
+    // The host pipeline has one stencil register for both faces.
+    auto back = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+    bits |= GetStencilFaceSetBits(
+        normalized_depth_control.stencilfunc, back.stencilref, back.stencilmask,
+        back.stencilwritemask, normalized_depth_control.stencilfail,
+        normalized_depth_control.stencilzpass, normalized_depth_control.stencilzfail);
+    bits |= GetStencilFaceSetBits(
+        normalized_depth_control.stencilfunc_bf, front.stencilref, front.stencilmask,
+        front.stencilwritemask, normalized_depth_control.stencilfail_bf,
+        normalized_depth_control.stencilzpass_bf, normalized_depth_control.stencilzfail_bf);
+    bits |= GetStencilFaceSetBits(
+        normalized_depth_control.stencilfunc_bf, back.stencilref, back.stencilmask,
+        back.stencilwritemask, normalized_depth_control.stencilfail_bf,
+        normalized_depth_control.stencilzpass_bf, normalized_depth_control.stencilzfail_bf);
+  }
+  AddStencilBitsToRenderTarget(depth_render_target->key(), bits);
 }
 
 void D3D12RenderTargetCache::WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -4628,8 +4724,35 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
 
         // Draw the transfer rectangles.
+        // The destination stencil was cleared to 0 above.
+        uint32_t stencil_bits_to_transfer = 0xFF;
+        if (is_stencil_bit && REXCVAR_GET(d3d12_transfer_skip_unused_stencil_bits)) {
+          stencil_bits_to_transfer = 0;
+          for (auto it_bits = it_merged_first;; ++it_bits) {
+            stencil_bits_to_transfer |= it_bits->transfer.stencil_bits & 0xFF;
+            if (it_bits == it_merged_last) {
+              break;
+            }
+          }
+        }
+        if (is_stencil_bit) {
+          if (transfer_shader_key.mode == TransferMode::kColorToStencilBit) {
+            ++stencil_groups_color_source_;
+          } else if (stencil_bits_to_transfer == 0xFF) {
+            ++stencil_groups_depth_full_;
+          } else {
+            ++stencil_groups_depth_partial_;
+          }
+        }
         command_processor_.SubmitBarriers();
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
+          if (is_stencil_bit && !(stencil_bits_to_transfer & (uint32_t(1) << j))) {
+            ++stencil_bit_passes_skipped_;
+            continue;
+          }
+          if (is_stencil_bit) {
+            ++stencil_bit_passes_drawn_;
+          }
           if (is_stencil_bit) {
             uint32_t transfer_stencil_bit = uint32_t(1) << j;
             command_list.D3DSetGraphicsRoot32BitConstants(
@@ -4639,6 +4762,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+        }
+        if (is_stencil_bit && stencil_bit_passes_drawn_ + stencil_bit_passes_skipped_ >=
+                                  stencil_bit_passes_next_log_) {
+          stencil_bit_passes_next_log_ <<= 1;
+          REXGPU_INFO(
+              "Stencil transfer passes: {} drawn, {} skipped; groups: {} from color, {} depth with "
+              "all bits, {} depth with fewer bits",
+              stencil_bit_passes_drawn_, stencil_bit_passes_skipped_, stencil_groups_color_source_,
+              stencil_groups_depth_full_, stencil_groups_depth_partial_);
         }
       }
     }

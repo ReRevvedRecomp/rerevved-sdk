@@ -73,6 +73,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
 
+  // Call before any direct queue use that must follow earlier submissions.
+  void DrainQueueSubmissions();
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
@@ -234,6 +237,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool SupportsPresentationAspect() const override { return true; }
 
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
 
   void PollDrawCaptureArmMarker();
   void PollLiveFrameCaptureRequest();
@@ -658,6 +662,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  static constexpr uint32_t kSubmissionCommandListCount = 4;
+  bool StartSubmissionWorker();
+  void StopSubmissionWorker();
+  bool CheckAsyncSubmissionError();
+  bool async_submission_ = false;
+  std::atomic<HRESULT> submission_worker_error_{S_OK};
+  ID3D12GraphicsCommandList* submission_command_lists_[kSubmissionCommandListCount] = {};
+  ID3D12GraphicsCommandList1* submission_command_lists_1_[kSubmissionCommandListCount] = {};
+  uint64_t submission_command_list_sequence_[kSubmissionCommandListCount] = {};
+  uint32_t submission_command_list_next_ = 0;
+  uint64_t async_submissions_ = 0;
+  uint64_t sync_submissions_ = 0;
+  uint64_t async_submissions_next_log_ = 4096;
 
   bool debug_markers_enabled_ = false;
 

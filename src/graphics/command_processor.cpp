@@ -262,11 +262,12 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
-      PrepareForWait();
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
+          // Repeated on each timed wait: pipeline creation may skip a flush.
+          PrepareForWait();
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));

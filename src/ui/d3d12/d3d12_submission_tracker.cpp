@@ -13,7 +13,133 @@
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
 
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <utility>
+
 namespace rex::ui::d3d12 {
+
+namespace queue_worker {
+namespace {
+struct State {
+  std::mutex mutex;
+  std::condition_variable work_cv;
+  std::condition_variable done_cv;
+  std::deque<std::pair<uint64_t, Operation>> operations;
+  std::thread thread;
+  ID3D12CommandQueue* queue = nullptr;
+  bool accepting = false;
+  bool stop = false;
+  uint64_t enqueued = 0;
+  uint64_t performed = 0;
+};
+// Never destroyed: the thread must not be joined during DLL unload.
+State& GetState() {
+  static State* state = new State;
+  return *state;
+}
+
+void ThreadMain(ID3D12CommandQueue* queue) {
+  SetThreadDescription(GetCurrentThread(), L"GPU Queue Submission");
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  State& state = GetState();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  for (;;) {
+    state.work_cv.wait(lock, [&state]() { return state.stop || !state.operations.empty(); });
+    if (state.operations.empty()) {
+      break;
+    }
+    std::pair<uint64_t, Operation> operation = std::move(state.operations.front());
+    state.operations.pop_front();
+    lock.unlock();
+    operation.second(queue);
+    // Release whatever the operation holds before reporting it as performed.
+    operation.second = nullptr;
+    lock.lock();
+    state.performed = operation.first;
+    state.done_cv.notify_all();
+  }
+}
+}  // namespace
+
+bool Start(ID3D12CommandQueue* queue) {
+  Stop();
+  State& state = GetState();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.queue = queue;
+  state.stop = false;
+  try {
+    state.thread = std::thread(ThreadMain, queue);
+  } catch (...) {
+    state.queue = nullptr;
+    return false;
+  }
+  state.accepting = true;
+  return true;
+}
+
+void Stop() {
+  State& state = GetState();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.thread.joinable()) {
+      return;
+    }
+    state.accepting = false;
+    state.stop = true;
+  }
+  state.work_cv.notify_all();
+  state.thread.join();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.queue = nullptr;
+  state.done_cv.notify_all();
+}
+
+bool IsActive(ID3D12CommandQueue* queue) {
+  State& state = GetState();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.accepting && queue && state.queue == queue;
+}
+
+uint64_t Run(ID3D12CommandQueue* queue, Operation operation) {
+  State& state = GetState();
+  {
+    std::unique_lock<std::mutex> lock(state.mutex);
+    if (state.accepting && queue && state.queue == queue) {
+      uint64_t sequence = ++state.enqueued;
+      state.operations.emplace_back(sequence, std::move(operation));
+      lock.unlock();
+      state.work_cv.notify_one();
+      return sequence;
+    }
+    state.done_cv.wait(lock, [&state]() { return state.performed >= state.enqueued; });
+  }
+  operation(queue);
+  return 0;
+}
+
+void WaitFor(uint64_t sequence) {
+  if (!sequence) {
+    return;
+  }
+  State& state = GetState();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  state.done_cv.wait(
+      lock, [&state, sequence]() { return state.performed >= std::min(sequence, state.enqueued); });
+}
+
+void Drain(ID3D12CommandQueue* queue) {
+  State& state = GetState();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  if (!queue || state.queue != queue) {
+    return;
+  }
+  state.done_cv.wait(lock, [&state]() { return state.performed >= state.enqueued; });
+}
+}  // namespace queue_worker
 
 bool D3D12SubmissionTracker::Initialize(ID3D12Device* device, ID3D12CommandQueue* queue) {
   Shutdown();
@@ -82,6 +208,9 @@ bool D3D12SubmissionTracker::AwaitSubmissionCompletion(UINT64 submission_index) 
       if (wait_result == WAIT_OBJECT_0) {
         break;
       }
+      if (wait_result == WAIT_TIMEOUT && signal_failed_->load()) {
+        return false;
+      }
       if (wait_result != WAIT_TIMEOUT || (device && FAILED(device->GetDeviceRemovedReason()))) {
         return false;
       }
@@ -117,10 +246,27 @@ bool D3D12SubmissionTracker::TrySignalEnqueueing() {
   if (!queue_ || !fence_) {
     return false;
   }
-  if (FAILED(queue_->Signal(fence_.Get(), submission_current_ - 1))) {
-    return false;
+  UINT64 signal_value = submission_current_ - 1;
+  if (queue_worker::IsActive(queue_.Get())) {
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence = fence_;
+    std::shared_ptr<std::atomic<bool>> signal_failed = signal_failed_;
+    queue_worker::Run(queue_.Get(),
+                      [fence, signal_value, signal_failed](ID3D12CommandQueue* queue) {
+                        if (FAILED(queue->Signal(fence.Get(), signal_value))) {
+                          signal_failed->store(true);
+                          REXLOG_ERROR(
+                              "D3D12SubmissionTracker: Failed to signal the fence on the queue "
+                              "worker");
+                        }
+                      });
+  } else {
+    // A worker that is stopping may still hold operations the signal must follow.
+    queue_worker::Drain(queue_.Get());
+    if (FAILED(queue_->Signal(fence_.Get(), signal_value))) {
+      return false;
+    }
   }
-  submission_signal_queued_ = submission_current_ - 1;
+  submission_signal_queued_ = signal_value;
   return true;
 }
 

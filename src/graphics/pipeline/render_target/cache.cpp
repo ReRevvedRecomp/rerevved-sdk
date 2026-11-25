@@ -31,6 +31,12 @@
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
+REXCVAR_DEFINE_BOOL(d3d12_transfer_assume_color_stencil_zero, false, "GPU",
+                    "Treat the stencil of EDRAM reused as depth after color without a clear as 0 "
+                    "instead of copying it from the color bits (title-specific hack: only correct "
+                    "if the title never reads that leftover stencil)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // Keep CPU vertex execution opt-in when extents only optimize interlock barriers.
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, false, "GPU",
                     "Execute unclipped draw VS on CPU for PSI render backend");
@@ -1113,8 +1119,10 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
   if (depth_render_target) {
+    // The host clear writes both depth and stencil, stencil from the low byte.
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
-                    depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
+                    depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle,
+                    resolve_info.rb_depth_clear & 0xFF);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
@@ -1241,7 +1249,8 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                                         uint32_t length_tiles,
                                         std::vector<Transfer>* transfers_append_out,
-                                        const Transfer::Rectangle* resolve_clear_cutout) {
+                                        const Transfer::Rectangle* resolve_clear_cutout,
+                                        uint32_t clear_stencil) {
   // xenos::kEdramTileCount with length 0 is fine if both the start and the end
   // are clamped to xenos::kEdramTileCount.
   assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
@@ -1253,6 +1262,28 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+  bool clearing_stencil = dest.is_depth && clear_stencil != UINT32_MAX;
+  // A clear replaces a range's bits only when it covers the whole range.
+  auto apply_stencil_clear = [&](OwnershipRange& range, uint32_t range_start,
+                                 bool range_within_extent) {
+    if (!clearing_stencil) {
+      return;
+    }
+    uint32_t clear_bits = clear_stencil & 0xFF;
+    Transfer::Rectangle uncovered[Transfer::kMaxRectanglesWithCutout];
+    uint32_t uncovered_count =
+        (resolve_clear_cutout && range_within_extent)
+            ? Transfer::GetRangeRectangles(range_start, range.end_tiles, dest.base_tiles,
+                                           dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
+                                           uncovered, resolve_clear_cutout)
+            : 1;
+    bool fully_covered = resolve_clear_cutout && range_within_extent && !uncovered_count;
+    if (fully_covered) {
+      range.stencil_bits = clear_bits;
+    } else {
+      range.stencil_bits |= clear_bits;
+    }
+  };
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the
     // same. Find the range starting at >= the start. A portion of the range
@@ -1270,6 +1301,9 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // Let the next loop do the transfer and needed merging and splitting
         // starting from the added tail.
         it = std::next(it_pre);
+      } else if (it_pre->second.end_tiles > extent_start) {
+        // Already owned and overlapping the extent, but never visited by the loop.
+        apply_stencil_clear(it_pre->second, it_pre->first, false);
       }
     }
     while (it != ownership_ranges_.end()) {
@@ -1280,6 +1314,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       if (it->second.IsOwnedBy(dest, host_depth_encoding_different)) {
         // Already owned by the needed render target - no need to transfer
         // anything.
+        apply_stencil_clear(it->second, it->first,
+                            it->first >= extent_start && it->second.end_tiles <= extent_end);
         ++it;
         continue;
       }
@@ -1289,6 +1325,18 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // Split the tail.
         ownership_ranges_.emplace(extent_end, it->second);
         it->second.end_tiles = extent_end;
+      }
+      RenderTargetKey previous_owner = it->second.render_target;
+      uint32_t claimed_stencil_bits;
+      if (previous_owner == dest) {
+        claimed_stencil_bits = it->second.stencil_bits;
+      } else if (previous_owner.IsEmpty()) {
+        claimed_stencil_bits = 0;
+      } else if (previous_owner.is_depth) {
+        claimed_stencil_bits = it->second.stencil_bits;
+      } else {
+        claimed_stencil_bits =
+            (dest.is_depth && REXCVAR_GET(d3d12_transfer_assume_color_stencil_zero)) ? 0 : 0xFF;
       }
       if (transfers_append_out) {
         RenderTargetKey transfer_source = it->second.render_target;
@@ -1320,6 +1368,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
               // Extend the last transfer if, for example, transferring color,
               // but host depth is different.
               transfers_append_out->back().end_tiles = transfer_end_tiles;
+              transfers_append_out->back().stencil_bits |= claimed_stencil_bits;
             } else {
               auto transfer_source_rt_it = render_targets_.find(transfer_source);
               if (transfer_source_rt_it != render_targets_.end()) {
@@ -1337,6 +1386,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
                           : nullptr);
+                  transfers_append_out->back().stencil_bits = claimed_stencil_bits;
                 }
               }
             }
@@ -1348,6 +1398,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       if (host_depth_encoding_different) {
         it->second.GetHostDepthRenderTarget(dest.GetDepthFormat()) = dest;
       }
+      it->second.stencil_bits = dest.is_depth ? claimed_stencil_bits : 0xFF;
+      apply_stencil_clear(it->second, it->first, true);
       // Check if can merge with the next range after claiming.
       std::map<uint32_t, OwnershipRange>::iterator it_next;
       if (it != ownership_ranges_.end()) {
@@ -1355,6 +1407,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         if (it_next != ownership_ranges_.end() && it_next->second.AreOwnersSame(it->second)) {
           // Merge with the next range.
           it->second.end_tiles = it_next->second.end_tiles;
+          it->second.stencil_bits |= it_next->second.stencil_bits;
           auto it_after = std::next(it_next);
           ownership_ranges_.erase(it_next);
           it_next = it_after;
@@ -1368,6 +1421,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         auto it_prev = std::prev(it);
         if (it_prev->second.AreOwnersSame(it->second)) {
           it_prev->second.end_tiles = it->second.end_tiles;
+          it_prev->second.stencil_bits |= it->second.stencil_bits;
           ownership_ranges_.erase(it);
         }
       }
@@ -1383,6 +1437,19 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   if (end_tiles > xenos::kEdramTileCount) {
     // The ownership change extent goes to the next EDRAM addressing period.
     change_ownership_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
+}
+
+void RenderTargetCache::AddStencilBitsToRenderTarget(RenderTargetKey depth_key, uint32_t bits) {
+  bits &= 0xFF;
+  if (!bits || depth_key.IsEmpty() || !depth_key.is_depth) {
+    return;
+  }
+  // Covering every range of the target transfers more bits, never fewer.
+  for (auto& range : ownership_ranges_) {
+    if (range.second.render_target == depth_key) {
+      range.second.stencil_bits |= bits;
+    }
   }
 }
 

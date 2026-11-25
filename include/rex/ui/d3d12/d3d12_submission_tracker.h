@@ -13,7 +13,24 @@
 
 #include <rex/ui/d3d12/d3d12_api.h>
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+
 namespace rex::ui::d3d12 {
+
+// One thread that performs a command queue's operations in request order.
+namespace queue_worker {
+using Operation = std::function<void(ID3D12CommandQueue* queue)>;
+bool Start(ID3D12CommandQueue* queue);
+void Stop();
+bool IsActive(ID3D12CommandQueue* queue);
+// Returns 0 when the operation ran at once on the calling thread.
+uint64_t Run(ID3D12CommandQueue* queue, Operation operation);
+void WaitFor(uint64_t sequence);  // UINT64_MAX: everything queued
+void Drain(ID3D12CommandQueue* queue);
+}  // namespace queue_worker
 
 // GPU > CPU fence wrapper, safely handling cases when the fence has not been
 // initialized yet or has already been shut down, dropped submissions, and also
@@ -81,6 +98,7 @@ class D3D12SubmissionTracker {
   HANDLE fence_completion_event_ = nullptr;
   Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
   Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
+  std::shared_ptr<std::atomic<bool>> signal_failed_ = std::make_shared<std::atomic<bool>>(false);
 };
 
 }  // namespace rex::ui::d3d12

@@ -49,6 +49,7 @@
 #include <rex/perf/counter.h>
 #include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
+#include <rex/ui/d3d12/d3d12_submission_tracker.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 REXCVAR_DECLARE(bool, half_pixel_offset);
@@ -76,6 +77,16 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU/D3D12",
+                    "Pass non-swap command lists to the GPU queue on a background thread so the "
+                    "command processor doesn't block in the driver")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(d3d12_async_swap_submission, true, "GPU/D3D12",
+                    "Also pass the swap (end of frame) submission to the background thread "
+                    "(the presenter's queue operations are ordered through the same thread)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(d3d12_capture_swap_texture, "", "GPU/D3D12",
@@ -330,7 +341,41 @@ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_syste
       frame_capture_(std::make_unique<FrameCapture>()) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
-D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+D3D12CommandProcessor::~D3D12CommandProcessor() {
+  StopSubmissionWorker();
+}
+
+bool D3D12CommandProcessor::StartSubmissionWorker() {
+  submission_worker_error_.store(S_OK, std::memory_order_relaxed);
+  return ui::d3d12::queue_worker::Start(GetD3D12Provider().GetDirectQueue());
+}
+
+void D3D12CommandProcessor::StopSubmissionWorker() {
+  if (!async_submission_) {
+    return;
+  }
+  ui::d3d12::queue_worker::Stop();
+}
+
+void D3D12CommandProcessor::DrainQueueSubmissions() {
+  if (!async_submission_) {
+    return;
+  }
+  ui::d3d12::queue_worker::Drain(GetD3D12Provider().GetDirectQueue());
+}
+
+bool D3D12CommandProcessor::CheckAsyncSubmissionError() {
+  HRESULT error = submission_worker_error_.load(std::memory_order_relaxed);
+  if (SUCCEEDED(error)) {
+    return true;
+  }
+  if (!submission_fence_failed_) {
+    HandleFenceFailure("Background submission fence Signal", error, true);
+    frame_capture_->Abort(GetD3D12Provider().GetDevice(), "submission_signal_failure");
+    FailLiveFrameCapture("submission_signal_failure");
+  }
+  return false;
+}
 
 void D3D12CommandProcessor::ArmTextureLoadScratchCapture(const std::filesystem::path& path) {
   texture_load_scratch_capture_armed_ = true;
@@ -1490,6 +1535,27 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  async_submission_ = false;
+  if (REXCVAR_GET(d3d12_async_submission)) {
+    bool lists_created = true;
+    for (uint32_t i = 0; i < kSubmissionCommandListCount; ++i) {
+      if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, command_allocator,
+                                           nullptr, IID_PPV_ARGS(&submission_command_lists_[i])))) {
+        lists_created = false;
+        break;
+      }
+      submission_command_lists_[i]->Close();
+      submission_command_lists_[i]->QueryInterface(IID_PPV_ARGS(&submission_command_lists_1_[i]));
+      submission_command_list_sequence_[i] = 0;
+    }
+    if (lists_created && StartSubmissionWorker()) {
+      async_submission_ = true;
+      REXGPU_INFO("D3D12 background queue submission enabled");
+    } else {
+      REXGPU_WARN("D3D12 background queue submission unavailable, submitting synchronously");
+    }
+  }
+
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -2244,6 +2310,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   FailLiveFrameCapture("shutdown_before_completed_swap");
   frame_capture_->Abort(device, "shutdown_before_completed_swap");
   const bool queue_is_idle = AwaitAllQueueOperationsCompletion();
+  StopSubmissionWorker();
   const bool device_is_removed = device && FAILED(device->GetDeviceRemovedReason());
   if (!diagnostic::CanReleaseSubmittedGpuResources(queue_is_idle, device_is_removed)) {
     REXGPU_ERROR("D3D12 context teardown skipped because submitted GPU work is not known idle");
@@ -2366,6 +2433,13 @@ void D3D12CommandProcessor::ShutdownContext() {
   shared_memory_.reset();
 
   deferred_command_list_.Reset();
+  for (uint32_t i = 0; i < kSubmissionCommandListCount; ++i) {
+    ui::d3d12::util::ReleaseAndNull(submission_command_lists_1_[i]);
+    ui::d3d12::util::ReleaseAndNull(submission_command_lists_[i]);
+    submission_command_list_sequence_[i] = 0;
+  }
+  submission_command_list_next_ = 0;
+  async_submission_ = false;
   ui::d3d12::util::ReleaseAndNull(command_list_1_);
   ui::d3d12::util::ReleaseAndNull(command_list_);
   ClearCommandAllocatorCache();
@@ -3316,6 +3390,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   texture_load_scratch_capture_buffer_.Reset();
   texture_load_scratch_capture_size_ = 0;
   texture_load_scratch_capture_submission_ = 0;
+}
+
+void D3D12CommandProcessor::PrepareForWait() {
+  CommandProcessor::PrepareForWait();
+  // Ending the submission would discard an open guest occlusion query.
+  if (submission_open_ && !active_occlusion_query_.valid && CanEndSubmissionImmediately()) {
+    if (!EndSubmission(false)) {
+      REXGPU_WARN("Pre-wait submission remains pending");
+    }
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -6868,6 +6952,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(uint32_t& written_addr
 }
 
 bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+  if (async_submission_ && !CheckAsyncSubmissionError()) {
+    return false;
+  }
   if (device_removed_ || submission_fence_failed_) {
     frame_capture_->Abort(GetD3D12Provider().GetDevice(), "fence_failure");
     FailLiveFrameCapture("fence_failure");
@@ -6884,6 +6971,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // outside of a submission, await explicitly.
     if (queue_operations_done_since_submission_signal_) {
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
+      DrainQueueSubmissions();
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
       HRESULT signal_result =
           direct_queue->Signal(queue_operations_since_submission_fence_, fence_value);
@@ -7036,6 +7124,10 @@ DWORD D3D12CommandProcessor::AwaitFenceCompletionEvent() {
       return wait_result;
     }
     if (FAILED(device->GetDeviceRemovedReason())) {
+      return WAIT_TIMEOUT;
+    }
+    // A fence value that the queue worker failed to signal never arrives.
+    if (FAILED(submission_worker_error_.load(std::memory_order_relaxed))) {
       return WAIT_TIMEOUT;
     }
   }
@@ -7322,6 +7414,33 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
+    if (async_submission_ && !CheckAsyncSubmissionError()) {
+      return false;
+    }
+    bool submit_async = async_submission_ && (!is_swap || REXCVAR_GET(d3d12_async_swap_submission));
+    if (async_submission_ && !submit_async) {
+      DrainQueueSubmissions();
+      if (!CheckAsyncSubmissionError()) {
+        return false;
+      }
+    }
+
+    // A ring list is reset only after the worker has executed its last use.
+    ID3D12GraphicsCommandList* submission_command_list = command_list_;
+    ID3D12GraphicsCommandList1* submission_command_list_1 = command_list_1_;
+    uint32_t submission_command_list_index = UINT32_MAX;
+    if (async_submission_) {
+      submission_command_list_index = submission_command_list_next_;
+      submission_command_list_next_ =
+          (submission_command_list_next_ + 1) % kSubmissionCommandListCount;
+      uint64_t previous_use = submission_command_list_sequence_[submission_command_list_index];
+      if (previous_use) {
+        ui::d3d12::queue_worker::WaitFor(previous_use);
+      }
+      submission_command_list = submission_command_lists_[submission_command_list_index];
+      submission_command_list_1 = submission_command_lists_1_[submission_command_list_index];
+    }
+
     // Submit the deferred command list.
     // Only one deferred command list must be executed in the same
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
@@ -7330,12 +7449,43 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
-    command_allocator_writable_first_->last_usage_submission = submission_current_;
+    submission_command_list->Reset(command_allocator, nullptr);
+    deferred_command_list_.Execute(submission_command_list, submission_command_list_1);
+    submission_command_list->Close();
+    const uint64_t submitted_submission = submission_current_++;
+    HRESULT signal_result = S_OK;
+    if (submit_async) {
+      ID3D12Fence* fence = submission_fence_;
+      std::atomic<HRESULT>* error = &submission_worker_error_;
+      uint64_t sequence = ui::d3d12::queue_worker::Run(
+          direct_queue,
+          [submission_command_list, fence, error, submitted_submission](ID3D12CommandQueue* queue) {
+            ID3D12CommandList* execute_command_lists[] = {submission_command_list};
+            queue->ExecuteCommandLists(1, execute_command_lists);
+            HRESULT result = queue->Signal(fence, submitted_submission);
+            if (FAILED(result)) {
+              HRESULT expected = S_OK;
+              error->compare_exchange_strong(expected, result);
+            }
+          });
+      submission_command_list_sequence_[submission_command_list_index] = sequence;
+      ++async_submissions_;
+    } else {
+      if (async_submission_) {
+        submission_command_list_sequence_[submission_command_list_index] = 0;
+      }
+      ID3D12CommandList* execute_command_lists[] = {submission_command_list};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+      signal_result = direct_queue->Signal(submission_fence_, submitted_submission);
+      ++sync_submissions_;
+    }
+    if (async_submission_ &&
+        async_submissions_ + sync_submissions_ >= async_submissions_next_log_) {
+      async_submissions_next_log_ <<= 1;
+      REXGPU_INFO("D3D12 queue submissions: {} in the background, {} synchronous",
+                  async_submissions_, sync_submissions_);
+    }
+    command_allocator_writable_first_->last_usage_submission = submitted_submission;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
     } else {
@@ -7348,8 +7498,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    const uint64_t submitted_submission = submission_current_++;
-    HRESULT signal_result = direct_queue->Signal(submission_fence_, submitted_submission);
     submission_open_ = false;
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
@@ -7365,7 +7513,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     submission_last_signaled_ = submitted_submission;
     diagnostic::GetXenosFenceTrace().D3D12Submission(
-        submitted_submission, reinterpret_cast<uint64_t>(command_list_),
+        submitted_submission, reinterpret_cast<uint64_t>(submission_command_list),
         reinterpret_cast<uint64_t>(submission_fence_), submitted_submission);
 
     for (Microsoft::WRL::ComPtr<ID3D12Resource>& resource : submission_retry_resources_) {

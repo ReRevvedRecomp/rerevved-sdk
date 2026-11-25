@@ -430,8 +430,10 @@ bool D3D12Presenter::UploadCpuGuestOutputFrame(const CpuGuestOutputFrame& frame,
     REXLOG_ERROR("D3D12Presenter: Failed to close the CPU guest output upload command list");
     return false;
   }
-  ID3D12CommandList* execute_command_list = command_list.Get();
-  provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  queue_worker::Run(provider_.GetDirectQueue(), [command_list](ID3D12CommandQueue* queue) {
+    ID3D12CommandList* execute_command_list = command_list.Get();
+    queue->ExecuteCommandLists(1, &execute_command_list);
+  });
 
   CpuGuestOutputUpload upload;
   upload.token = token;
@@ -484,6 +486,7 @@ bool D3D12Presenter::CopyGpuGuestOutputFrame(PendingGuestOutputFrame pending,
     return false;
   }
   const auto& ready = std::get<GpuGuestOutputFrame>(copy.pending.frame);
+  queue_worker::Drain(gpu_guest_output_copy_queue_.Get());
   if (FAILED(gpu_guest_output_copy_queue_->Wait(ready.ready_fence.Get(), ready.ready_value))) {
     copy.pending.ticket->Cancel();
     return false;
@@ -520,6 +523,7 @@ void D3D12Presenter::DrainGpuGuestOutputCopies() {
   bool drained = FAILED(device->GetDeviceRemovedReason());
   if (!drained && gpu_guest_output_copy_value_ < UINT64_MAX - 1) {
     const uint64_t value = ++gpu_guest_output_copy_value_;
+    queue_worker::Drain(gpu_guest_output_copy_queue_.Get());
     if (SUCCEEDED(
             gpu_guest_output_copy_queue_->Signal(gpu_guest_output_copy_fence_.Get(), value))) {
       auto ticket = std::shared_ptr<GpuGuestOutputTicket>(new GpuGuestOutputTicket);
@@ -780,8 +784,12 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
     if (!submission_tracker.Initialize(device, direct_queue)) {
       return false;
     }
-    ID3D12CommandList* execute_command_list = command_list.Get();
-    direct_queue->ExecuteCommandLists(1, &execute_command_list);
+    const uint64_t execute_sequence =
+        queue_worker::Run(direct_queue, [command_list](ID3D12CommandQueue* queue) {
+          ID3D12CommandList* execute_command_list = command_list.Get();
+          queue->ExecuteCommandLists(1, &execute_command_list);
+        });
+    queue_worker::WaitFor(execute_sequence);
     if (!submission_tracker.NextSubmission()) {
       REXLOG_ERROR("D3D12Presenter: Failed to signal the guest output capturing fence");
       return false;
@@ -1872,12 +1880,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
 
   // Execute and present.
   command_list->Close();
-  ID3D12CommandList* execute_command_list = command_list;
-  provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  ID3D12CommandQueue* paint_queue = provider_.GetDirectQueue();
+  queue_worker::Run(paint_queue, [command_list](ID3D12CommandQueue* queue) {
+    ID3D12CommandList* execute_command_list = command_list;
+    queue->ExecuteCommandLists(1, &execute_command_list);
+  });
   if (execute_ui_drawers) {
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
+  // Present may block for long: it runs here, after this thread's queued work.
+  queue_worker::WaitFor(queue_worker::Run(paint_queue, [](ID3D12CommandQueue*) {}));
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
