@@ -662,6 +662,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool use_stencil_reference_output_ = false;
 
+  void AccumulateStencilWriteBits(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                  RenderTarget* depth_render_target);
+  uint64_t stencil_bit_passes_drawn_ = 0;
+  uint64_t stencil_bit_passes_skipped_ = 0;
+  uint64_t stencil_bit_passes_next_log_ = uint64_t(1) << 16;
+  uint64_t stencil_groups_color_source_ = 0;
+  uint64_t stencil_groups_depth_full_ = 0;
+  uint64_t stencil_groups_depth_partial_ = 0;
+
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_float24_round_ = false;

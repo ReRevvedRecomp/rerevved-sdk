@@ -306,6 +306,7 @@ class RenderTargetCache {
     uint32_t end_tiles;
     RenderTarget* source;
     RenderTarget* host_depth_source;
+    uint32_t stencil_bits = 0xFF;  // bits that may be 1
     Transfer(uint32_t start_tiles, uint32_t end_tiles, RenderTarget* source,
              RenderTarget* host_depth_source)
         : start_tiles(start_tiles),
@@ -582,6 +583,7 @@ class RenderTargetCache {
     // empty too.
     RenderTargetKey host_depth_render_target_unorm24;
     RenderTargetKey host_depth_render_target_float24;
+    uint32_t stencil_bits = 0;  // bits that may be 1; 0xFF after color
     OwnershipRange(uint32_t end_tiles, RenderTargetKey render_target,
                    RenderTargetKey host_depth_render_target_unorm24,
                    RenderTargetKey host_depth_render_target_float24)
@@ -647,8 +649,13 @@ class RenderTargetCache {
   // change to transfers_append_out if it's not null.
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
-                       const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+                       const Transfer::Rectangle* resolve_clear_cutout = nullptr,
+                       uint32_t clear_stencil = UINT32_MAX);
 
+ protected:
+  void AddStencilBitsToRenderTarget(RenderTargetKey depth_key, uint32_t bits);
+
+ private:
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
   std::unordered_map<RenderTargetKey, RenderTarget*, RenderTargetKey::Hasher> render_targets_;
