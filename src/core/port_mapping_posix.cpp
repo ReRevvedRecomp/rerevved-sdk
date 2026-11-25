@@ -1,6 +1,7 @@
 #include "port_mapping_internal.h"
 
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 
@@ -36,10 +37,15 @@ std::optional<Route> FindRoute() {
 }
 }  // namespace
 
-// NAT-PMP only: UPnP is not implemented outside Windows.
 Environment SystemEnvironment() {
   Environment environment;
   environment.find_route = FindRoute;
+  auto direct = std::make_shared<DirectUpnp>();
+  environment.upnp_open = [direct](const Route& route, const Options& options,
+                                   const std::atomic<bool>& stop) {
+    return direct->Open(route, options, stop);
+  };
+  environment.upnp_close = [direct](uint16_t outside_port) { direct->Close(outside_port); };
   return environment;
 }
 

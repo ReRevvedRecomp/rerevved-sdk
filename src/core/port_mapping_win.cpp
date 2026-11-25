@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <set>
 #include <thread>
 #include <vector>
@@ -280,8 +281,22 @@ bool PublicNetwork() {
 Environment SystemEnvironment() {
   Environment environment;
   environment.find_route = FindRoute;
-  environment.upnp_open = UpnpOpen;
-  environment.upnp_close = UpnpClose;
+  auto direct = std::make_shared<DirectUpnp>();
+  auto direct_holds = std::make_shared<bool>(false);
+  environment.upnp_open = [direct, direct_holds](const Route& route, const Options& options,
+                                                 const std::atomic<bool>& stop) {
+    auto result = direct->Open(route, options, stop);
+    *direct_holds = result.failure == Failure::kNone;
+    if (result.failure == Failure::kNoRouter && !stop.load())
+      result = UpnpOpen(route, options, stop);
+    return result;
+  };
+  environment.upnp_close = [direct, direct_holds](uint16_t outside_port) {
+    if (*direct_holds)
+      direct->Close(outside_port);
+    else
+      UpnpClose(outside_port);
+  };
   environment.discovery_disabled = DiscoveryDisabled;
   environment.public_network = PublicNetwork;
   return environment;

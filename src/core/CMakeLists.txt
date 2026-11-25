@@ -24,6 +24,7 @@ add_library(rexcore OBJECT
     relay_transport.cpp
     online_server.cpp
     port_mapping.cpp
+    port_mapping_upnp.cpp
     live_invite.cpp
     sha256.cpp
     string_buffer.cpp

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -49,6 +50,22 @@ void NatPmpClose(relay::Endpoint gateway, uint16_t port);
 struct UpnpResult {
   Failure failure = Failure::kNoRouter;
   Grant grant;
+};
+
+// Asks the router itself, so it works where the system's UPnP is off or
+// blocked. Open and Close belong to one thread.
+class DirectUpnp {
+ public:
+  struct Control;
+  // Tests point `ssdp_port` at a fake router.
+  explicit DirectUpnp(uint16_t ssdp_port = 1900);
+  ~DirectUpnp();
+  UpnpResult Open(const Route& route, const Options& options, const std::atomic<bool>& stop);
+  void Close(uint16_t outside_port);
+
+ private:
+  uint16_t ssdp_port_;
+  std::unique_ptr<Control> control_;
 };
 
 // What the mapping thread asks of the system. Tests replace it.

@@ -91,10 +91,15 @@ public IPv4 address and outside port to put in an invite. `Close` removes
 the mapping and can wait a few seconds for the router. Nothing is sent before
 `Open`.
 
-The thread tries UPnP first, on Windows only, through the system's
-`IUPnPNAT`. It takes the first of ten outside ports from the server's port
-that no other mapping holds; a mapping with the same label that points at
-this computer counts as its own. It then tries NAT-PMP (RFC 6886) on the
+The thread tries UPnP first by asking the default gateway itself: an SSDP
+search sent to the gateway and to the SSDP group, the gateway's description
+over HTTP, then SOAP to its WAN connection service (`WANIPConnection` 1 or
+2, or `WANPPPConnection` 1). Only answers from the gateway's address are
+used. This needs no system service, so it also works on a Windows network
+set to Public. It takes the first of ten outside ports from the server's
+port that the router grants; a mapping that already points at this computer
+and port counts as its own. On Windows, when no router answers, the
+system's `IUPnPNAT` is tried next. It then tries NAT-PMP (RFC 6886) on the
 default gateway, UDP port 5351, with a lifetime of one hour renewed at half
 that; a failed renewal is asked again until the lifetime runs out. On Linux
 the gateway comes from `/proc/net/route`; on macOS no gateway is looked up,
@@ -103,8 +108,8 @@ so the port is never opened there.
 | Failure | Meaning |
 |---|---|
 | `kNoNetwork` | No network connection with a default gateway. |
-| `kNoDiscovery` | The Windows service SSDP Discovery is disabled. |
-| `kNoRouter` | Nothing answered UPnP or NAT-PMP. `public_network` is set when a connected Windows network is Public, which hides the router from UPnP. |
+| `kNoDiscovery` | Nothing answered, and the Windows service SSDP Discovery is disabled, which rules out the system's UPnP. |
+| `kNoRouter` | Nothing answered UPnP or NAT-PMP. `public_network` is set when a connected Windows network is Public, which hides the router from the system's UPnP only. |
 | `kPortsTaken` | Other mappings hold all ten outside ports. |
 | `kSharedAddress` | The router's outside address is private or shared by the provider, so a mapping cannot be reached; the mapping is removed. |
 | `kRefused` | The router answered and refused, or stopped renewing. |
