@@ -42,6 +42,8 @@ jobs:
       - name: Bootstrap container (linux-amd64)
         if: inputs.platform == 'linux-amd64'
         run: |
+          # The toolchain PPA answers 503 on some downloads.
+          echo 'Acquire::Retries "8";' > /etc/apt/apt.conf.d/80-retries
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl wget gnupg git git-lfs
