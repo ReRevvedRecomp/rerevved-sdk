@@ -8,6 +8,9 @@
 #include <optional>
 #include <span>
 
+#include <rex/online_server.h>
+#include <rex/port_mapping.h>
+
 namespace rex::kernel::xam::system_link {
 
 enum class Mode { kOff, kLan, kRelay };
@@ -17,8 +20,7 @@ struct Config {
   std::string address;
   std::string room;
   std::string secret_file;
-  // Valid system_link_advertised_address, or empty. Only invites sent to other
-  // players use it; this instance always connects to `address`.
+  // Only invites to other players use it; this instance connects to `address`.
   std::string advertised_address;
   std::shared_ptr<const relay_link::Secret> invite_secret;
   // From live_invite: joins the token's room instead of a room and secret.
@@ -34,27 +36,42 @@ struct Config {
   bool direct = false;
   // Developer fault injection, never persisted; see relay_link::DirectOptions.
   uint32_t direct_drop_after = 0;
+  // From online_host: this process runs the server `address` names.
+  bool hosting = false;
+  std::filesystem::path host_password_file;
   std::string error;
+};
+// What online_host starts. Tests replace it.
+struct HostServices {
+  std::function<VoidResult(const online_server::Options&)> start_server = online_server::Start;
+  std::function<void()> stop_server = online_server::Stop;
+  std::function<VoidResult(const port_mapping::Options&)> open_port = port_mapping::Open;
 };
 using RandomSource = std::function<Result<relay::Digest>()>;
 
 bool ValidProfileName(std::string_view name);
-// The relay address to tell other players: the advertised one when set.
+// The relay address to tell other players: the advertised one when set. A
+// host has none until its router port is open or an address was configured.
 std::string InviteRelayAddress(const Config& config);
+// Replaces the advertised address after the freeze; empty clears it. False,
+// changing nothing, before the freeze or for an address that
+// system_link_advertised_address would not accept.
+bool SetAdvertisedAddress(std::string_view address);
 Config CurrentConfig();
 Mode CurrentMode();
-// True when live_sessions is set in a valid relay configuration.
 bool LiveSessionsActive();
-// Called before guest threads start. Repeated calls retain the first snapshot.
-void FreezeConfig(const std::filesystem::path& config_path, RandomSource random);
+// Called before guest threads start; repeated calls keep the first snapshot.
+// With online_host set it also starts hosting.
+void FreezeConfig(const std::filesystem::path& config_path, RandomSource random,
+                  const HostServices& host = {});
+void StopHosting();
+bool HostAskedForPort();
 void Initialize(const std::filesystem::path& config_path);
 std::string Status();
 std::string RelayStatus(const relay_link::Stats& stats);
 void SetStartupFailure(std::string reason);
 Result<relay_link::Secret> ReadSecret(const Config& config);
-// A fresh copy of the configured join token, or nullopt without one.
 std::optional<relay_link::JoinToken> CopyJoinToken(const Config& config);
-// Status reason for a token join the relay rejected.
 inline constexpr std::string_view kInviteExpired = "invite expired; ask for a new invite";
 
 // XNetStartup and XNetCleanup references in relay mode. Callers serialize.

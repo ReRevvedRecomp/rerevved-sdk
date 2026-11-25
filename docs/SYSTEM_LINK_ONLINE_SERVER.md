@@ -65,6 +65,88 @@ never logged.
 | `--max-rooms` | 16 | 1-256 |
 | `--max-members` | 4 | 1-64 per room |
 
+## In-process server
+
+A title can run the same server on a host thread through
+`rex/online_server.h`, so one player hosts without starting `rexglue`.
+`MakeInvite` returns the invite code for an address and a password file, and
+creates the file with a random password when it is missing, as `rexglue
+online-invite --create-password` does with the room `testers`. `Start` takes
+the bind address, UDP port, the same password file and the member limit; it
+opens the port before it returns, so a port in use is reported to the caller.
+`Stop`
+closes the port and joins the thread. `Current` reports the port and the
+joined player and game counts. One server runs per process, with the default
+room limit of 16. No thread or socket exists before `Start`, and the thread
+sleeps on its socket for up to 100 ms between packets. It logs one line when
+it starts listening and one when it stops; the status and problem lines below
+belong to the command.
+
+## Router port
+
+`rex/port_mapping.h` asks the home router to forward an outside UDP port to
+the server, so a host needs no router setup. `Open` starts a host thread and
+returns at once; `Current` reports the state, and while the port is open the
+public IPv4 address and outside port to put in an invite. `Close` removes
+the mapping and can wait a few seconds for the router. Nothing is sent before
+`Open`.
+
+The thread tries UPnP first by asking the default gateway itself: an SSDP
+search sent to the gateway and to the SSDP group, the gateway's description
+over HTTP, then SOAP to its WAN connection service (`WANIPConnection` 1 or
+2, or `WANPPPConnection` 1). Only answers from the gateway's address are
+used. This needs no system service, so it also works on a Windows network
+set to Public. It takes the first of ten outside ports from the server's
+port that the router grants; a mapping that already points at this computer
+and port counts as its own. On Windows, when no router answers, the
+system's `IUPnPNAT` is tried next. It then tries NAT-PMP (RFC 6886) on the
+default gateway, UDP port 5351, with a lifetime of one hour renewed at half
+that; a failed renewal is asked again until the lifetime runs out. On Linux
+the gateway comes from `/proc/net/route`; on macOS no gateway is looked up,
+so the port is never opened there.
+
+| Failure | Meaning |
+|---|---|
+| `kNoNetwork` | No network connection with a default gateway. |
+| `kNoDiscovery` | Nothing answered, and the Windows service SSDP Discovery is disabled, which rules out the system's UPnP. |
+| `kNoRouter` | Nothing answered UPnP or NAT-PMP. `public_network` is set when a connected Windows network is Public, which hides the router from the system's UPnP only. |
+| `kPortsTaken` | Other mappings hold all ten outside ports. |
+| `kSharedAddress` | The router's outside address is private or shared by the provider, so a mapping cannot be reached; the mapping is removed. |
+| `kRefused` | The router answered and refused, or stopped renewing. |
+
+The log names the method, the ports and the failure, never the outside
+address.
+
+## Hosting from the game
+
+`online_host` (Advanced, Boolean, restart required) makes one launch host,
+for example `--online_host=true` on the command line; a title relaunches
+itself with it. It is session-only: never written to configuration and not
+settable from it. As startup settings freeze, the game:
+
+1. Reads the password in `online-server/server-password.txt` beside the
+   configuration file, creating it on the first launch that hosts.
+2. Starts the in-process server on `online_host_port` (default 30100, saved in
+   configuration). A port in use becomes the `system_link_status` failure.
+3. Selects relay mode joined to `127.0.0.1` on that port with room `testers`
+   and that password. This takes precedence for the session over
+   `live_invite`, `system_link_invite`, explicit relay settings and LAN, whose
+   saved values stay.
+4. Asks the router for the port in the background. When it opens, the public
+   address and outside port become the advertised address that host invites
+   carry; until then, and after a failure, the game hands out no host invite.
+   With `system_link_advertised_address` set, that address is used and the
+   router is left alone.
+
+Any configuration error at the freeze stops the server again and skips the
+router.
+
+`rex/online_host.h` reports this to the title: whether the launch hosts, why
+the server did not start, the router port's state and failure, the address
+friends reach and the invite code for it. The application stops the server
+and removes the router port when it closes. Without `online_host` no server
+thread, socket or router request exists.
+
 ## Server logs
 
 At startup the server logs its bind address, UDP port, room limit and member

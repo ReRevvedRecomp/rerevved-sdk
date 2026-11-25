@@ -55,8 +55,9 @@
 
 // This consumer-compiled source links rexruntime; internal headers are not installed.
 namespace rex::kernel::xam::system_link {
+void StopHosting();
 void Initialize(const std::filesystem::path& config_path);
-}
+}  // namespace rex::kernel::xam::system_link
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -882,6 +883,9 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
+  // The hard exit skips OnDestroy, so give up the server port and the router
+  // port here; the title's hook may start a successor that needs them.
+  rex::kernel::xam::system_link::StopHosting();
   // Guest threads are stopped, but stragglers may still poll; the hook may only
   // drain and release the title's own presentation resources.
   OnBeforeHardExit();
@@ -1059,6 +1063,8 @@ void ReXApp::OnDestroy() {
   }
   window_.reset();
   runtime_.reset();
+  // After the game has left its own server.
+  rex::kernel::xam::system_link::StopHosting();
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {

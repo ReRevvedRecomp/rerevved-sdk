@@ -20,6 +20,11 @@ add_library(rexcore OBJECT
     ring_buffer.cpp
     relay_protocol.cpp
     relay_invite.cpp
+    relay_core.cpp
+    relay_transport.cpp
+    online_server.cpp
+    port_mapping.cpp
+    port_mapping_upnp.cpp
     live_invite.cpp
     sha256.cpp
     string_buffer.cpp
@@ -32,15 +37,11 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-# Server implementation is internal to the CLI and tests, never the title runtime.
-add_library(rexrelay_server STATIC relay_core.cpp relay_transport.cpp)
-# The runtime owns the codec and crypto symbols without copying rexcore object state.
-target_link_libraries(rexrelay_server PUBLIC rexruntime)
-target_include_directories(rexrelay_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
-if(WIN32)
-    target_compile_definitions(rexrelay_server PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(rexrelay_server PRIVATE ws2_32)
-endif()
+# The server implementation lives in the runtime, behind rex/online_server.h.
+# This target gives the CLI and tests its internal headers under src/core.
+add_library(rexrelay_server INTERFACE)
+target_link_libraries(rexrelay_server INTERFACE rexruntime)
+target_include_directories(rexrelay_server INTERFACE ${PROJECT_SOURCE_DIR}/src)
 
 if(APPLE)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the
@@ -65,14 +66,17 @@ if(WIN32)
         memory_win.cpp
         platform/console_win.cpp
         platform/env_win.cpp
+        port_mapping_win.cpp
         seh_win.cpp
         socket_win.cpp
         system_win.cpp
         threading_win.cpp
     )
     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
-    # dbghelp writes the crash report minidump.
-    target_link_libraries(rexcore PRIVATE bcrypt dbghelp ws2_32)
+    # dbghelp writes the crash report minidump. port_mapping_win.cpp finds the
+    # router through iphlpapi and asks it for a port through COM.
+    target_link_libraries(rexcore PRIVATE
+        advapi32 bcrypt dbghelp iphlpapi ole32 oleaut32 ws2_32)
 elseif(UNIX)
     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
     # is selected inside them with #if defined(__APPLE__).
@@ -89,6 +93,7 @@ elseif(UNIX)
         memory_posix.cpp
         platform/console_posix.cpp
         platform/env_posix.cpp
+        port_mapping_posix.cpp
         seh_posix.cpp
         socket_posix.cpp
         system_posix.cpp

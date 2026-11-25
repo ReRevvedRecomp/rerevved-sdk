@@ -42,6 +42,8 @@ jobs:
       - name: Bootstrap container (linux-amd64)
         if: inputs.platform == 'linux-amd64'
         run: |
+          # The toolchain PPA answers 503 on some downloads.
+          echo 'Acquire::Retries "8";' > /etc/apt/apt.conf.d/80-retries
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl wget gnupg git git-lfs
@@ -63,7 +65,10 @@ jobs:
 
       - name: Install toolchain (Windows)
         if: inputs.platform == 'win-amd64'
-        run: choco install llvm cmake ninja -y
+        # The runner's MSVC STL rejects the preinstalled Clang 20.
+        run: |
+          choco upgrade llvm --version=22.1.8 -y
+          choco install cmake ninja -y
 
       - name: Install clang 22 (linux-amd64)
         if: inputs.platform == 'linux-amd64'
