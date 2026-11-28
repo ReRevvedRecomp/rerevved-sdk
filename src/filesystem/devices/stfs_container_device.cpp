@@ -40,11 +40,9 @@ StfsContainerDevice::~StfsContainerDevice() {
 
 std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
     const std::filesystem::path& file_path) {
-  if (!std::filesystem::exists(file_path)) {
-    return nullptr;
-  }
-
-  if (std::filesystem::file_size(file_path) < sizeof(StfsHeader)) {
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(file_path, ec);
+  if (ec || size < sizeof(StfsHeader)) {
     return nullptr;
   }
 
@@ -68,6 +66,11 @@ std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
 }
 
 bool StfsContainerDevice::Initialize() {
+  std::error_code ec;
+  if (single_file_stfs_only_ && std::filesystem::is_directory(host_path_, ec)) {
+    REXFS_ERROR("{} is a directory, not a single-file STFS package", rex::path_to_utf8(host_path_));
+    return false;
+  }
   // Resolve a valid STFS file if a directory is given.
   if (std::filesystem::is_directory(host_path_) && !ResolveFromFolder(host_path_)) {
     REXFS_ERROR("Could not resolve an STFS container given path {}", rex::path_to_utf8(host_path_));
@@ -117,6 +120,15 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
     return header_result;
   }
 
+  // Checked before any data fragment is listed or opened.
+  if (single_file_stfs_only_ && (header_.metadata.volume_type != XContentVolumeType::kStfs ||
+                                 header_.metadata.data_file_count > 1)) {
+    REXFS_ERROR("{} is not a single-file STFS package", rex::path_to_utf8(host_path_));
+    fclose(header_file);
+    files_total_size_ = 0;
+    return Error::kErrorFileMismatch;
+  }
+
   // If the STFS package is a single file, the header is self contained and
   // we don't need to map any extra files.
   // NOTE: data_file_count is 0 for STFS and 1 for SVOD
@@ -128,6 +140,7 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
 
   // If the STFS package is multi-file, it is an SVOD system. We need to map
   // the files in the .data folder and can discard the header.
+  fclose(header_file);
   auto data_fragment_path = host_path_;
   data_fragment_path += ".data";
   if (!std::filesystem::exists(data_fragment_path)) {
@@ -211,6 +224,13 @@ StfsContainerDevice::Error StfsContainerDevice::ReadHeaderAndVerify(FILE* header
 
   // Pre-calculate some values used in block number calculations
   if (header_.metadata.volume_type == XContentVolumeType::kStfs) {
+    const uint64_t data_start =
+        rex::round_up(uint64_t(header_.header.header_size), uint64_t(kBlockSize));
+    if (data_start > files_total_size_ || data_start > UINT32_MAX) {
+      REXFS_ERROR("STFS header size 0x{:X} is past the end of the package",
+                  header_.header.header_size.get());
+      return Error::kErrorFileMismatch;
+    }
     blocks_per_hash_table_ =
         header_.metadata.volume_descriptor.stfs.flags.bits.read_only_format ? 1 : 2;
 
@@ -550,8 +570,21 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
 
   auto& descriptor = header_.metadata.volume_descriptor.stfs;
   uint32_t table_block_index = descriptor.file_table_block_number();
+  // Marking used blocks refuses cyclic or shared chains.
+  const size_t file_blocks = files_total_size_ / kBlockSize;
+  if (descriptor.file_table_block_count > file_blocks) {
+    REXFS_ERROR("ReadSTFS: file table has more blocks than the package");
+    return Error::kErrorFileMismatch;
+  }
+  // Block numbers are 24-bit, so a sparse huge file cannot inflate the bitmap past that range.
+  std::vector<bool> used_blocks(std::min<size_t>(file_blocks, kEndOfChain));
   size_t n = 0;
   for (n = 0; n < descriptor.file_table_block_count; n++) {
+    if (table_block_index >= used_blocks.size() || used_blocks[table_block_index]) {
+      REXFS_ERROR("ReadSTFS: file table reuses block {}", table_block_index);
+      return Error::kErrorFileMismatch;
+    }
+    used_blocks[table_block_index] = true;
     auto offset = BlockToOffsetSTFS(table_block_index);
     rex::filesystem::Seek(file, offset, SEEK_SET);
 
@@ -571,12 +604,34 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
       StfsContainerEntry* parent_entry = nullptr;
       if (dir_entry.directory_index == 0xFFFF) {
         parent_entry = root_entry;
-      } else {
+      } else if (dir_entry.directory_index < all_entries.size()) {
         parent_entry = all_entries[dir_entry.directory_index];
+      } else {
+        REXFS_ERROR("ReadSTFS: entry parent index {} is out of range",
+                    dir_entry.directory_index.get());
+        return Error::kErrorFileMismatch;
       }
 
-      std::string name(reinterpret_cast<const char*>(dir_entry.name),
-                       dir_entry.flags.name_length & 0x3F);
+      const size_t name_length = dir_entry.flags.name_length & 0x3F;
+      if (name_length == 0 || name_length > sizeof(dir_entry.name)) {
+        REXFS_ERROR("ReadSTFS: entry name length {} is invalid", name_length);
+        return Error::kErrorFileMismatch;
+      }
+      std::string name(reinterpret_cast<const char*>(dir_entry.name), name_length);
+      // One printable ASCII path component, so a name cannot escape its parent.
+      if (std::any_of(name.begin(), name.end(),
+                      [](char c) { return c < 0x20 || c > 0x7E || c == '\\' || c == '/'; })) {
+        REXFS_ERROR("ReadSTFS: entry name has a non-printable byte or separator");
+        return Error::kErrorFileMismatch;
+      }
+      if (parent_entry->path().size() + 1 + name_length > kMaxPathLength) {
+        REXFS_ERROR("ReadSTFS: entry path under {} is too long", parent_entry->path());
+        return Error::kErrorFileMismatch;
+      }
+      if (!dir_entry.flags.directory && dir_entry.length > files_total_size_) {
+        REXFS_ERROR("ReadSTFS: file {} is larger than its package", name);
+        return Error::kErrorFileMismatch;
+      }
       auto entry = StfsContainerEntry::Create(this, parent_entry, name, &files_);
 
       if (dir_entry.flags.directory) {
@@ -606,30 +661,39 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
         while (remaining_size && block_index != kEndOfChain) {
           size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
           size_t offset = BlockToOffsetSTFS(block_index);
+          if (offset + block_size > files_total_size_) {
+            REXFS_ERROR("ReadSTFS: file {} has data past the end of the package", name);
+            return Error::kErrorReadError;
+          }
+          if (block_index >= used_blocks.size() || used_blocks[block_index]) {
+            REXFS_ERROR("ReadSTFS: file {} reuses data block {}", name, block_index);
+            return Error::kErrorFileMismatch;
+          }
+          used_blocks[block_index] = true;
           entry->block_list_.push_back({0, offset, block_size});
           remaining_size -= block_size;
           auto block_hash = GetBlockHash(block_index);
+          if (!block_hash) {
+            return Error::kErrorReadError;
+          }
           block_index = block_hash->level0_next_block();
         }
 
         if (remaining_size) {
-          // Loop above must have exited prematurely, bad hash tables?
-          REXFS_WARN(
+          REXFS_ERROR(
               "STFS file {} only found {} bytes for file, expected {} ({} "
               "bytes missing)",
               name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
               remaining_size);
-          assert_always();
+          return Error::kErrorFileMismatch;
         }
 
-        // Check that the number of blocks retrieved from hash entries matches
-        // the block count read from the file entry
+        // A block count that disagrees with complete data is tolerated.
         if (entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
           REXFS_WARN(
               "STFS failed to read correct block-chain for entry {}, read {} "
               "blocks, expected {}",
               entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
-          assert_always();
         }
       }
 
@@ -637,6 +701,9 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
     }
 
     auto block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      return Error::kErrorReadError;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
@@ -646,7 +713,6 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
   if (n + 1 != descriptor.file_table_block_count) {
     REXFS_WARN("STFS read {} file table blocks, but STFS headers expected {}!", n + 1,
                descriptor.file_table_block_count);
-    assert_always();
   }
 
   return Error::kSuccess;
