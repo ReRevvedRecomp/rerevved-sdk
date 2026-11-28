@@ -14,10 +14,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <rex/math.h>
 
 namespace rex::filesystem {
+
+namespace {
+// Open files of one package share its FILE*; each seek and read pair must not interleave.
+std::mutex read_mutex;
+}  // namespace
 
 StfsContainerFile::StfsContainerFile(uint32_t file_access, StfsContainerEntry* entry)
     : File(file_access, entry), entry_(entry) {}
@@ -51,10 +57,18 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
     size_t read_length = std::min(record.length - read_offset, remaining_length);
 
     auto& file = entry_->files()->at(record.file);
-    rex::filesystem::Seek(file, record.offset + read_offset, SEEK_SET);
-    auto num_read = fread(p, 1, read_length, file);
+    size_t num_read = 0;
+    {
+      std::lock_guard lock(read_mutex);
+      if (rex::filesystem::Seek(file, record.offset + read_offset, SEEK_SET)) {
+        num_read = fread(p, 1, read_length, file);
+      }
+    }
 
     *out_bytes_read += num_read;
+    if (num_read != read_length) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
     p += num_read;
     src_offset += record.length;
     remaining_length -= read_length;

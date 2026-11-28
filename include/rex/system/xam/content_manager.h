@@ -131,6 +131,9 @@ class ContentPackage {
 
   uint32_t GetPackageLicense() const { return license_; }
 
+  // False when a package file failed to mount.
+  bool mounted() const { return mounted_; }
+
  private:
   KernelState* kernel_state_;
   std::string root_name_;
@@ -138,6 +141,7 @@ class ContentPackage {
   std::filesystem::path package_path_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_ = 0;
+  bool mounted_ = true;
 };
 
 class ContentManager {
@@ -188,7 +192,8 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
-  // Lists a read-only title directory as XUID-zero marketplace content; fails if the name exists.
+  // Lists a read-only title directory, or a single-file STFS marketplace package for title_id
+  // mounted in place, as XUID-zero marketplace content; fails if the name exists.
   X_RESULT AddTitlePackage(uint32_t title_id, const std::string_view file_name,
                            const std::filesystem::path& host_path);
 

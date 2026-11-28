@@ -37,10 +37,11 @@ class StfsContainerDevice : public Device {
 
   bool Initialize() override;
 
-  bool is_read_only() const override {
-    return header_.metadata.volume_type != XContentVolumeType::kStfs ||
-           header_.metadata.volume_descriptor.stfs.flags.bits.read_only_format;
-  }
+  // Makes Initialize refuse SVOD and multi-file packages before parsing their volume.
+  void RequireSingleFileStfs() { single_file_stfs_only_ = true; }
+
+  // The device has no write path, whatever the package's hash-table format.
+  bool is_read_only() const override { return true; }
 
   void Dump(string::StringBuffer* string_buffer) override;
   Entry* ResolvePath(const std::string_view path) override;
@@ -85,6 +86,7 @@ class StfsContainerDevice : public Device {
  private:
   const uint32_t kBlocksPerHashLevel[3] = {170, 28900, 4913000};
   const uint32_t kEndOfChain = 0xFFFFFF;
+  const size_t kMaxPathLength = 255;
   const uint32_t kEntriesPerDirectoryBlock = kBlockSize / sizeof(StfsDirectoryEntry);
 
   enum class Error {
@@ -135,6 +137,7 @@ class StfsContainerDevice : public Device {
   SvodLayoutType svod_layout_;
   uint32_t blocks_per_hash_table_;
   uint32_t block_step[2];
+  bool single_file_stfs_only_ = false;
 
   std::unordered_map<size_t, StfsHashTable> cached_hash_tables_;
 };

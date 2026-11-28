@@ -19,6 +19,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -38,6 +39,47 @@ static const char* kGameContentHeaderDirName = "Headers";
 
 static int content_device_id_ = 0;
 
+static X_RESULT CheckTitlePackageHeader(uint32_t title_id,
+                                        const rex::filesystem::StfsHeader& header,
+                                        const std::string& file) {
+  const auto& metadata = header.metadata;
+  if (metadata.volume_type != rex::filesystem::XContentVolumeType::kStfs ||
+      metadata.data_file_count > 1) {
+    REXSYS_WARN("Title package {} is not a single-file STFS package", file);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (metadata.content_type != XContentType::kMarketplaceContent) {
+    REXSYS_WARN("Title package {} has content type {:08X}, not marketplace", file,
+                uint32_t(XContentType(metadata.content_type)));
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (metadata.execution_info.title_id != title_id) {
+    REXSYS_WARN("Title package {} is for title {:08X}, not {:08X}", file,
+                uint32_t(metadata.execution_info.title_id), title_id);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+static X_RESULT CheckTitlePackageFile(uint32_t title_id, const std::filesystem::path& path) {
+  const auto file = rex::path_to_utf8(path);
+  auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path);
+  if (!header) {
+    REXSYS_WARN("Title package {} is not an Xbox 360 content package", file);
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if (auto result = CheckTitlePackageHeader(title_id, *header, file); result != X_ERROR_SUCCESS) {
+    return result;
+  }
+  rex::filesystem::StfsContainerDevice device("", path);
+  device.RequireSingleFileStfs();
+  if (!device.Initialize()) {
+    REXSYS_WARN("Title package {} has an unreadable file table", file);
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  return X_ERROR_SUCCESS;
+}
+
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
                                const std::filesystem::path& package_path, bool read_only)
@@ -46,14 +88,39 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
-      device_path_, package_path, read_only, /*allow_share_delete=*/true);
-  device->Initialize();
+  std::unique_ptr<rex::filesystem::Device> device;
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(package_path, ec)) {
+    // Recheck the header in case the file changed after registration.
+    const auto file = rex::path_to_utf8(package_path);
+    const uint32_t title_id =
+        data.title_id == kCurrentlyRunningTitleId ? kernel_state_->title_id() : data.title_id.get();
+    auto stfs = std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
+    stfs->RequireSingleFileStfs();
+    if (!stfs->Initialize() ||
+        CheckTitlePackageHeader(title_id, stfs->header(), file) != X_ERROR_SUCCESS) {
+      REXSYS_ERROR("ContentPackage: cannot mount package {}", file);
+      mounted_ = false;
+      return;
+    }
+    device = std::move(stfs);
+  } else {
+    device = std::make_unique<rex::filesystem::HostPathDevice>(
+        device_path_, package_path, read_only, /*allow_share_delete=*/true);
+    if (!device->Initialize()) {
+      REXSYS_ERROR("ContentPackage: cannot mount {}", rex::path_to_utf8(package_path));
+      mounted_ = false;
+      return;
+    }
+  }
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
 }
 
 ContentPackage::~ContentPackage() {
+  if (!mounted_) {
+    return;
+  }
   auto fs = kernel_state_->file_system();
   fs->UnregisterSymbolicLink(root_name_ + ":");
   fs->UnregisterDevice(device_path_);
@@ -229,7 +296,11 @@ X_RESULT ContentManager::AddTitlePackage(uint32_t title_id, const std::string_vi
     return X_ERROR_INVALID_PARAMETER;
   }
   std::error_code ec;
-  if (!std::filesystem::is_directory(host_path, ec)) {
+  if (std::filesystem::is_regular_file(host_path, ec)) {
+    if (auto result = CheckTitlePackageFile(title_id, host_path); result != X_ERROR_SUCCESS) {
+      return result;
+    }
+  } else if (!std::filesystem::is_directory(host_path, ec)) {
     return X_ERROR_PATH_NOT_FOUND;
   }
   auto global_lock = global_critical_region_.Acquire();
@@ -270,6 +341,9 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path,
                                                   !FindTitlePackage(data).empty());
+  if (!package->mounted()) {
+    return nullptr;
+  }
   return package;
 }
 
@@ -392,7 +466,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     return X_ERROR_FILE_NOT_FOUND;
   }
   auto package = ResolvePackage(root_name, xuid, data);
-  assert_not_null(package);
+  if (!package) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
   // Title packages carry no license header; a same-named installed one is unrelated.
   if (FindTitlePackage(data).empty()) {
     package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
